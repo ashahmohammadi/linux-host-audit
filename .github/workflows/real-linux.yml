@@ -41,6 +41,8 @@ jobs:
           sudo bash tests/real-smoke.sh
           bash tests/real-smoke.sh
           sudo bash linux-host-audit.sh --problems
+          echo '--- raw kernel disk lines'
+          sudo journalctl -k --since '7 days ago' --no-pager -q | grep -iE 'i/o error|ext4-fs error|blk_update_request|nvme.*(timeout|reset)|ata[0-9]+.*failed' || true
 
   docker:
     runs-on: ubuntu-latest
