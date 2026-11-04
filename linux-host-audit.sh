@@ -14,7 +14,9 @@ package_snapshot() {
         dpkg-query -W -f='${Status}\t${Package}\t${Version}\n' 2>/dev/null |
             awk -F '\t' '$1 ~ / ok installed$/ { print "dpkg:" $2, $3 }'
     fi
-    if has rpm; then
+    # Without a system database, rpm creates a new one in the home folder.
+    if has rpm && [[ -n $(ls /var/lib/rpm/Packages* /var/lib/rpm/rpmdb.sqlite \
+        /usr/lib/sysimage/rpm/Packages* /usr/lib/sysimage/rpm/rpmdb.sqlite 2>/dev/null) ]]; then
         rpm -qa --qf 'rpm:%{NAME} %{VERSION}-%{RELEASE}\n' 2>/dev/null
     fi
     if has apk; then

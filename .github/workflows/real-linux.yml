@@ -40,6 +40,7 @@ jobs:
         run: |
           sudo bash tests/real-smoke.sh
           bash tests/real-smoke.sh
+          sudo bash linux-host-audit.sh --problems
 
   docker:
     runs-on: ubuntu-latest
@@ -77,6 +78,10 @@ jobs:
       - name: Create workloads in known states
         run: |
           sudo k3s kubectl create namespace lha
+          for i in $(seq 1 30); do
+              sudo k3s kubectl -n lha get serviceaccount default >/dev/null 2>&1 && break
+              sleep 2
+          done
           sudo k3s kubectl -n lha create deployment good --image=nginx:1.27-alpine
           sudo k3s kubectl -n lha create deployment badimage --image=registry.invalid/none:1
           sudo k3s kubectl -n lha run crash --image=alpine:3.20 --command -- sh -c 'exit 1'
