@@ -2699,7 +2699,7 @@ tui_open() {
     fi
     if [[ ${tui_inherited:-no} != yes ]]; then
         trap 'printf "\033[0m\033[?25h\033[?1049l" >&9' EXIT
-        printf '\033[?1049h' >&9
+        printf '\033[?1049h\033[?25l' >&9
     fi
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -2715,9 +2715,10 @@ tui_size() {
 }
 
 tui_style() {
-    accent='' secondary='' dim='' bold='' reset='' selected=''
+    accent='' secondary='' dim='' bold='' reset='' selected='' green='' red='' magenta=''
     if [[ ! ${NO_COLOR+x} ]]; then
         accent=$'\033[96m' secondary=$'\033[93m' dim=$'\033[90m'
+        green=$'\033[92m' red=$'\033[91m' magenta=$'\033[95m'
         bold=$'\033[1m' reset=$'\033[0m' selected=$'\033[7m'
     fi
 }
@@ -2774,7 +2775,7 @@ tui_menu_labels() {
 }
 
 tui_main() (
-    local key choice=0 index term_rows term_cols accent secondary dim bold reset selected
+    local key choice=0 index frame term_rows term_cols accent secondary dim bold reset selected
     local tui_inherited=no tui_active=yes menu_keys=123456789abcdefg
     local -a actions
     local -a views=(view_overview view_problems view_apps view_network view_containers view_kube
@@ -2790,8 +2791,8 @@ tui_main() (
     while :; do
         tui_size
         tui_menu_labels
-        {
-            printf '\033[H\033[J%s %.*s%s\n' "$bold$accent" "$((term_cols-1))" "LINUX HOST AUDIT  ${H_NAME:-}" "$reset"
+        frame=$(
+            printf '%s %.*s%s\n' "$bold$accent" "$((term_cols-1))" "LINUX HOST AUDIT  ${H_NAME:-}" "$reset"
             printf ' %.*s\n\n' "$((term_cols - 1))" "$(verdict)$reset"
             for ((index=0; index<${#actions[@]}; index++)); do
                 if (( index == choice )); then
@@ -2801,7 +2802,8 @@ tui_main() (
                 fi
             done
             printf '\n%s %.*s%s\n' "$dim" "$((term_cols - 1))" 'Up/Down + Enter, or press a key.  r: rescan   q: quit' "$reset"
-        } >&9
+        )
+        tui_paint "$frame"
         tui_key '' || return 0
         case $key in
             up|k) choice=$(((choice+${#actions[@]}-1)%${#actions[@]})); continue ;;
@@ -2849,151 +2851,217 @@ tui_rate() {
     fi
 }
 
-# chart_build returns a frame in chart_rows. The history is aligned on the right.
-# Single and dual series use distinct point glyphs even with NO_COLOR enabled.
+# Draw over the old frame instead of clearing first: a cleared screen is what flickers.
+# The ?2026 pair asks terminals that support it to show the frame all at once.
+tui_paint() {
+    local frame=$1
+    frame=${frame//$'\n'/$'\033[K\n'}
+    printf '\033[?2026h\033[H%s\033[K\033[J\033[?2026l' "$frame" >&9
+}
+
+# Decide between Unicode and ASCII once. Asking the terminal is more reliable than the locale:
+# after printing one 3-byte block, the cursor sits in column 2 only if it was drawn as one cell.
+tui_glyphs() {
+    local reply='' column=''
+    if [[ -z ${glyph_mode:-} ]]; then
+        printf '\r\xe2\x96\x88\033[6n' >&9
+        IFS= read -rs -d R -t 1 -u 9 reply || :
+        printf '\r\033[K' >&9
+        [[ $reply != *';'* ]] || column=${reply##*;}
+        if [[ $column == 2 ]]; then glyph_mode=utf8
+        elif [[ -z $column && ${LHA_LOCALE:-} == *[Uu][Tt][Ff]* ]]; then glyph_mode=utf8
+        else glyph_mode=ascii
+        fi
+    fi
+    if [[ $glyph_mode == utf8 ]]; then
+        g_h=$'\xe2\x94\x80' g_v=$'\xe2\x94\x82' g_tl=$'\xe2\x95\xad' g_tr=$'\xe2\x95\xae'
+        g_bl=$'\xe2\x95\xb0' g_br=$'\xe2\x95\xaf'
+        blocks=(' ' $'\xe2\x96\x81' $'\xe2\x96\x82' $'\xe2\x96\x83' $'\xe2\x96\x84'
+            $'\xe2\x96\x85' $'\xe2\x96\x86' $'\xe2\x96\x87' $'\xe2\x96\x88')
+    else
+        g_h=- g_v='|' g_tl=+ g_tr=+ g_bl=+ g_br=+
+        blocks=(' ' . . : : '=' '=' '#' '#')
+    fi
+}
+
+chart_rule() {
+    local count=$1
+    REPLY=
+    ((count > 0)) || return 0
+    printf -v REPLY '%*s' "$count" ''
+    REPLY=${REPLY// /$g_h}
+}
+
+# Top or bottom border carrying a left and a right label.
+chart_border() {
+    local corner_l=$1 corner_r=$2 inner=$3 left=$4 right=$5 room fill text
+    if [[ -z $left ]]; then
+        right=${right:0:inner-3}
+        chart_rule "$((inner - ${#right} - 3))"
+        fill=$REPLY
+        chart_rule 1
+        chart_rows+=("$dim$corner_l$fill$reset $dim$right$reset $dim$REPLY$corner_r$reset")
+        return 0
+    fi
+    room=$((inner - ${#left} - 7))
+    ((room >= 0)) || room=0
+    right=${right:0:room}
+    fill=$((inner - ${#left} - ${#right} - 6))
+    chart_rule "$fill"
+    fill=$REPLY
+    if [[ -n $right ]]; then text=" $right "; else text=$g_h$g_h; fi
+    chart_rule 1
+    chart_rows+=("$dim$corner_l$REPLY$reset$bold$accent ${left:0:inner-4} $reset$dim$fill$reset$text$dim$REPLY$corner_r$reset")
+}
+
+# Adds one series from the series array as an area chart: newest sample on the right,
+# eight levels per text row. A style of "heat" colors rows by how high they are.
+chart_area() {
+    local height=$1 inner=$2 limit=$3 style=$4
+    local units=$((height * 8)) start=$((${#series[@]} - inner)) col idx value row base step line color
+    local -a level
+    ((height > 0)) || return 0
+    for ((col = 0; col < inner; col++)); do
+        idx=$((start + col))
+        value=-1
+        ((idx < 0)) || value=${series[idx]:--1}
+        level[col]=0
+        if ((value > 0)); then
+            level[col]=$(((value * units + limit - 1) / limit))
+            ((level[col] <= units)) || level[col]=$units
+        fi
+    done
+    for ((row = height - 1; row >= 0; row--)); do
+        base=$((row * 8)) line=''
+        for ((col = 0; col < inner; col++)); do
+            step=$((level[col] - base))
+            if ((step <= 0)); then line+=' '
+            elif ((step >= 8)); then line+=${blocks[8]}
+            else line+=${blocks[step]}
+            fi
+        done
+        color=$style
+        if [[ $style == heat ]]; then
+            step=$(((row + 1) * 100 / height))
+            if ((step > 85)); then color=$red
+            elif ((step > 60)); then color=$secondary
+            else color=$green
+            fi
+        fi
+        chart_rows+=("$dim$g_v$reset$color$line$reset$dim$g_v$reset")
+    done
+}
+
+# Rate charts scale to their own recent peak, with a floor so an idle server stays flat.
+chart_peak() {
+    local value
+    peak=65536
+    for value in "${series[@]}"; do ((value <= peak)) || peak=$value; done
+}
+
+# chart_build leaves a finished box in chart_rows: height rows plus two borders.
 chart_build() {
-    local pane=$1 width=$2 height=$3 chart_title label left right rate
-    local inner=$((width-2)) limit=100 start col idx row a b y1 y2 fill rule r1 r2
-    local -a p1 p2
+    local pane=$1 width=$2 height=$3 inner=$(($2 - 2)) title value left right low peak rate
+    local peak_a peak_b upper short
+    local -a series
     chart_rows=()
     case $pane in
-        cpu) chart_title='CPU / BUSY'; p1=("${cpu_history[@]}"); label='Busy: --'
-             (( cpu_pct < 0 )) || label="Busy: $cpu_pct%" ;;
-        ram) chart_title='RAM / USED'; p1=("${ram_history[@]}"); label='Used: --'
-             (( ram_pct < 0 )) || label="Used: $ram_pct%" ;;
-        disk)
-            chart_title='DISK I/O'; p1=("${disk_r_history[@]}"); p2=("${disk_w_history[@]}")
-            tui_rate "$disk_read"; left=$rate; tui_rate "$disk_write"; right=$rate
-            label="R* $left  W+ $right"; limit=1 ;;
-        net)
-            chart_title='NETWORK TRAFFIC'; p1=("${net_r_history[@]}"); p2=("${net_t_history[@]}")
-            tui_rate "$net_rx"; left=$rate; tui_rate "$net_tx"; right=$rate
-            label="RX* $left  TX+ $right"; limit=1 ;;
+        cpu|ram)
+            if [[ $pane == cpu ]]; then title=CPU value=$cpu_pct series=("${cpu_history[@]}")
+            else title=RAM value=$ram_pct series=("${ram_history[@]}")
+            fi
+            if ((value < 0)); then value=--; else value+=%; fi
+            chart_border "$g_tl" "$g_tr" "$inner" "$title" "$value"
+            chart_area "$height" "$inner" 100 heat
+            chart_border "$g_bl" "$g_br" "$inner" '' '0-100%'
+            ;;
+        disk|net)
+            upper=$(((height + 1) / 2))
+            if [[ $pane == disk ]]; then
+                title=DISK left=read right=write low=$disk_write
+                tui_rate "$disk_read"; value=$rate
+            else
+                title=NETWORK left=in right=out low=$net_tx
+                tui_rate "$net_rx"; value=$rate
+            fi
+            short=$value
+            tui_rate "$low"
+            value="$left $value  $right $rate"
+            # Never cut a number in half: narrow panes drop the words instead.
+            ((${#value} <= inner - ${#title} - 7)) || value="$short / $rate"
+            ((${#value} <= inner - ${#title} - 7)) || title=
+            chart_border "$g_tl" "$g_tr" "$inner" "$title" "$value"
+            if [[ $pane == disk ]]; then series=("${disk_r_history[@]}"); else series=("${net_r_history[@]}"); fi
+            chart_peak
+            peak_a=$peak
+            chart_area "$upper" "$inner" "$peak_a" "$accent"
+            if [[ $pane == disk ]]; then series=("${disk_w_history[@]}"); else series=("${net_t_history[@]}"); fi
+            chart_peak
+            peak_b=$peak
+            chart_area "$((height - upper))" "$inner" "$peak_b" "$magenta"
+            tui_rate "$peak_a"
+            value="peak $rate / "
+            tui_rate "$peak_b"
+            chart_border "$g_bl" "$g_br" "$inner" '' "$value$rate"
+            ;;
     esac
-    if (( limit == 1 )); then
-        for a in "${p1[@]}" "${p2[@]}"; do
-            (( a <= limit )) || limit=$a
-        done
-    fi
-    printf -v rule '%*s' "$inner" ''
-    rule=${rule// /-}
-    chart_rows+=("${dim}+$rule+${reset}")
-    printf -v fill '%-*.*s' "$inner" "$inner" " $chart_title"
-    chart_rows+=("${dim}|${reset}${accent}${bold}$fill${reset}${dim}|${reset}")
-    printf -v fill '%-*.*s' "$inner" "$inner" " $label"
-    chart_rows+=("${dim}|${reset}$fill${dim}|${reset}")
-    start=$(("${#p1[@]}" - inner))
-    for ((col=0; col<inner; col++)); do
-        idx=$((start+col))
-        a=-1 b=-1
-        if (( idx >= 0 )); then a=${p1[idx]:--1}; b=${p2[idx]:--1}; fi
-        y1=0 y2=0
-        if (( height == 1 )); then
-            # Compact view uses intensity characters in place of the vertical axis.
-            r1=' '; r2=' '
-            if (( a >= 0 )); then r1=${levels:a*7/limit:1}; fi
-            if (( b >= 0 )); then r2=${levels:b*7/limit:1}; fi
-            y1=$r1 y2=$r2
-        else
-            (( a < 0 )) || y1=$((1+a*(height-1)/limit))
-            (( b < 0 )) || y2=$((1+b*(height-1)/limit))
-        fi
-        series_a[col]=$y1; series_b[col]=$y2
-    done
-    if (( height == 1 )); then
-        fill=
-        for ((col=0; col<inner; col++)); do fill+=${series_a[col]}; done
-        chart_rows+=("${dim}|${reset}${accent}$fill${reset}${dim}|${reset}")
-        if [[ $pane == disk || $pane == net ]]; then
-            fill=
-            for ((col=0; col<inner; col++)); do fill+=${series_b[col]}; done
-            chart_rows+=("${dim}|${reset}${secondary}$fill${reset}${dim}|${reset}")
-        fi
-    else
-        for ((row=height; row>=1; row--)); do
-            fill=
-            for ((col=0; col<inner; col++)); do
-                y1=${series_a[col]} y2=${series_b[col]}
-                if (( y1 == row && y2 == row )); then fill+="${bold}#${reset}"
-                elif (( y1 == row )); then fill+="${accent}*${reset}"
-                elif (( y2 == row )); then fill+="${secondary}+${reset}"
-                elif (( row == 1 || row == height )); then fill+="${dim}.${reset}"
-                else fill+=' '
-                fi
-            done
-            chart_rows+=("${dim}|${reset}$fill${dim}|${reset}")
-        done
-    fi
-    if [[ $pane == cpu || $pane == ram ]]; then
-        label=' Scale 0-100%'
-    else
-        tui_rate "$limit"
-        label=" Scale 0-$rate   # both"
-    fi
-    printf -v fill '%-*.*s' "$inner" "$inner" "$label"
-    chart_rows+=("${dim}|$fill|${reset}" "${dim}+$rule+${reset}")
 }
 
 chart_pair() {
     local first=$1 second=$2 index
-    local -a left_chart chart_rows series_a series_b
+    local -a left_chart chart_rows
     chart_build "$first" "$pane_width" "$chart_height"
     left_chart=("${chart_rows[@]}")
     chart_build "$second" "$pane_width" "$chart_height"
-    for ((index=0; index<${#left_chart[@]}; index++)); do
-        printf ' %s  %s\n' "${left_chart[index]}" "${chart_rows[index]}"
+    for ((index = 0; index < ${#left_chart[@]}; index++)); do
+        printf ' %s %s\n' "${left_chart[index]}" "${chart_rows[index]}"
     done
 }
 
 monitor_frame() {
-    local term_rows term_cols width pane_width chart_height pane line
-    local -a chart_rows series_a series_b
+    local term_rows term_cols width pane_width chart_height pane line text
+    local -a chart_rows
     tui_size
     width=$term_cols
-    (( width <= 150 )) || width=150
-    printf '\033[H\033[J%s %.*s%s\n' "$bold$accent" "$((width-1))" "LIVE SERVER MONITOR  [$activity]" "$reset"
-    if (( term_cols >= 68 && term_rows >= 20 )); then
-        pane_width=$(((width-4)/2)); chart_height=$(((term_rows-16)/2))
-        (( chart_height <= 10 )) || chart_height=10
+    ((width <= 170)) || width=170
+    printf ' %s%s%s  %s%s%s\n' "$bold$accent" 'LIVE SERVER MONITOR' "$reset" "$dim" "${H_NAME:-}  $activity" "$reset"
+    if ((term_cols >= 60 && term_rows >= 14)); then
+        pane_width=$(((width - 3) / 2))
+        chart_height=$(((term_rows - 8) / 2))
+        ((chart_height <= 16)) || chart_height=16
         chart_pair cpu ram
         chart_pair disk net
-    elif (( term_cols >= 28 && term_rows >= 30 )); then
-        pane_width=$((width>2?width-2:0))
+    elif ((term_cols >= 24 && term_rows >= 17)); then
+        pane_width=$((width - 2))
+        chart_height=$(((term_rows - 13) / 4))
         for pane in cpu ram disk net; do
-            chart_build "$pane" "$pane_width" 1
+            chart_build "$pane" "$pane_width" "$chart_height"
             for line in "${chart_rows[@]}"; do printf ' %s\n' "$line"; done
         done
     else
-        pane_width=$((width>2?width-2:0))
-        printf ' %.*s\n' "$pane_width" 'Resize for framed charts.'
-        if (( pane_width >= 10 && term_rows >= 16 )); then
-            for pane in cpu ram disk net; do
-                chart_build "$pane" "$pane_width" 1
-                printf ' %s\n' "${chart_rows[@]:1:${#chart_rows[@]}-3}"
-            done
-        fi
+        printf ' CPU %s%%  RAM %s%%\n Make the window larger to see charts.\n' "$cpu_pct" "$ram_pct"
     fi
-    if (( term_rows >= 20 )); then
-        printf ' %.*s\n' "$((width-1))" "Disk scope: ${metrics_disk_scope:-unknown}"
-        printf ' %.*s\n' "$((width-1))" "Network scope: ${metrics_net_scope:-unknown}"
-    fi
-    (( term_rows < 22 )) || printf ' %.*s\n' "$((width-1))" "Load: $load_now   Busiest: ${top_now:-unknown}"
-    printf ' %.*s\033[J' "$((width-1))" 'q Back / quit    Space Pause / resume'
+    text="Load $load_now   Busiest: ${top_now:-unknown}"
+    printf ' %.*s\n' "$((width - 1))" "$text"
+    text="Disk: ${metrics_disk_scope:-unknown}   Network: ${metrics_net_scope:-unknown}"
+    printf ' %s%.*s%s\n' "$dim" "$((width - 1))" "$text" "$reset"
+    printf ' %.*s' "$((width - 1))" 'q Back   Space Pause'
 }
 
 monitor_main() (
     local key activity=LIVE paused=no rc frame accent secondary dim bold reset selected
     local cpu_pct=-1 ram_pct=-1 disk_read=-1 disk_write=-1 net_rx=-1 net_tx=-1
-    local metrics_disk_scope metrics_net_scope levels='.:-=+*#@' load_now top_now
+    local metrics_disk_scope metrics_net_scope load_now top_now
     local -a cpu_history=() ram_history=() disk_r_history=() disk_w_history=() net_r_history=() net_t_history=()
     tui_open || return 1
     tui_style
+    tui_glyphs
     while :; do
         if [[ $paused == no ]]; then
             metrics_snapshot
             load_now=$(cut -d ' ' -f 1-3 /proc/loadavg 2>/dev/null)
             top_now=$(ps -eo comm=,pcpu= --sort=-pcpu 2>/dev/null | head -n 1 | clean | awk '{ print $1, $2 "%" }')
-            if (( ${#cpu_history[@]} >= 72 )); then
+            if (( ${#cpu_history[@]} >= 180 )); then
                 cpu_history=("${cpu_history[@]:1}"); ram_history=("${ram_history[@]:1}")
                 disk_r_history=("${disk_r_history[@]:1}"); disk_w_history=("${disk_w_history[@]:1}")
                 net_r_history=("${net_r_history[@]:1}"); net_t_history=("${net_t_history[@]:1}")
@@ -3003,7 +3071,7 @@ monitor_main() (
             net_r_history+=("$net_rx"); net_t_history+=("$net_tx")
         fi
         frame=$(monitor_frame)
-        printf '%s' "$frame" >&9
+        tui_paint "$frame"
         rc=0
         tui_key 1 || rc=$?
         (( rc != 1 )) || return 0
@@ -3062,6 +3130,7 @@ one_view() {
 }
 
 main() {
+    LHA_LOCALE=${LC_ALL:-${LC_CTYPE:-${LANG:-}}}
     export LC_ALL=C
     PATH=${LHA_TEST_PATH:+$LHA_TEST_PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     PATH+=:/snap/bin:/var/lib/snapd/snap/bin:/var/lib/rancher/rke2/bin:/opt/bin:/run/current-system/sw/bin
