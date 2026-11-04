@@ -9,6 +9,14 @@ It never prints passwords, process arguments, container environments or Kubernet
 
 ## Run it
 
+One line, on any Linux server:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ashahmohammadi/linux-host-audit/main/linux-host-audit.sh | sudo bash
+```
+
+If you are already root, or the server has no `sudo`, end it with `| bash`.
+
 With the script on the server:
 
 ```bash
