@@ -1,0 +1,94 @@
+name: real-linux
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  distros:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:24.04
+          - ubuntu:20.04
+          - debian:12
+          - almalinux:9
+          - rockylinux:8
+          - fedora:latest
+          - opensuse/leap:15
+          - archlinux:latest
+          - alpine:3.20
+          - bash:3.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run every view
+        run: |
+          docker run --rm -v "$PWD:/w:ro" "${{ matrix.image }}" sh -c '
+            if command -v apk >/dev/null && ! command -v bash >/dev/null; then apk add -q bash; fi
+            bash /w/tests/real-smoke.sh'
+
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Full report on a real systemd host, as root and as a normal user
+        run: |
+          sudo bash tests/real-smoke.sh
+          bash tests/real-smoke.sh
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start containers in known states
+        run: |
+          docker run -d --name lha-good nginx:1.27-alpine
+          docker run -d --name lha-sick --health-cmd=false --health-interval=1s --health-retries=1 nginx:1.27-alpine
+          docker run -d --name lha-priv --privileged nginx:1.27-alpine
+          docker run --name lha-failed alpine:3.20 sh -c 'exit 3' || true
+          docker run -d --name lha-loop --restart=always alpine:3.20 sh -c 'exit 1'
+          sleep 8
+      - name: The audit must report each state
+        run: |
+          sudo bash linux-host-audit.sh --containers | tee out.txt
+          for want in 'Container lha-sick is unhealthy' 'Container lha-loop keeps restarting' \
+              'Container lha-failed stopped with error code 3' 'Container lha-priv runs in privileged mode' \
+              'lha-good' 'Live usage per container' 'Disk used by images'; do
+              grep -qF "$want" out.txt || { echo "MISSING: $want"; exit 1; }
+          done
+          ! grep -F 'Container lha-good is' out.txt
+
+  kubernetes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install k3s
+        run: |
+          curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='--disable=traefik' sh -
+          for i in $(seq 1 60); do
+              sudo k3s kubectl get nodes 2>/dev/null | grep -q ' Ready' && break
+              sleep 2
+          done
+      - name: Create workloads in known states
+        run: |
+          sudo k3s kubectl create namespace lha
+          sudo k3s kubectl -n lha create deployment good --image=nginx:1.27-alpine
+          sudo k3s kubectl -n lha create deployment badimage --image=registry.invalid/none:1
+          sudo k3s kubectl -n lha run crash --image=alpine:3.20 --command -- sh -c 'exit 1'
+          sleep 60
+          sudo k3s kubectl get pods -A
+      - name: The audit must report each state
+        run: |
+          sudo bash linux-host-audit.sh --k8s | tee out.txt
+          for want in '1 of 1 ready' 'K3s' 'Pods that are not healthy' 'crash' 'badimage' \
+              'deployments lack ready replicas' 'Latest warning events'; do
+              grep -qF "$want" out.txt || { echo "MISSING: $want"; exit 1; }
+          done
+          ! grep -E 'SECRET|password=' out.txt
+          sudo bash linux-host-audit.sh --overview | tee over.txt
+          grep -qF 'Kubernetes cluster' over.txt
