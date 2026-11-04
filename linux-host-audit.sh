@@ -2746,43 +2746,143 @@ tui_rescan() {
     run_checks
 }
 
-tui_menu_labels() {
-    local i badge_docker='not found' badge_kube='not found'
-    if ((CT_N > 0)); then badge_docker=''
-        for ((i = 0; i < CT_N; i++)); do badge_docker+="${CT_ENGINE[i]} ${CT_STATE[i]%%,*} "; done
+# Worst finding in the given areas: crit, warn or ok.
+menu_state() {
+    local i
+    REPLY=ok
+    for ((i = 0; i < F_N; i++)); do
+        [[ ${F_AREA[i]} =~ ^($1)$ ]] || continue
+        case ${F_SEV[i]} in
+            CRIT) REPLY=crit; return 0 ;;
+            WARN) REPLY=warn ;;
+        esac
+    done
+}
+
+# menu_add STATE LABEL [BADGE] [HEADING]. HEADING starts a new group above this item.
+menu_add() {
+    menu_states[menu_n]=$1 menu_labels[menu_n]=$2 menu_badges[menu_n]=${3:-} menu_heads[menu_n]=${4:-}
+    ((menu_n += 1))
+}
+
+tui_menu_items() {
+    local i text failed
+    menu_n=0
+    menu_add tool 'Overview' 'what this server is' 'START HERE'
+    menu_state '.*'
+    menu_add "$REPLY" 'Problems and what to do' "$F_CRIT critical, $F_WARN warnings"
+
+    failed=$(awk 'NF { n++ } END { print n + 0 }' <<< "$SVC_FAILED")
+    text="$(awk 'NF { n++ } END { print n + 0 }' <<< "$SVC_APPS") services"
+    ((failed == 0)) || text+=", $failed failed"
+    menu_state services
+    menu_add "$REPLY" 'Applications and services' "$text" 'WHAT RUNS HERE'
+
+    if ((CT_N > 0)) || [[ -n $CT_PLATFORMS ]]; then
+        text=
+        for ((i = 0; i < CT_N; i++)); do text+="${CT_ENGINE[i]} ${CT_STATE[i]%%,*}  "; done
+        menu_state containers
+        menu_add "$REPLY" 'Docker and containers' "$text$CT_PLATFORMS"
+    else
+        menu_add none 'Docker and containers' 'not on this server'
     fi
-    if [[ $K_API == yes ]]; then badge_kube="$K_READY/$K_NODES nodes, $K_BAD bad pods"
-    elif [[ $K_ON == yes ]]; then badge_kube=found
+    if [[ $K_API == yes ]]; then
+        menu_state kubernetes
+        menu_add "$REPLY" 'Kubernetes' "$K_READY/$K_NODES nodes, $K_BAD bad pods"
+    elif [[ $K_ON == yes ]]; then
+        menu_state kubernetes
+        menu_add "$REPLY" 'Kubernetes' 'found, cluster not readable here'
+    else
+        menu_add none 'Kubernetes' 'not on this server'
     fi
-    actions=(
-        'Overview: what this server is, and its health'
-        "Problems and what to do  [$F_CRIT critical, $F_WARN warnings]"
-        'Applications and services'
-        "Ports, firewall and network  [$NET_PUBLIC public]"
-        "Docker and containers  [$badge_docker]"
-        "Kubernetes  [$badge_kube]"
-        "Websites, domains and SSL  [$W_CERT_N certs]"
-        'Databases and caches'
-        'Security'
-        'Logs: why did something stop? (may show private data)'
-        'Scheduled jobs, backups and monitoring'
-        'CPU, RAM and disk details'
-        'Live monitor (CPU, RAM, Disk, Network)'
-        'All installed software and listeners'
-        'Full report, everything on one page'
-        'Learn: guided tour and glossary'
-    )
+    menu_state web
+    menu_add "$REPLY" 'Websites, domains and SSL' "$W_CERT_N certificates"
+    menu_state data
+    if [[ -n $DB_ROWS ]]; then menu_add "$REPLY" 'Databases and caches'
+    else menu_add none 'Databases and caches' 'none found'
+    fi
+
+    menu_state network
+    menu_add "$REPLY" 'Ports, firewall and network' "$NET_PUBLIC public ports" 'NETWORK AND SAFETY'
+    menu_state security
+    menu_add "$REPLY" 'Security'
+    menu_state jobs
+    menu_add "$REPLY" 'Scheduled jobs, backups, monitoring'
+
+    menu_add tool 'Logs: why did something stop?' 'may show private data' 'WHEN SOMETHING IS WRONG'
+    menu_state 'resources|disk'
+    menu_add "$REPLY" 'CPU, RAM and disk' "CPU $R_CPU%, RAM $R_MEM_PCT%"
+    menu_add tool 'Live monitor' 'CPU, RAM, disk, network charts'
+
+    menu_add tool 'All installed software' '' 'MORE'
+    menu_add tool 'Full report on one page'
+    menu_add tool 'Learn: guided tour and glossary'
+}
+
+menu_frame() {
+    local index text icon color line room count offset=0 selected_line=0 gap=no legend
+    local width=$((term_cols - 10))
+    local -a lines=()
+    ((width >= 1)) || width=1
+    ((term_rows < 31)) || gap=yes
+    for ((index = 0; index < menu_n; index++)); do
+        if [[ -n ${menu_heads[index]} ]]; then
+            if [[ $gap == yes && $index != 0 ]]; then lines+=(''); fi
+            lines+=(" $bold${menu_heads[index]}$reset")
+        fi
+        case ${menu_states[index]} in
+            ok) icon=$g_ok color=$green ;;
+            warn) icon=$g_warn color=$secondary ;;
+            crit) icon=$g_crit color=$red ;;
+            none) icon=$g_none color=$dim ;;
+            *) icon=$g_tool color=$accent ;;
+        esac
+        printf -v text '%-36s' "${menu_labels[index]}"
+        line=${menu_badges[index]}
+        if ((width >= 36)); then line=${line:0:width-36}
+        else text=${text:0:width} line=
+        fi
+        if ((index == choice)); then
+            selected_line=${#lines[@]}
+            lines+=("$selected > ${menu_keys:index:1}  $icon  $text$line$reset")
+        else
+            lines+=("   ${menu_keys:index:1}  $color$icon$reset  $text$dim$line$reset")
+        fi
+    done
+    count=${#lines[@]}
+    room=$((term_rows - 3))
+    ((term_rows < 25)) || room=$((term_rows - 4))
+    ((room >= 3)) || room=3
+    if ((count > room)); then
+        offset=$((selected_line - room / 2))
+        ((offset >= 0)) || offset=0
+        ((offset <= count - room)) || offset=$((count - room))
+    fi
+    printf '%s %.*s%s\n' "$bold$accent" "$((term_cols - 1))" "LINUX HOST AUDIT  ${H_NAME:-}" "$reset"
+    printf ' %s\n' "$(verdict)"
+    ((term_rows < 25)) || printf '\n'
+    printf '%s\n' "${lines[@]:offset:room}"
+    legend="$g_ok ok  $g_warn warning  $g_crit critical  $g_none not here  "
+    if ((term_cols < 62)); then legend=; fi
+    printf ' %s%s%s' "$dim" "$legend" "$reset"
+    if ((count > room)); then printf '%sUp/Down scrolls  q quit%s' "$dim" "$reset"
+    else printf '%sEnter open  r rescan  q quit%s' "$dim" "$reset"
+    fi
 }
 
 tui_main() (
     local key choice=0 index frame term_rows term_cols accent secondary dim bold reset selected
     local tui_inherited=no tui_active=yes menu_keys=123456789abcdefg
-    local -a actions
-    local -a views=(view_overview view_problems view_apps view_network view_containers view_kube
-        view_web view_data view_security view_logs view_jobs view_resources_full
-        monitor view_inventory view_report view_learn)
+    local menu_n=0
+    local -a menu_states menu_labels menu_badges menu_heads
+    local -a views=(view_overview view_problems
+        view_apps view_containers view_kube view_web view_data
+        view_network view_security view_jobs
+        view_logs view_resources_full monitor
+        view_inventory view_report view_learn)
     tui_open || return 1
     tui_style
+    tui_glyphs
     LHA_COLOR=always
     ui_colors
     printf '\033[H\033[J\n  Reading this server. This takes a few seconds...\n\n' >&9
@@ -2790,24 +2890,13 @@ tui_main() (
     tui_report view_overview
     while :; do
         tui_size
-        tui_menu_labels
-        frame=$(
-            printf '%s %.*s%s\n' "$bold$accent" "$((term_cols-1))" "LINUX HOST AUDIT  ${H_NAME:-}" "$reset"
-            printf ' %.*s\n\n' "$((term_cols - 1))" "$(verdict)$reset"
-            for ((index=0; index<${#actions[@]}; index++)); do
-                if (( index == choice )); then
-                    printf ' %s> %s. %.*s%s\n' "$selected" "${menu_keys:index:1}" "$((term_cols>7?term_cols-7:0))" "${actions[index]}" "$reset"
-                else
-                    printf '   %s. %.*s\n' "${menu_keys:index:1}" "$((term_cols>7?term_cols-7:0))" "${actions[index]}"
-                fi
-            done
-            printf '\n%s %.*s%s\n' "$dim" "$((term_cols - 1))" 'Up/Down + Enter, or press a key.  r: rescan   q: quit' "$reset"
-        )
+        tui_menu_items
+        frame=$(menu_frame)
         tui_paint "$frame"
         tui_key '' || return 0
         case $key in
-            up|k) choice=$(((choice+${#actions[@]}-1)%${#actions[@]})); continue ;;
-            down|j) choice=$(((choice+1)%${#actions[@]})); continue ;;
+            up|k) choice=$(((choice+menu_n-1)%menu_n)); continue ;;
+            down|j) choice=$(((choice+1)%menu_n)); continue ;;
             r|R)
                 printf '\033[H\033[J\n  Reading this server again...\n\n' >&9
                 tui_rescan
@@ -2876,10 +2965,13 @@ tui_glyphs() {
     if [[ $glyph_mode == utf8 ]]; then
         g_h=$'\xe2\x94\x80' g_v=$'\xe2\x94\x82' g_tl=$'\xe2\x95\xad' g_tr=$'\xe2\x95\xae'
         g_bl=$'\xe2\x95\xb0' g_br=$'\xe2\x95\xaf'
+        g_ok=$'\xe2\x97\x8f' g_warn=$'\xe2\x96\xb2' g_crit=$'\xe2\x96\xa0'
+        g_none=$'\xe2\x97\x8b' g_tool=$'\xe2\x96\xba'
         blocks=(' ' $'\xe2\x96\x81' $'\xe2\x96\x82' $'\xe2\x96\x83' $'\xe2\x96\x84'
             $'\xe2\x96\x85' $'\xe2\x96\x86' $'\xe2\x96\x87' $'\xe2\x96\x88')
     else
         g_h=- g_v='|' g_tl=+ g_tr=+ g_bl=+ g_br=+
+        g_ok='*' g_warn='!' g_crit=X g_none=- g_tool='>'
         blocks=(' ' . . : : '=' '=' '#' '#')
     fi
 }
