@@ -2378,11 +2378,13 @@ check_logs() {
     local log count
     log=$(kernel_log | clean)
     L_OOM=$(grep -i 'out of memory\|oom-kill\|oom_reaper' <<< "$log" | tail -n 8 | cut -c1-120)
-    # Virtual floppy, CD and loop devices log I/O errors on healthy VMs.
+    # Virtual floppy, CD and loop devices log I/O errors on healthy VMs, and the kernel's
+    # boot command line can hold options such as nvme_core.io_timeout.
     count=$(grep -iE 'i/o error|ext4-fs error|xfs.*(corruption|error)|nvme.*(timeout|reset)|ata[0-9]+.*failed|blk_update_request' <<< "$log" |
-        grep -ivE 'dev (fd|sr|loop)[0-9]')
+        grep -ivE 'dev (fd|sr|loop)[0-9]|command line')
     L_DISK=$(tail -n 8 <<< "$count" | cut -c1-120)
-    L_HW=$(grep -iE 'machine check|hardware error|mce:|soft lockup|hung_task|segfault' <<< "$log" | tail -n 8 | cut -c1-120)
+    L_HW=$(grep -iE 'machine check events logged|hardware error|soft lockup|blocked for more than|segfault' <<< "$log" |
+        grep -iv 'command line' | tail -n 8 | cut -c1-120)
     if [[ -n $L_DISK ]]; then
         finding CRIT disk "Kernel logged $(awk 'END { print NR }' <<< "$count") disk errors recently" \
             'The disk may be failing. Check your backups before anything else.' 'journalctl -k -p err --since "7 days ago"'
