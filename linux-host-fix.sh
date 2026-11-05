@@ -4,19 +4,25 @@
 # Never prints passwords, process arguments, container environments or Kubernetes secrets.
 # Bash 3.2+ on any Linux. Missing tools only hide the part of the report that needs them.
 
-LHA_VERSION=3.5.0
+LHA_VERSION=3.6.0
+# Lets tests point file checks at a made-up server. Empty on a real one.
+LHA_ROOT=${LHA_TEST_ROOT:-}
 
 section() { title "$1"; }
 has() { type -P "$1" >/dev/null 2>&1; }
+
+# Without a system database, rpm creates a new one in the home folder.
+rpm_usable() {
+    has rpm && [[ -n $(ls /var/lib/rpm/Packages* /var/lib/rpm/rpmdb.sqlite \
+        /usr/lib/sysimage/rpm/Packages* /usr/lib/sysimage/rpm/rpmdb.sqlite 2>/dev/null) ]]
+}
 
 package_snapshot() {
     if has dpkg-query && [[ -r /var/lib/dpkg/status ]]; then
         dpkg-query -W -f='${Status}\t${Package}\t${Version}\n' 2>/dev/null |
             awk -F '\t' '$1 ~ / ok installed$/ { print "dpkg:" $2, $3 }'
     fi
-    # Without a system database, rpm creates a new one in the home folder.
-    if has rpm && [[ -n $(ls /var/lib/rpm/Packages* /var/lib/rpm/rpmdb.sqlite \
-        /usr/lib/sysimage/rpm/Packages* /usr/lib/sysimage/rpm/rpmdb.sqlite 2>/dev/null) ]]; then
+    if rpm_usable; then
         rpm -qa --qf 'rpm:%{NAME} %{VERSION}-%{RELEASE}\n' 2>/dev/null
     fi
     if has apk; then
@@ -554,8 +560,8 @@ metrics_snapshot() {
     if [[ -z $net_rows && -z $route && -r /proc/net/dev ]] && has awk; then
         # In isolated namespaces the visible interface can be virtual and have no PCI device.
         net_rows=$(awk 'NR > 2 {
-            line=$0; sub(/^[[:space:]]+/, "", line)
-            split(line,f,/[:[:space:]]+/)
+            line=$0; sub(/^[ \t]+/, "", line)
+            split(line,f,/[: \t]+/)
             if (f[1] != "lo" && f[2] ~ /^[0-9]+$/ && f[10] ~ /^[0-9]+$/) {
                 print "net", f[1], f[2], f[10]; count++
             }
@@ -665,6 +671,36 @@ metric_inventory() {
     return 0
 }
 
+# Java, Erlang and Python services all share one process name. Their main class or module says
+# what they are. Arguments can hold passwords, so each is only compared here, and never kept.
+runtime_role() {
+    local arg count=0
+    REPLY=
+    while IFS= read -r -d '' arg; do
+        ((count += 1))
+        ((count <= 400)) || break
+        case $arg in
+            org.apache.catalina.startup.Bootstrap) REPLY=tomcat; break ;;
+            kafka.Kafka) REPLY=kafka; break ;;
+            org.apache.zookeeper.server.quorum.QuorumPeerMain) REPLY=zookeeper; break ;;
+            org.apache.cassandra.service.CassandraDaemon) REPLY=cassandra; break ;;
+            org.elasticsearch.bootstrap.Elasticsearch) REPLY=elasticsearch; break ;;
+            org.opensearch.bootstrap.OpenSearch) REPLY=opensearch; break ;;
+            io.confluent.ksql.rest.server.KsqlServerMain) REPLY=ksql; break ;;
+            org.apache.activemq.console.Main|*/activemq.jar) REPLY=activemq; break ;;
+            -Dsolr.*) REPLY=solr; break ;;
+            org.logstash.Logstash) REPLY=logstash; break ;;
+            org.neo4j.server.*) REPLY=neo4j; break ;;
+            org.sonar.application.App) REPLY=sonarqube; break ;;
+            org.jboss.modules.Main|*/jboss-modules.jar) REPLY=wildfly; break ;;
+            rabbit|*/rabbit-[0-9]*) REPLY=rabbitmq-server; break ;;
+            */gunicorn|gunicorn|gunicorn.app.*) REPLY=gunicorn; break ;;
+            */uvicorn|uvicorn) REPLY=uvicorn; break ;;
+            */celery|celery) REPLY=celery; break ;;
+        esac
+    done 2>/dev/null < "$1"
+}
+
 scan_evidence() {
     local proc comm exe result
     systemd_visible=no diagnostic_units=$'\n' sig_rows='' sig_groups='' sig_current=''
@@ -680,6 +716,11 @@ scan_evidence() {
                 exe=${exe% (deleted)}
                 [[ -z $exe ]] || processes+="$exe"$'\n'
             fi
+            case $comm in
+                java|beam.smp|python*)
+                    runtime_role "${proc%/comm}/cmdline"
+                    [[ -z $REPLY ]] || processes+="$REPLY"$'\n' ;;
+            esac
         fi
     done
     if [[ $processes == $'\n' ]] && has ps; then
@@ -760,14 +801,14 @@ detect 'Tengine' '' '/usr/local/tengine/sbin/nginx' 'tengine' 'tengine'
 detect 'Lighttpd' 'lighttpd' '/etc/lighttpd/lighttpd.conf' 'lighttpd' 'lighttpd'
 detect 'Apache Tomcat' 'catalina.sh' '/etc/tomcat*/server.xml /opt/tomcat/bin/catalina.sh' 'tomcat tomcat[0-9] tomcat[0-9][0-9]' 'tomcat tomcat9 tomcat10 tomcat11'
 detect 'PHP CLI' 'php' '/opt/cpanel/ea-php*/root/usr/bin/php /opt/alt/php*/usr/bin/php /usr/local/php*/bin/php /www/server/php/*/bin/php /opt/plesk/php/*/bin/php' 'php-cli php[0-9]*-cli ea-php*-php-cli alt-php*-cli' ''
-detect 'PHP-FPM' 'php-fpm' '/etc/php/*/fpm/php-fpm.conf /etc/php-fpm.conf /opt/plesk/php/*/sbin/php-fpm /opt/cpanel/ea-php*/root/usr/sbin/php-fpm /www/server/php/*/sbin/php-fpm' 'php-fpm php[0-9]*-fpm ea-php*-php-fpm alt-php*-fpm' 'php-fpm php8.1-fpm php8.2-fpm php8.3-fpm php8.4-fpm php8.5-fpm'
+detect 'PHP-FPM' 'php-fpm' '/etc/php/*/fpm/php-fpm.conf /etc/php-fpm.conf /opt/plesk/php/*/sbin/php-fpm /opt/cpanel/ea-php*/root/usr/sbin/php-fpm /www/server/php/*/sbin/php-fpm' 'php-fpm php[0-9]*-fpm ea-php*-php-fpm alt-php*-fpm' 'php-fpm php5.6-fpm php7.0-fpm php7.1-fpm php7.2-fpm php7.3-fpm php7.4-fpm php8.0-fpm php8.1-fpm php8.2-fpm php8.3-fpm php8.4-fpm php8.5-fpm php-fpm5.6 php-fpm7.0 php-fpm7.1 php-fpm7.2 php-fpm7.3 php-fpm7.4 php-fpm8.0 php-fpm8.1 php-fpm8.2 php-fpm8.3 php-fpm8.4 php-fpm8.5'
 detect 'LiteSpeed PHP (LSAPI)' 'lsphp' '/usr/local/lsws/lsphp*/bin/lsphp /opt/alt/php*/usr/bin/lsphp' 'lsphp[0-9][0-9] lsphp' 'lsphp'
 detect 'Node.js' 'node nodejs' '' 'nodejs' 'node nodejs'
 detect 'Python' 'python3 python' '' 'python3' ''
 detect 'Gunicorn' 'gunicorn' '/etc/gunicorn.d' 'gunicorn gunicorn3' 'gunicorn'
 detect 'uWSGI' 'uwsgi' '/etc/uwsgi' 'uwsgi' 'uwsgi'
 detect 'Uvicorn' 'uvicorn' '' 'python3-uvicorn' 'uvicorn'
-detect 'Java' 'java' '' '' ''
+detect 'Java' 'java' '' '' 'java'
 detect 'Ruby' 'ruby' '' 'ruby' ''
 detect 'Passenger' 'passenger-status' '' 'passenger ea-apache24-mod-passenger' ''
 detect 'Composer' 'composer' '' 'composer' ''
@@ -921,11 +962,11 @@ detect 'Nextcloud' '' '/var/www/nextcloud/occ /var/www/html/occ' 'nextcloud' ''
 detect 'Apache Kafka' 'kafka-server-start.sh kafka-topics' '/opt/kafka/bin/kafka-server-start.sh /etc/kafka' 'kafka confluent-kafka' 'kafka'
 detect 'Apache ZooKeeper' 'zkServer.sh' '/etc/zookeeper /opt/zookeeper/bin/zkServer.sh' 'zookeeper zookeeperd' 'zookeeper'
 detect 'Apache Cassandra' 'cassandra' '/etc/cassandra/cassandra.yaml' 'cassandra' 'cassandra'
-detect 'ClickHouse' 'clickhouse-server clickhouse' '/etc/clickhouse-server/config.xml' 'clickhouse-server' 'clickhouse-server'
+detect 'ClickHouse' 'clickhouse-server clickhouse' '/etc/clickhouse-server/config.xml' 'clickhouse-server' 'clickhouse-server clickhouse-serv'
 detect 'InfluxDB' 'influxd' '/etc/influxdb/config.toml /etc/influxdb/influxdb.conf' 'influxdb influxdb2' 'influxd influxdb'
 detect 'TimescaleDB' '' '' 'timescaledb-*' ''
 detect 'MinIO object storage' 'minio' '/etc/default/minio' 'minio' 'minio'
-detect 'Ceph storage' 'ceph' '/etc/ceph/ceph.conf' 'ceph ceph-common' 'ceph-mon ceph-osd ceph-mgr'
+detect 'Ceph storage' 'ceph' '/etc/ceph/ceph.conf' 'ceph ceph-common' 'ceph-mon ceph-osd ceph-mgr ceph-mds'
 detect 'GlusterFS' 'glusterd' '/etc/glusterfs/glusterd.vol' 'glusterfs-server' 'glusterd'
 detect 'NFS server' 'exportfs' '/etc/exports' 'nfs-kernel-server nfs-utils' 'nfsd nfs-server'
 detect 'Samba' 'smbd' '/etc/samba/smb.conf' 'samba' 'smbd smb'
@@ -946,6 +987,65 @@ detect 'Proxmox Backup' 'proxmox-backup-client' '/etc/proxmox-backup' 'proxmox-b
 detect 'Uptime Kuma' '' '/opt/uptime-kuma' '' ''
 detect 'Glances' 'glances' '/etc/glances/glances.conf' 'glances' 'glances'
 detect 'Nagios' '' '/etc/nagios/nagios.cfg /usr/local/nagios/bin/nagios' 'nagios nagios4 nagios-nrpe-server' 'nagios nagios4 nrpe'
+
+sig_group 'Messaging, search and more'
+detect 'Apache ActiveMQ' 'activemq' '/etc/activemq /opt/activemq/bin/activemq' 'activemq' 'activemq'
+detect 'NSQ' 'nsqd' '' 'nsq' 'nsqd'
+detect 'Mosquitto MQTT' 'mosquitto' '/etc/mosquitto/mosquitto.conf' 'mosquitto' 'mosquitto'
+detect 'EMQX' 'emqx' '/etc/emqx/emqx.conf' 'emqx' 'emqx'
+detect 'Apache Solr' 'solr' '/opt/solr/bin/solr /etc/default/solr.in.sh' 'solr' 'solr'
+detect 'Meilisearch' 'meilisearch' '' 'meilisearch' 'meilisearch'
+detect 'Typesense' 'typesense-server' '/etc/typesense/typesense-server.ini' 'typesense-server' 'typesense-server'
+detect 'Logstash' 'logstash' '/etc/logstash/logstash.yml /usr/share/logstash/bin/logstash' 'logstash' 'logstash'
+detect 'Kibana' 'kibana' '/etc/kibana/kibana.yml /usr/share/kibana/bin/kibana' 'kibana' 'kibana'
+detect 'OpenSearch Dashboards' '' '/etc/opensearch-dashboards/opensearch_dashboards.yml' 'opensearch-dashboards' 'opensearch-dashboards'
+detect 'Filebeat' 'filebeat' '/etc/filebeat/filebeat.yml' 'filebeat' 'filebeat'
+detect 'Metricbeat' 'metricbeat' '/etc/metricbeat/metricbeat.yml' 'metricbeat' 'metricbeat'
+detect 'Grafana Loki' 'loki' '/etc/loki/config.yml /etc/loki/loki.yaml' 'loki' 'loki'
+detect 'Promtail' 'promtail' '/etc/promtail/config.yml' 'promtail' 'promtail'
+detect 'Prometheus Alertmanager' 'alertmanager' '/etc/alertmanager/alertmanager.yml' 'prometheus-alertmanager alertmanager' 'alertmanager prometheus-alertmanager'
+detect 'VictoriaMetrics' 'victoria-metrics' '' 'victoria-metrics' 'victoria-metrics victoriametrics'
+detect 'Jaeger' 'jaeger-all-in-one' '' '' 'jaeger jaeger-all-in-one'
+detect 'PgBouncer' 'pgbouncer' '/etc/pgbouncer/pgbouncer.ini' 'pgbouncer' 'pgbouncer'
+detect 'Pgpool-II' 'pgpool' '/etc/pgpool2/pgpool.conf /etc/pgpool-II/pgpool.conf' 'pgpool2 pgpool-II' 'pgpool pgpool2 pgpool-II'
+detect 'Patroni' 'patroni' '/etc/patroni/config.yml /etc/patroni.yml' 'patroni' 'patroni'
+detect 'ProxySQL' 'proxysql' '/etc/proxysql.cnf' 'proxysql' 'proxysql'
+detect 'MariaDB MaxScale' 'maxscale' '/etc/maxscale.cnf' 'maxscale' 'maxscale'
+detect 'CouchDB' 'couchdb' '/opt/couchdb/etc/local.ini /etc/couchdb/local.ini' 'couchdb' 'couchdb'
+detect 'Couchbase Server' '' '/opt/couchbase/bin/couchbase-server' 'couchbase-server couchbase-server-community' 'couchbase-server memcached.couch'
+detect 'CockroachDB' 'cockroach' '' '' 'cockroach cockroachdb'
+detect 'ScyllaDB' 'scylla' '/etc/scylla/scylla.yaml' 'scylla scylla-server' 'scylla scylla-server'
+detect 'Neo4j' 'neo4j' '/etc/neo4j/neo4j.conf' 'neo4j' 'neo4j'
+detect 'Dragonfly' 'dragonfly' '/etc/dragonfly/dragonfly.conf' 'dragonfly' 'dragonfly'
+detect 'Qdrant' 'qdrant' '/etc/qdrant' 'qdrant' 'qdrant'
+detect 'Nginx Unit' 'unitd' '' 'unit' 'unit unitd'
+detect 'FrankenPHP' 'frankenphp' '' 'frankenphp' 'frankenphp'
+detect 'Apache Traffic Server' 'traffic_server' '/etc/trafficserver/records.config /etc/trafficserver/records.yaml' 'trafficserver' 'trafficserver traffic_server'
+detect 'Pound' 'pound' '/etc/pound.cfg /etc/pound/pound.cfg' 'pound' 'pound'
+detect 'stunnel' 'stunnel stunnel4' '/etc/stunnel/stunnel.conf' 'stunnel4 stunnel' 'stunnel stunnel4'
+detect 'WildFly or JBoss' '' '/opt/wildfly/bin/standalone.sh /opt/jboss/bin/standalone.sh' 'wildfly' 'wildfly jboss'
+detect 'Jetty' '' '/etc/jetty/jetty.conf /opt/jetty/start.jar' 'jetty9 jetty' 'jetty jetty9'
+detect 'Celery' 'celery' '' 'python3-celery' 'celery'
+detect 'Sidekiq' 'sidekiq' '' '' 'sidekiq'
+detect 'Puma' 'puma' '' 'puma' 'puma'
+detect 'dotnet runtime' 'dotnet' '' 'dotnet-runtime-* aspnetcore-runtime-*' 'dotnet'
+detect 'Deno' 'deno' '' '' 'deno'
+detect 'Bun' 'bun' '' '' 'bun'
+detect 'SonarQube' '' '/opt/sonarqube/bin' '' 'sonarqube'
+detect 'Nexus Repository' '' '/opt/nexus/bin/nexus /opt/sonatype/nexus/bin/nexus' '' 'nexus'
+detect 'JFrog Artifactory' '' '/opt/jfrog/artifactory' 'jfrog-artifactory-oss' 'artifactory'
+detect 'Pi-hole' 'pihole' '/etc/pihole' '' 'pihole-FTL'
+detect 'AdGuard Home' 'AdGuardHome' '/opt/AdGuardHome/AdGuardHome' '' 'AdGuardHome'
+detect 'dnsdist' 'dnsdist' '/etc/dnsdist/dnsdist.conf' 'dnsdist' 'dnsdist'
+detect 'FRRouting' 'vtysh' '/etc/frr/frr.conf' 'frr' 'frr zebra bgpd'
+detect 'BIRD routing' 'bird birdc' '/etc/bird/bird.conf /etc/bird.conf' 'bird bird2' 'bird bird6'
+detect 'LVS load balancer tools' 'ipvsadm' '/etc/ipvsadm.rules' 'ipvsadm' ''
+detect 'DRBD' 'drbdadm' '/etc/drbd.conf' 'drbd-utils' 'drbd'
+detect 'Mailman' 'mailman' '/etc/mailman3/mailman.cfg /etc/mailman.cfg' 'mailman3 mailman' 'mailman3 mailman'
+detect 'Roundcube' '' '/etc/roundcube/config.inc.php /usr/share/roundcube/index.php' 'roundcube-core roundcube' ''
+detect 'Cyrus IMAP' 'cyrmaster' '/etc/imapd.conf' 'cyrus-imapd' 'cyrus-imapd cyrmaster'
+detect 'Icinga' 'icinga2' '/etc/icinga2/icinga2.conf' 'icinga2' 'icinga2'
+detect 'Graylog' '' '/etc/graylog/server/server.conf' 'graylog-server' 'graylog-server'
 }
 
 print_signatures() {
@@ -963,7 +1063,7 @@ print_signatures() {
 }
 
 run_audit() {
-    local show_missing=yes inventory=no journal=no all_services=no unit ignored
+    local show_missing=yes inventory=no journal=no all_services=no unit ignored raw
     while (($#)); do
         case $1 in
             --found-only) show_missing=no ;;
@@ -994,21 +1094,21 @@ run_audit() {
     printf '%s\n' 'Configuration matches may be inactive, overridden, or outside the loaded include tree.' \
         'A running cache service alone does not show that a site uses it.'
     if has awk; then
-        cache_directives 'NGINX FastCGI cache' '^[[:space:]]*fastcgi_cache[[:space:]]+[^[:space:]#;]+[[:space:]]*;' '^[[:space:]]*[a-z_]+[[:space:]]+off[[:space:]]*;' \
+        cache_directives 'NGINX FastCGI cache' '^[ \t]*fastcgi_cache[ \t]+[^ \t#;]+[ \t]*;' '^[ \t]*[a-z_]+[ \t]+off[ \t]*;' \
             /etc/nginx/nginx.conf /etc/nginx/{conf.d,sites-enabled,vhosts.d}/* \
             /usr/local/nginx/conf/nginx.conf /usr/local/nginx/conf/{conf.d,vhost}/* \
             /www/server/panel/vhost/nginx/*.conf
-        cache_directives 'NGINX proxy cache' '^[[:space:]]*proxy_cache[[:space:]]+[^[:space:]#;]+[[:space:]]*;' '^[[:space:]]*[a-z_]+[[:space:]]+off[[:space:]]*;' \
+        cache_directives 'NGINX proxy cache' '^[ \t]*proxy_cache[ \t]+[^ \t#;]+[ \t]*;' '^[ \t]*[a-z_]+[ \t]+off[ \t]*;' \
             /etc/nginx/nginx.conf /etc/nginx/{conf.d,sites-enabled,vhosts.d}/* \
             /usr/local/nginx/conf/nginx.conf /usr/local/nginx/conf/{conf.d,vhost}/* \
             /www/server/panel/vhost/nginx/*.conf
-        cache_directives 'Apache mod_cache' '^[[:space:]]*cacheenable[[:space:]]+(disk|socache|fd)[[:space:]]' '' \
+        cache_directives 'Apache mod_cache' '^[ \t]*cacheenable[ \t]+(disk|socache|fd)[ \t]' '' \
             /etc/apache2/apache2.conf /etc/apache2/{conf-enabled,mods-enabled,sites-enabled}/* \
             /etc/httpd/conf/httpd.conf /etc/httpd/conf.d/*.conf /usr/local/apache/conf/httpd.conf \
             /etc/apache2/conf/httpd.conf /www/server/panel/vhost/apache/*.conf
-        cache_directives 'LiteSpeed cache rules' '^[[:space:]]*(cacheengine[[:space:]]+on([[:space:]#]|$)|enablecache[[:space:]]+1([[:space:]#]|$)|<enablecache>[[:space:]]*1[[:space:]]*</enablecache>)' '' \
+        cache_directives 'LiteSpeed cache rules' '^[ \t]*(cacheengine[ \t]+on([ \t#]|$)|enablecache[ \t]+1([ \t#]|$)|<enablecache>[ \t]*1[ \t]*</enablecache>)' '' \
             /usr/local/lsws/conf/httpd_config.{conf,xml} /usr/local/lsws/conf/vhosts/*/*.conf
-        cache_directives 'PHP OPcache extension' '^[[:space:]]*zend_extension[[:space:]]*=[[:space:]]*[^;#]*opcache' '' \
+        cache_directives 'PHP OPcache extension' '^[ \t]*zend_extension[ \t]*=[ \t]*[^;#]*opcache' '' \
             /etc/php.ini /etc/php.d/*opcache*.ini /etc/php*/conf.d/*opcache*.ini \
             /etc/php/*/*/php.ini /etc/php/*/*/conf.d/*opcache*.ini \
             /opt/cpanel/ea-php*/root/etc/php.d/*opcache*.ini /opt/plesk/php/*/etc/php.d/*opcache*.ini \
@@ -1037,13 +1137,8 @@ run_audit() {
         section 'Service definitions and runtime states'
         printf '%s\n' "$units" "$active_units"
         section 'Local TCP and UDP listeners (addresses and ports)'
-        if has ss; then
-            if ! ss -H -lntu 2>/dev/null; then printf 'Listener inventory unavailable\n'; fi
-        elif has netstat; then
-            if ! netstat -lntu 2>/dev/null; then printf 'Listener inventory unavailable\n'; fi
-        else
-            printf 'Listener inventory unavailable (ss and netstat missing)\n'
-        fi
+        raw=$(net_listeners | awk '{ print $1, $3 ":" $2 }' | sort -u)
+        printf '%s\n' "${raw:-Listener inventory unavailable}"
     fi
     return 0
 }
@@ -1065,7 +1160,9 @@ ui_colors() {
 }
 
 # Container, log and event text is attacker-influenced: strip terminal control bytes.
-clean() { tr -d '\000-\010\013-\037\177'; }
+# U+0080 to U+009F include an 8-bit CSI, and take two bytes in UTF-8.
+LHA_C1=$'\xc2[\x80-\x9f]'
+clean() { tr -d '\000-\010\013-\037\177' | LC_ALL=C sed "s/$LHA_C1//g"; }
 
 # Every external probe that can hang goes through this, with stdin closed.
 run_t() {
@@ -1288,6 +1385,7 @@ check_eol() {
         debian:10) H_EOL=2024-06 ;;
         debian:11) H_EOL=2026-08 ;;
         debian:12) H_EOL=2028-06 ;;
+        debian:13) H_EOL=2030-06 ;;
     esac
     case $H_OS_ID:$H_OS_VERSION in
         ubuntu:14.04*) H_EOL=2019-04 ;;
@@ -1296,6 +1394,7 @@ check_eol() {
         ubuntu:20.04*) H_EOL=2025-05 ;;
         ubuntu:22.04*) H_EOL=2027-04 ;;
         ubuntu:24.04*) H_EOL=2029-04 ;;
+        ubuntu:26.04*) H_EOL=2031-04 ;;
     esac
     if [[ -n $H_EOL && $H_EOL < $(date +%Y-%m) ]]; then
         fid=os-eol ftarget="$H_OS" finding WARN security "$H_OS no longer gets free security updates" \
@@ -1400,7 +1499,8 @@ check_resources() {
         fid=raid-degraded finding CRIT disk 'A software RAID array is degraded' \
             'One disk already failed. Another failure can lose the data.' 'cat /proc/mdstat'
     fi
-    if has zpool; then
+    # zpool loads the zfs kernel module when it is not there, so only ask where it already is.
+    if has zpool && [[ -d /sys/module/zfs ]]; then
         line=$(run_t 5 zpool status -x 2>/dev/null) || line=
         if [[ -n $line && $line != *'all pools are healthy'* && $line != 'no pools available'* ]]; then
             fid=zfs-unhealthy finding CRIT disk 'A ZFS pool is not healthy' 'ZFS reports a problem with a pool.' 'zpool status -x'
@@ -1434,7 +1534,8 @@ check_resources() {
                 'When full, the kernel silently drops new connections.' 'sysctl net.netfilter.nf_conntrack_count'
         fi
     fi
-    R_ZOMBIES=$(awk '$3 == "Z"' /proc/[0-9]*/stat 2>/dev/null | wc -l | tr -d ' ')
+    # cat rides over a process that vanishes. awk alone stops there on mawk.
+    R_ZOMBIES=$(cat /proc/[0-9]*/stat 2>/dev/null | awk '{ sub(/^.*\) /, ""); if ($1 == "Z") n++ } END { print n + 0 }')
     if ((R_ZOMBIES >= 20)); then
         fid=zombies finding WARN resources "$R_ZOMBIES zombie processes" \
             'A parent process is not cleaning up its children, a sign of a buggy app.' 'ps -eo stat,ppid,comm | grep "^Z"'
@@ -1478,9 +1579,77 @@ view_resources() {
 # ---------------------------------------------------------------------------
 # Ports, firewall and network: this finds any application, known or not
 # ---------------------------------------------------------------------------
+# ss asks the kernel through sock_diag, and the kernel then loads these modules if it can.
+# So ss is only used where they are in already, or do not exist as modules at all.
+ss_quiet() {
+    local module
+    for module in "$@"; do
+        [[ ! -d $LHA_ROOT/sys/module/$module ]] || continue
+        # A container cannot see the module list, and the load would happen on its host.
+        [[ -z ${H_CONTAINER:-} ]] || return 1
+        if grep -qs "/$module\.ko" "$LHA_ROOT/lib/modules/$(uname -r)/modules.dep"; then return 1; fi
+    done
+}
+
+# Socket inode, then owner pid, read from /proc. Links and names only, never arguments.
+proc_socket_owners() {
+    ls -l /proc/[0-9]*/fd 2>/dev/null | awk '
+        /^\/proc\/[0-9]+\/fd:$/ { split($0, p, "/"); pid = p[3]; next }
+        match($0, /socket:\[[0-9]+\]$/) { print substr($0, RSTART + 8, RLENGTH - 9), pid }'
+}
+
+# Same rows as ss, from the tables the kernel publishes anyway.
+proc_listeners() {
+    local name
+    {
+        proc_socket_owners
+        for name in tcp tcp6 udp udp6; do
+            printf '@ %s\n' "$name"
+            cat "$LHA_ROOT/proc/net/$name" 2>/dev/null
+        done
+    } | awk -v root="$LHA_ROOT" '
+        function hex(s,   i, v) {
+            v = 0; s = tolower(s)
+            for (i = 1; i <= length(s); i++) v = v * 16 + index("0123456789abcdef", substr(s, i, 1)) - 1
+            return v
+        }
+        function v4(a) { return hex(substr(a, 7, 2)) "." hex(substr(a, 5, 2)) "." hex(substr(a, 3, 2)) "." hex(substr(a, 1, 2)) }
+        function v6(a,   out, i, w) {
+            if (a == "00000000000000000000000000000000") return "::"
+            if (a == "00000000000000000000000001000000") return "::1"
+            if (substr(a, 1, 24) == "0000000000000000FFFF0000") return "::ffff:" v4(substr(a, 25, 8))
+            out = ""
+            for (i = 0; i < 4; i++) {
+                w = tolower(substr(a, 8 * i + 1, 8))
+                out = out (i ? ":" : "") substr(w, 7, 2) substr(w, 5, 2) ":" substr(w, 3, 2) substr(w, 1, 2)
+            }
+            return out
+        }
+        function name_of(pid,   file, text) {
+            if (pid in names) return names[pid]
+            file = root "/proc/" pid "/comm"
+            text = "?"
+            if ((getline text < file) <= 0) text = "?"
+            close(file)
+            gsub(/ /, "_", text)
+            names[pid] = text
+            return text
+        }
+        $1 == "@" { table = $2; next }
+        table == "" { owner[$1] = $2; next }
+        $2 !~ /:/ { next }
+        {
+            udp = (table ~ /^udp/)
+            if (udp ? $4 != "07" : $4 != "0A") next
+            split($2, a, ":")
+            pid = ($10 in owner) ? owner[$10] : "-"
+            print (udp ? "udp" : "tcp"), hex(a[2]), (table ~ /6$/ ? v6(a[1]) : v4(a[1])), (pid == "-" ? "?" : name_of(pid)), pid
+        }'
+}
+
 net_listeners() {
     local raw
-    if has ss && raw=$(run_t 5 ss -lntup 2>/dev/null); then
+    if has ss && ss_quiet tcp_diag udp_diag && raw=$(run_t 5 ss -lntup 2>/dev/null); then
         awk '$1 ~ /^(tcp|udp)$/ {
             n = split($5, a, ":"); port = a[n]
             addr = substr($5, 1, length($5) - length(port) - 1)
@@ -1499,26 +1668,43 @@ net_listeners() {
             print $1, port, addr, proc, pid
         }' <<< "$raw"
     else
-        awk 'function hex(s,   i, v) {
-                v = 0; s = tolower(s)
-                for (i = 1; i <= length(s); i++) v = v * 16 + index("0123456789abcdef", substr(s, i, 1)) - 1
-                return v
-            }
-            FNR > 1 && $4 == "0A" {
-                split($2, a, ":")
-                ip = hex(substr(a[1], 7, 2)) "." hex(substr(a[1], 5, 2)) "." hex(substr(a[1], 3, 2)) "." hex(substr(a[1], 1, 2))
-                print "tcp", hex(a[2]), ip, "?", "-"
-            }' /proc/net/tcp 2>/dev/null
+        proc_listeners
     fi
 }
+
+# Established connections, optionally on some local ports. tcp_diag stays out of it this way,
+# and old ss has no -H anyway.
+tcp_count() {
+    local state=$1 from=${2:-0} to=${3:-65535}
+    shift 3
+    cat "$LHA_ROOT/proc/net/tcp" "$LHA_ROOT/proc/net/tcp6" 2>/dev/null | awk -v state="$state" -v from="$from" -v to="$to" -v ports=" $* " '
+        function hex(s,   i, v) {
+            v = 0; s = tolower(s)
+            for (i = 1; i <= length(s); i++) v = v * 16 + index("0123456789abcdef", substr(s, i, 1)) - 1
+            return v
+        }
+        $4 == state {
+            split($2, a, ":"); p = hex(a[2])
+            if (p < from + 0 || p > to + 0) next
+            if (ports != "  " && !index(ports, " " p " ")) next
+            n++
+        }
+        END { print n + 0 }'
+}
+
+# Which local port a program holds, and which program holds a port.
+port_of() { awk -v names=" $* " '$1 == "tcp" && index(names, " " $5 " ") { print $2; exit }' <<< "$NET_ROWS"; }
+port_owner() { awk -v p="$1" '$1 == "tcp" && $2 == p { print $5; exit }' <<< "$NET_ROWS"; }
 
 # NET_ROWS: proto port scope addr process pid, one row per proto/port/process.
 net_collect() {
     NET_ROWS=$(net_listeners | awk '
         function scope(a) {
             sub(/%.*/, "", a); gsub(/[][]/, "", a)
+            # Java and others bind a v4 address in v6 form.
+            sub(/^::ffff:/, "", a)
             if (a ~ /^127\./ || a == "::1") return 1
-            if (a ~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|f[cd]|fe80)/) return 2
+            if (a ~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|f[cd]|fe80)/) return 2
             return 3
         }
         {
@@ -1555,6 +1741,17 @@ port_name() {
         1433) REPLY='Microsoft SQL Server' ;;
         1521) REPLY='Oracle Database' ;;
         2049) REPLY='NFS file sharing' ;;
+        2181) REPLY='ZooKeeper' ;;
+        3128) REPLY='Squid proxy' ;;
+        4222) REPLY='NATS messaging' ;;
+        6432) REPLY='PgBouncer pool' ;;
+        7000|7001|9042) REPLY='Cassandra' ;;
+        8086) REPLY='InfluxDB' ;;
+        8123) REPLY='ClickHouse HTTP' ;;
+        9092) REPLY='Kafka' ;;
+        15672) REPLY='RabbitMQ web console' ;;
+        24007) REPLY='GlusterFS' ;;
+        25672) REPLY='RabbitMQ cluster' ;;
         2082|2083|2086|2087) REPLY=cPanel/WHM ;;
         2375) REPLY='Docker API WITHOUT encryption' ;;
         2376) REPLY='Docker API (TLS)' ;;
@@ -1629,7 +1826,7 @@ check_network() {
             2375)
                 fid=docker-api-open ftarget=2375 finding CRIT security 'Docker API is open without encryption on port 2375' \
                     'Anyone who reaches it gets root on this server.' 'ss -lntp | grep 2375' ;;
-            6379|11211|27017|9200|2379|5900|5901|3306|5432|1433)
+            6379|11211|27017|9200|2379|5900|5901|3306|5432|1433|2181|8086|8123|9042|9092|5672|15672)
                 port_name "$port"
                 if [[ $NET_FW_ON == yes ]]; then
                     fid=db-listens-all ftarget="$port" finding INFO security "$REPLY listens on all interfaces (port $port)" \
@@ -1741,12 +1938,13 @@ check_mail() {
         if has exim; then text=exim; else text=exim4; fi
         has "$text" && MAIL_QUEUE=$(run_t 8 "$text" -bpc 2>/dev/null | clean)
     elif [[ -n $(sig_list RUNNING '^Postfix') ]] && has postqueue; then
-        MAIL_QUEUE=$(run_t 8 postqueue -p 2>/dev/null | awk '/^[0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]/ { n++ } END { print n + 0 }')
+        # The summary line also counts long queue ids, which are not plain hex.
+        MAIL_QUEUE=$(run_t 8 postqueue -p 2>/dev/null | awk '/^-- / { for (i = 2; i < NF; i++) if ($(i + 1) ~ /^Requests?\.?$/) n = $i } END { print n + 0 }')
     fi
     [[ $MAIL_QUEUE =~ ^[0-9]+$ ]] || MAIL_QUEUE=
     if [[ -n $MAIL_QUEUE ]] && ((MAIL_QUEUE >= 1000)); then
         fid=mail-queue finding WARN services "$MAIL_QUEUE emails are stuck in the mail queue" \
-            'Mail is not leaving, or a hacked site is sending spam.' 'exim -bp | head'
+            'Mail is not leaving, or a hacked site is sending spam.' "$(if [[ -n $(sig_list RUNNING '^Exim') ]]; then printf 'exim -bp | head'; else printf 'postqueue -p | head'; fi)"
     fi
     return 0
 }
@@ -2183,7 +2381,7 @@ check_web() {
                     n = split(line, f, /[ \t]+/)
                     for (i = 2; i <= n; i++) {
                         if (f[i] ~ /^[#]/) break
-                        if (f[i] ~ /^[A-Za-z0-9*][-A-Za-z0-9.*]*\.[A-Za-z]{2,}$/ && f[i] !~ /^localhost/) print tolower(f[i])
+                        if (f[i] ~ /^[A-Za-z0-9*][-A-Za-z0-9.*]*\.[A-Za-z][A-Za-z]+$/ && f[i] !~ /^localhost/) print tolower(f[i])
                     }
                 }
             }' "${files[@]}" 2>/dev/null | sort -u | clean)
@@ -2290,20 +2488,25 @@ check_mysql() {
         fid=mysql-connections finding WARN data "MySQL uses $conn of $max connections" \
             'At the limit, apps get "too many connections".' "$client -e 'SHOW PROCESSLIST'"
     fi
-    out=$(run_t 6 "$client" --connect-timeout=3 -e 'SHOW SLAVE STATUS\G' 2>/dev/null)
+    # MySQL 8.4 removed the old statement and the old field names. MariaDB before 10.5 and
+    # MySQL before 8.0.22 know only those.
+    out=$(run_t 6 "$client" --connect-timeout=3 -e 'SHOW REPLICA STATUS\G' 2>/dev/null) || out=
+    [[ -n $out ]] || out=$(run_t 6 "$client" --connect-timeout=3 -e 'SHOW SLAVE STATUS\G' 2>/dev/null)
     if [[ -n $out ]]; then
-        behind=$(awk '/Seconds_Behind_Master:/ { print $2 }' <<< "$out")
-        db_row 'MySQL replica' "${behind:-?}s behind" "$(awk '/Slave_(IO|SQL)_Running:/ { printf "%s ", $0 }' <<< "$out" | tr -s ' ')"
+        behind=$(awk '/Seconds_Behind_(Master|Source):/ { print $2 }' <<< "$out")
+        db_row 'MySQL replica' "${behind:-?}s behind" "$(awk '/(Slave|Replica)_(IO|SQL)_Running:/ { printf "%s ", $0 }' <<< "$out" | tr -s ' ')"
         if [[ $out == *'Running: No'* ]]; then
             fid=mysql-replication-stopped finding CRIT data 'MySQL replication is stopped' 'This replica no longer receives data.' \
-                "$client -e 'SHOW SLAVE STATUS\\G'"
+                "$client -e 'SHOW REPLICA STATUS\\G'"
         fi
     fi
 }
 
 check_postgres() {
     if ! has pg_isready; then db_row PostgreSQL "$1" 'pg_isready not available'; return 0; fi
-    if ! run_t 5 pg_isready -t 3 >/dev/null 2>&1; then
+    local port
+    port=$(port_of postgres)
+    if ! run_t 5 pg_isready -t 3 ${port:+-p "$port"} >/dev/null 2>&1; then
         db_row PostgreSQL down 'pg_isready failed'
         fid=postgres-down finding CRIT data 'PostgreSQL is not answering' 'Apps using it will show database errors.' 'systemctl status postgresql'
         return 0
@@ -2312,17 +2515,25 @@ check_postgres() {
 }
 
 check_redis() {
-    local name=$1 cli=$2 out role mem clients save
+    local name=$1 cli=$2 out role mem clients save port
     has "$cli" || { db_row "$name" running 'no client to query it'; return 0; }
-    out=$(run_t 5 "$cli" -h 127.0.0.1 ping 2>&1)
+    port=$(port_of "${cli%-cli}-server")
+    REDIS_PORT=${port:-6379}
+    out=$(run_t 5 "$cli" -h 127.0.0.1 -p "$REDIS_PORT" ping 2>&1)
     case $out in
         *PONG*) ;;
         *NOAUTH*|*'Authentication required'*) db_row "$name" running 'password protected'; return 0 ;;
-        *) db_row "$name" down 'no answer on 127.0.0.1:6379'
+        *LOADING*) db_row "$name" starting 'loading its data into memory'; return 0 ;;
+        *) if [[ -z $port && -n $NET_ROWS ]]; then
+               # The listener table names every TCP port, so this one is on a Unix socket only.
+               db_row "$name" running 'no TCP port, so it was not queried'
+               return 0
+           fi
+           db_row "$name" down "no answer on 127.0.0.1:$REDIS_PORT"
            fid=redis-down ftarget="$name" finding CRIT data "$name is not answering" 'Caches, sessions and queues using it will fail.' "$cli ping"
            return 0 ;;
     esac
-    out=$(run_t 5 "$cli" -h 127.0.0.1 info 2>/dev/null | tr -d '\r')
+    out=$(run_t 5 "$cli" -h 127.0.0.1 -p "$REDIS_PORT" info 2>/dev/null | tr -d '\r')
     mem=$(awk -F: '$1 == "used_memory_human" { print $2 }' <<< "$out")
     clients=$(awk -F: '$1 == "connected_clients" { print $2 }' <<< "$out")
     role=$(awk -F: '$1 == "role" { print $2 }' <<< "$out")
@@ -2331,9 +2542,9 @@ check_redis() {
     if [[ $save == err ]]; then
         fid=redis-save-failing ftarget="$name" finding CRIT data "$name cannot save to disk" 'A restart would lose recent data, and writes may be refused.' "$cli info persistence"
     fi
-    if [[ $NET_ROWS == *"tcp 6379 public"* ]]; then
+    if [[ $NET_ROWS == *"tcp $REDIS_PORT public"* ]]; then
         fid=redis-open ftarget="$name" finding CRIT security "$name answers with no password on a public port" \
-            'Anyone can read the data, and this is a well-known way to take over servers.' 'ss -lntp | grep 6379'
+            'Anyone can read the data, and this is a well-known way to take over servers.' "ss -lntp | grep $REDIS_PORT"
     fi
 }
 
@@ -2368,9 +2579,12 @@ check_data() {
         [[ -z $(sig_list RUNNING '^RabbitMQ') ]] || echo 'RabbitMQ 5672'
         [[ -z $(sig_list RUNNING '^ClickHouse') ]] || echo 'ClickHouse 9000'
         [[ -z $(sig_list RUNNING '^Apache Kafka') ]] || echo 'Kafka 9092'
+        [[ -z $(sig_list RUNNING '^Apache Cassandra') ]] || echo 'Cassandra 9042'
+        [[ -z $(sig_list RUNNING '^InfluxDB') ]] || echo 'InfluxDB 8086'
+        [[ -z $(sig_list RUNNING '^NATS') ]] || echo 'NATS 4222'
     )"
     for ((line = 0; line < CT_N; line++)); do
-        out=$(printf '%s\n' "${CT_ROWS[line]}" | awk -F '|' 'tolower($2) ~ /(mysql|mariadb|postgres|redis|valkey|mongo|elastic|rabbitmq|clickhouse|kafka)/ {
+        out=$(printf '%s\n' "${CT_ROWS[line]}" | awk -F '|' 'tolower($2) ~ /(mysql|mariadb|postgres|redis|valkey|mongo|elastic|opensearch|rabbitmq|clickhouse|kafka|cassandra|influxdb)/ {
             printf "%s (%s) ", $1, ($3 ~ /^Up/ ? "up" : "down") }')
         [[ -z $out ]] || db_row 'In containers' "${CT_ENGINE[line]}" "$out"
     done
@@ -2398,12 +2612,40 @@ view_data() {
 # ---------------------------------------------------------------------------
 # Security posture
 # ---------------------------------------------------------------------------
+# What sshd reads, for when "sshd -T" cannot run. The first value wins, an Include counts where
+# it stands, and whatever follows a Match applies to some logins only.
+sshd_file_settings() {
+    local main=$1 files
+    files=$(printf '%s ' "${main%/*}"/sshd_config.d/*.conf)
+    awk -v included="$files" '
+        function take(file,   line, w, n, i, f) {
+            while ((getline line < file) > 0) {
+                sub(/^[ \t]+/, "", line)
+                if (line == "" || line ~ /^#/) continue
+                n = split(line, w, /[ \t=]+/)
+                if (n < 2) continue
+                w[1] = tolower(w[1])
+                if (w[1] == "match") break
+                if (w[1] == "include") {
+                    n = split(included, f, " ")
+                    for (i = 1; i <= n; i++) take(f[i])
+                    continue
+                }
+                if (!(w[1] in seen)) { seen[w[1]] = 1; print w[1], tolower(w[2]) }
+            }
+            close(file)
+        }
+        BEGIN { take("'"$main"'") }' 2>/dev/null
+}
+
+kernel_newest() { sed 's|.*/vmlinuz-||' | grep '^[0-9]' | grep -v 'rescue\|debug' | sort -V 2>/dev/null | tail -n 1; }
+
 check_security() {
     local out count value pid exe
     S_SSH= S_UPDATES=unknown S_FAILED=
     if has sshd && ((LHA_UID == 0)); then out=$(run_t 5 sshd -T 2>/dev/null); else out=; fi
     if [[ -z $out && -r /etc/ssh/sshd_config ]]; then
-        out=$(cat /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk '!/^[ \t]*#/ && NF >= 2 && !s[tolower($1)]++ { print tolower($1), $2 }')
+        out=$(sshd_file_settings /etc/ssh/sshd_config)
     fi
     if [[ -n $out ]]; then
         value=$(awk '$1 == "permitrootlogin" { print $2 }' <<< "$out")
@@ -2439,7 +2681,8 @@ check_security() {
             print p[3], link
         }')"
     if [[ -z $H_CONTAINER ]]; then
-        value=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | grep -v 'rescue\|debug' | sort -V 2>/dev/null | tail -n 1)
+        # Alpine and Arch name theirs vmlinuz-lts and vmlinuz-linux, which is no version.
+        value=$(ls /boot/vmlinuz-* 2>/dev/null | kernel_newest)
         if [[ -n $value && $value != "$H_KERNEL" ]]; then
             fid=kernel-pending ftarget="$value" finding WARN security "A newer kernel is installed: $value" \
                 "The server still runs $H_KERNEL, so its fixes are not active until a reboot." 'uname -r'
@@ -2529,7 +2772,11 @@ check_logs() {
     victims=$(grep -io 'killed process [0-9]* ([^)]*)' <<< "$log" | sed 's/.*(//; s/)//' | sort | uniq -c | sort -rn |
         head -n 4 | awk '{ printf "%s%s x%s", (NR > 1 ? ", " : ""), $2, $1 }')
     if [[ ${R_OOM:-0} =~ ^[1-9] || -n $victims ]]; then
-        fid=oom-kills ftarget="$victims" finding WARN resources "The kernel killed ${R_OOM:-some} processes for lack of memory since boot" \
+        # The journal reaches past the last boot, while the counter starts at zero with each boot.
+        if [[ ${R_OOM:-0} =~ ^[1-9] ]]; then count="The kernel killed $R_OOM processes for lack of memory since boot"
+        else count='The kernel killed processes for lack of memory in the last 7 days'
+        fi
+        fid=oom-kills ftarget="$victims" finding WARN resources "$count" \
             "${victims:+Killed in the last 7 days: $victims. }A service may have died silently. Add RAM or lower its memory settings." \
             'journalctl -k | grep -i "out of memory"'
     fi
@@ -2899,6 +3146,9 @@ app_row() {
     fi
 }
 
+# "mysql  Ver 8.0.36 for Linux", "mysql  Ver 14.14 Distrib 5.7.44" or "mariadb from 11.4.2-MariaDB".
+client_version() { sed -E 's/.*(Distrib|Ver|from) ([0-9]+\.[0-9]+).*/\2/'; }
+
 check_app_versions() {
     local text version listed=' ' eol
     APP_ROWS=
@@ -2912,7 +3162,7 @@ check_app_versions() {
         case $version in
             5.*) eol=2018-12 ;; 7.0) eol=2019-01 ;; 7.1) eol=2019-12 ;; 7.2) eol=2020-11 ;;
             7.3) eol=2021-12 ;; 7.4) eol=2022-11 ;; 8.0) eol=2023-11 ;; 8.1) eol=2025-12 ;;
-            8.2) eol=2026-12 ;; 8.3) eol=2027-12 ;; 8.4) eol=2028-12 ;; *) eol= ;;
+            8.2) eol=2026-12 ;; 8.3) eol=2027-12 ;; 8.4) eol=2028-12 ;; 8.5) eol=2029-12 ;; *) eol= ;;
         esac
         app_row php "$version" "$eol"
     done <<< "$text"
@@ -2921,11 +3171,11 @@ check_app_versions() {
     elif has mysql; then text=$(run_t 3 mysql --version 2>/dev/null)
     fi
     if [[ -n $(sig_list RUNNING '^(MariaDB server|MySQL-compatible)') ]]; then
-        version=$(sed -E 's/.*(Distrib|Ver) ([0-9]+\.[0-9]+).*/\2/' <<< "$text")
+        version=$(client_version <<< "$text")
         if [[ $text == *MariaDB* ]]; then
             case $version in
                 5.*|10.[0-2]) eol=2022-05 ;; 10.3) eol=2023-05 ;; 10.4) eol=2024-06 ;; 10.5) eol=2025-06 ;;
-                10.6) eol=2026-07 ;; 10.11) eol=2028-02 ;; 11.4) eol=2029-05 ;; *) eol= ;;
+                10.6) eol=2026-07 ;; 10.11) eol=2028-02 ;; 11.4) eol=2029-05 ;; 11.8) eol=2030-06 ;; *) eol= ;;
             esac
             app_row mariadb "$version" "$eol"
         else
@@ -2939,7 +3189,7 @@ check_app_versions() {
         version=$(run_t 3 psql --version 2>/dev/null | sed -E 's/.* ([0-9]+)[.0-9]*.*/\1/')
         case $version in
             9|10) eol=2022-11 ;; 11) eol=2023-11 ;; 12) eol=2024-11 ;; 13) eol=2025-11 ;; 14) eol=2026-11 ;;
-            15) eol=2027-11 ;; 16) eol=2028-11 ;; 17) eol=2029-11 ;; *) eol= ;;
+            15) eol=2027-11 ;; 16) eol=2028-11 ;; 17) eol=2029-11 ;; 18) eol=2030-11 ;; *) eol= ;;
         esac
         app_row postgresql "$version" "$eol"
     fi
@@ -2948,7 +3198,7 @@ check_app_versions() {
         if [[ $version =~ ^[0-9]+$ ]]; then
             case $version in
                 ?|1[0-6]) eol=2023-09 ;; 17|18) eol=2025-04 ;; 19|20) eol=2026-04 ;; 21|22) eol=2027-04 ;;
-                23|24) eol=2028-04 ;; *) eol= ;;
+                23|24) eol=2028-04 ;; 25|26) eol=2029-04 ;; *) eol= ;;
             esac
             app_row nodejs "$version" "$eol"
         fi
@@ -2964,6 +3214,8 @@ js() {
     text=${text//\\/\\\\}
     text=${text//\"/\\\"}
     text=${text//$'\t'/ }
+    text=${text//$'\n'/ }
+    text=${text//$'\r'/ }
     printf '"%s"' "$text"
 }
 
@@ -3045,6 +3297,20 @@ tune_real_kb() {
 }
 tune_round() { local unit=134217728; printf '%d' "$((($1 + unit - 1) / unit * unit))"; }
 
+# Seconds since the oldest process of these names started. Without etimes the answer is 0,
+# which counts as young, so such a system gets numbers and no advice.
+tune_age() {
+    ps -eo etimes=,comm= 2>/dev/null | awk -v names=" $* " '
+        index(names, " " $2 " ") && $1 + 0 > m { m = $1 + 0 } END { printf "%d", m }'
+}
+tune_age_pid() { ps -o etimes= -p "$1" 2>/dev/null | awk 'NR == 1 { printf "%d", $1 }'; }
+
+# True, and says so, while a service is too young to judge.
+tune_too_young() {
+    ((${2:-0} < TUNE_MATURE)) || return 1
+    tune_note "$1" "Running for only $(human_age "${2:-0}"). Numbers are shown, but no advice until it has a full day of traffic."
+}
+
 tune_mysql() {
     local client=mysql vars status label version group mature=no
     local max used pool total free fill reads reqs hit up rate data rec why eff tmp disk size files opened now conn created
@@ -3063,7 +3329,7 @@ tune_mysql() {
     group="$label ${version%%-*}"
     up=$(tune_get "$status" Uptime)
     ((up < TUNE_MATURE)) || mature=yes
-    [[ $mature == yes ]] || tune_note "$group" "Running for only $(human_age "$up"). Numbers are shown, but no advice until it has a full day of traffic."
+    tune_too_young "$group" "$up"
 
     max=$(tune_get "$vars" max_connections)
     used=$(tune_get "$status" Max_used_connections)
@@ -3093,7 +3359,8 @@ tune_mysql() {
             rec=$(tune_round "$rec")
             if ((rec > pool)); then why="Pool is full and only $hit% of reads come from memory."; else rec=''; fi
         elif ((fill <= 50 && pool > 1073741824)); then
-            rec=$(tune_round "$(((total - free) * pool / total * 13 / 10))")
+            # Page size first: pages times pool size overflows on a very large pool.
+            rec=$(tune_round "$(((total - free) * (pool / total) * 13 / 10))")
             why="Only $fill% is used after $(human_age "$up"). The rest could serve other programs."
         fi
     fi
@@ -3130,7 +3397,7 @@ tune_mysql() {
     fi
     tune_row "$group" thread_cache_size "$size" "$created created" "$(tune_pct "$created" "$conn")" "$rec" "$why" 'live'
 
-    if [[ $(tune_get "$vars" query_cache_type) == ON ]] && (($(tune_get "$vars" query_cache_size) > 0)); then
+    if [[ $mature == yes && $(tune_get "$vars" query_cache_type) == ON ]] && (($(tune_get "$vars" query_cache_size) > 0)); then
         tune_row "$group" query_cache_type ON 'in use' 0 OFF 'It takes a global lock on every write, and slows busy servers. Vendors advise against it.' 'live'
     fi
 
@@ -3144,11 +3411,12 @@ tune_mysql() {
     ((up == 0)) || rate=$(($(tune_get "$status" Innodb_os_log_written) * 3600 / up))
     rec='' why=''
     if [[ $mature == yes ]] && ((rate > size * files)); then
-        rec=$(tune_round "$((rate > 4294967296 ? 4294967296 : rate))")
+        # innodb_log_file_size is per file, so the hour of writes is shared between the files.
+        rec=$(tune_round "$(((rate > 4294967296 ? 4294967296 : rate) / files))")
         why="$(tune_size "$rate") of redo log is written each hour. Too small a log causes write stalls."
     fi
     if ((size > 0)); then
-        tune_row "$group" "$log_name" "$(tune_size "$((size * files))")" "$(tune_size "$rate") per hour" "$(tune_pct "$rate" "$((size * files))")" "${rec:+$(tune_size "$rec")}" "$why" 'restart' "$rec"
+        tune_row "$group" "$log_name" "$(tune_size "$size")" "$(tune_size "$rate") per hour" "$(tune_pct "$rate" "$((size * files))")" "${rec:+$(tune_size "$rec")}" "$why" 'restart' "$rec"
     fi
 
     now=$(tune_get "$status" Slow_queries)
@@ -3166,7 +3434,8 @@ tune_postgres() {
         tune_note PostgreSQL 'Details need root and the setpriv tool.'
         return 0
     fi
-    out=$(run_t 8 setpriv --reuid=postgres --regid=postgres --clear-groups psql -w -AtF $'\t' -c "
+    # -X: a .psqlrc can add lines to the output, or run anything.
+    out=$(run_t 8 setpriv --reuid=postgres --regid=postgres --clear-groups psql -X -w -AtF $'\t' -c "
         select name, setting from pg_settings where name in ('max_connections','shared_buffers','effective_cache_size','work_mem','server_version_num','block_size')
         union all select 'backends', sum(numbackends)::text from pg_stat_database
         union all select 'hit', round(100.0 * sum(blks_hit) / nullif(sum(blks_hit + blks_read), 0), 2)::text from pg_stat_database
@@ -3180,13 +3449,13 @@ tune_postgres() {
     hit=$(tune_get "$out" hit)
     rec='' why=''
     if (($(tune_get "$out" uptime) >= TUNE_MATURE)); then
-        if ((now * 100 / max >= 85)); then rec=$((max * 3 / 2)) why='Near the limit. A pooler such as PgBouncer is usually better than a higher number.'; fi
+        if ((max > 0 && now * 100 / max >= 85)); then rec=$((max * 3 / 2)) why='Near the limit. A pooler such as PgBouncer is usually better than a higher number.'; fi
     else
         tune_note "$group" 'Running for less than a day, so no advice yet.'
     fi
     tune_row "$group" max_connections "$max" "$now now" "$(tune_pct "$now" "$max")" "$rec" "$why" 'restart'
     rec='' why=''
-    if (($(tune_get "$out" uptime) >= TUNE_MATURE)) && [[ $(awk -v h="$hit" 'BEGIN { print (h + 0 < 99) }') == 1 ]] && ((shared < ram / 4)); then
+    if (($(tune_get "$out" uptime) >= TUNE_MATURE)) && [[ -n $hit ]] && [[ $(awk -v h="$hit" 'BEGIN { print (h + 0 < 99) }') == 1 ]] && ((shared < ram / 4)); then
         rec=$(tune_round "$((ram / 4))") why="Only $hit% of reads come from memory, and the buffer is under a quarter of RAM."
     fi
     tune_row "$group" shared_buffers "$(tune_size "$shared")" "$hit% read hits" "$(tune_pct "$shared" "$ram")" "${rec:+$(tune_size "$rec")}" "$why" 'restart'
@@ -3197,9 +3466,11 @@ tune_postgres() {
 }
 
 tune_redis() {
-    local name=$1 cli=$2 info conf max used clients limit evicted hits misses frag rec why group version
+    local name=$1 cli=$2 info conf max used clients limit evicted hits misses frag rec why group version port up ram=$((R_MEM_TOTAL * 1024))
     has "$cli" || return 0
-    info=$(run_t 5 "$cli" -h 127.0.0.1 info 2>/dev/null | tr -d '\r' | tr ':' '\t')
+    port=$(port_of "${cli%-cli}-server")
+    port=${port:-6379}
+    info=$(run_t 5 "$cli" -h 127.0.0.1 -p "$port" info 2>/dev/null | tr -d '\r' | tr ':' '\t')
     if [[ -z $info || $info == *NOAUTH* ]]; then tune_note "$name" 'It needs a password, so its limits could not be read.'; return 0; fi
     # Valkey keeps a redis_version of 7.2 for clients, and has its own real version.
     version=$(tune_get "$info" valkey_version)
@@ -3211,15 +3482,23 @@ tune_redis() {
     hits=$(tune_get "$info" keyspace_hits)
     misses=$(tune_get "$info" keyspace_misses)
     frag=$(tune_get "$info" mem_fragmentation_ratio)
+    up=$(tune_get "$info" uptime_in_seconds)
+    tune_too_young "$group" "$up"
     rec='' why=''
-    if ((max == 0)); then
-        rec=$(tune_round "$((used * 2))")
-        why='No limit is set, so it can grow until the kernel kills something. Also pick a maxmemory-policy.'
-    elif ((used * 100 / max >= 90 && evicted > 0)); then
-        rec=$(tune_round "$((max * 3 / 2))") why="It is full, and has evicted $evicted keys."
+    if ((up >= TUNE_MATURE)); then
+        if ((max == 0)); then
+            # A small instance is no evidence of anything, and a limit fails writes once reached.
+            if ((used * 10 >= ram)); then
+                rec=$(tune_round "$((used * 2))")
+                why='No limit is set, and it already uses a real part of RAM. It can grow until the kernel kills something. Also pick a maxmemory-policy.'
+            fi
+        elif ((used * 100 / max >= 90 && evicted > 0)); then
+            rec=$(tune_round "$((max * 3 / 2))") why="It is full, and has evicted $evicted keys."
+        fi
+        if [[ -n $rec ]] && ((rec > ram * 3 / 4)); then rec='' why=''; fi
     fi
     tune_row "$group" maxmemory "$( ((max == 0)) && printf unlimited || tune_size "$max")" "$(tune_size "$used") used" "$(tune_pct "$used" "$max")" "${rec:+$(tune_size "$rec")}" "$why" 'live' "$rec"
-    conf=$(run_t 5 "$cli" -h 127.0.0.1 config get maxclients 2>/dev/null | tail -n 1 | tr -d '\r')
+    conf=$(run_t 5 "$cli" -h 127.0.0.1 -p "$port" config get maxclients 2>/dev/null | tail -n 1 | tr -d '\r')
     clients=$(tune_get "$info" connected_clients)
     if [[ $conf =~ ^[0-9]+$ ]]; then tune_row "$group" maxclients "$conf" "$clients now" "$(tune_pct "$clients" "$conf")" '' ''; fi
     tune_note "$group" "$(tune_pct "$hits" "$((hits + misses))")% cache hit rate, $evicted keys evicted, memory fragmentation $frag."
@@ -3240,10 +3519,10 @@ tune_memcached() {
 }
 
 # Established clients on a port list, using only the kernel's own table.
-tune_connections() { run_t 5 ss -Htn state established "$1" 2>/dev/null | wc -l | tr -d ' '; }
+tune_connections() { tcp_count 01 0 65535 "$@"; }
 
 tune_nginx() {
-    local conf=/etc/nginx/nginx.conf procs conns cap wp wc rec why group nofile pid busy
+    local conf=/etc/nginx/nginx.conf procs conns cap wp wc rec why group nofile pid busy age
     [[ -n $(sig_list RUNNING '^(Nginx|OpenResty|Tengine)') ]] && has nginx || return 0
     [[ -r $conf ]] || conf=/usr/local/nginx/conf/nginx.conf
     [[ -r $conf ]] || return 0
@@ -3255,14 +3534,16 @@ tune_nginx() {
     rec='' why=''
     busy=$(ps -eo pcpu=,args= 2>/dev/null | awk '$2 == "nginx:" && $3 == "worker" { s += $1 } END { printf "%d", s }')
     # More workers only help if the ones it has are really busy.
-    if [[ $wp =~ ^[0-9]+$ ]] && ((wp < H_CPUS && procs > 0 && busy / procs >= 50)); then
+    age=$(tune_age nginx)
+    tune_too_young "$group" "$age"
+    if [[ $wp =~ ^[0-9]+$ ]] && ((age >= TUNE_MATURE && wp < H_CPUS && procs > 0 && busy / procs >= 50)); then
         rec=auto why="Workers average $((busy / procs))% CPU, and there are $H_CPUS cores."
     fi
     tune_row "$group" worker_processes "${wp:-1}" "$procs running" "$(tune_pct "$procs" "$H_CPUS")" "$rec" "$why" 'reload'
-    conns=$(tune_connections '( sport = :80 or sport = :443 )')
+    conns=$(tune_connections 80 443)
     cap=$((procs * wc))
     rec='' why=''
-    if ((cap > 0 && conns * 100 / cap >= 60)); then
+    if ((age >= TUNE_MATURE && cap > 0 && conns * 100 / cap >= 60)); then
         rec=$((wc * 2)) why="$conns open connections of $cap possible. A proxied request uses two."
     fi
     tune_row "$group" worker_connections "$wc" "$conns connections now" "$(tune_pct "$conns" "$cap")" "$rec" "$why" 'reload'
@@ -3270,24 +3551,27 @@ tune_nginx() {
     pid=$(ps -eo pid=,args= 2>/dev/null | awk '$2 == "nginx:" && $3 == "worker" { print $1; exit }')
     if [[ $pid =~ ^[0-9]+$ ]]; then
         nofile=$(awk '/^Max open files/ { print $4 }' "/proc/$pid/limits" 2>/dev/null)
-        if [[ $nofile =~ ^[0-9]+$ ]] && ((nofile < wc * 2)); then
+        if [[ $nofile =~ ^[0-9]+$ ]] && ((age >= TUNE_MATURE && nofile < wc * 2)); then
             tune_row "$group" worker_rlimit_nofile "$nofile" 'open file limit' 0 "$((wc * 2))" 'Each connection needs a file handle, and a proxied one needs two.' 'reload'
         fi
     fi
 }
 
 tune_apache() {
-    local bin mpm max threads procs conns reached file rec why group logs=0 real
+    local bin mpm max threads procs conns reached file rec why group logs=0 real age
     [[ -n $(sig_list RUNNING '^Apache HTTP') ]] || return 0
     if has httpd; then bin=httpd; else bin=apache2; fi
     has "$bin" || return 0
     group="Apache $(run_t 3 "$bin" -v 2>/dev/null | sed -n 's/.*Apache\/\([0-9.]*\).*/\1/p')"
     mpm=$(run_t 3 "$bin" -V 2>/dev/null | awk -F ': *' '/Server MPM/ { print tolower($2) }')
-    max=$(cat /etc/apache2/conf/httpd.conf /etc/apache2/conf.d/*.conf /etc/httpd/conf/httpd.conf /etc/httpd/conf.modules.d/*.conf \
-        /etc/apache2/mods-enabled/mpm_*.conf 2>/dev/null | awk 'tolower($1) ~ /^(maxrequestworkers|maxclients)$/ { v = $2 } END { print v }')
-    threads=$(cat /etc/apache2/conf/httpd.conf /etc/httpd/conf/httpd.conf /etc/apache2/mods-enabled/mpm_*.conf 2>/dev/null |
+    local R=$LHA_ROOT
+    max=$(cat "$R"/etc/apache2/conf/httpd.conf "$R"/etc/apache2/conf.d/*.conf "$R"/etc/httpd/conf/httpd.conf "$R"/etc/httpd/conf.modules.d/*.conf \
+        "$R"/etc/apache2/mods-enabled/mpm_*.conf 2>/dev/null | awk 'tolower($1) ~ /^(maxrequestworkers|maxclients)$/ { v = $2 } END { print v }')
+    threads=$(cat "$R"/etc/apache2/conf/httpd.conf "$R"/etc/httpd/conf/httpd.conf "$R"/etc/apache2/mods-enabled/mpm_*.conf 2>/dev/null |
         awk 'tolower($1) == "threadsperchild" { v = $2 } END { print v }')
-    threads=${threads:-25}
+    # A value can be a ${VARIABLE} from the environment file, and only numbers can be computed.
+    [[ $threads =~ ^[1-9][0-9]*$ ]] || threads=25
+    [[ $max =~ ^[1-9][0-9]*$ ]] || max=
     if [[ -z $max ]]; then
         if [[ $mpm == prefork ]]; then max=256; else max=400; fi
         tune_note "$group" "MaxRequestWorkers is not set, so the $mpm default of $max applies."
@@ -3300,7 +3584,9 @@ tune_apache() {
         break
     done
     rec='' why=''
-    if ((${reached:-0} > 0)); then
+    age=$(tune_age httpd apache2)
+    tune_too_young "$group" "$age"
+    if ((age >= TUNE_MATURE && ${reached:-0} > 0)); then
         rec=$((max * 3 / 2)) why="The error log shows the limit was hit $reached times, so visitors waited."
     fi
     if [[ $mpm == prefork ]]; then
@@ -3318,9 +3604,12 @@ tune_apache() {
 
 # PHP-FPM is judged per pool, from each pool's file, its workers, and its own limit-hit lines.
 tune_phpfpm() {
-    local pools workers logs line pool pm max count rss reached rec why total_run=0 shown=0 avg file real budget=0 measured=' ' pids
+    local pools workers logs line pool pm max count rss reached rec why total_run=0 shown=0 avg file real budget=0 measured=' ' pids age
     [[ -n $(sig_list RUNNING '^PHP-FPM') ]] || return 0
-    workers=$(ps -eo pid=,rss=,args= 2>/dev/null | awk '$3 == "php-fpm:" && $4 == "pool" { print }')
+    # Debian builds name the process after the binary, such as php-fpm8.2: pool www.
+    workers=$(ps -eo pid=,rss=,args= 2>/dev/null | awk '$3 ~ /^php-fpm[0-9.]*:$/ && $4 == "pool" { print }')
+    age=$(tune_age php-fpm php-fpm5.6 php-fpm7.0 php-fpm7.1 php-fpm7.2 php-fpm7.3 php-fpm7.4 php-fpm8.0 php-fpm8.1 php-fpm8.2 php-fpm8.3 php-fpm8.4 php-fpm8.5)
+    tune_too_young 'PHP-FPM pools' "$age"
     pools=$(cat /etc/php-fpm.d/*.conf /etc/php/*/fpm/pool.d/*.conf /usr/local/etc/php-fpm.d/*.conf /opt/cpanel/ea-php*/root/etc/php-fpm.d/*.conf \
         /opt/plesk/php/*/etc/php-fpm.d/*.conf /www/server/php/*/etc/php-fpm.conf 2>/dev/null | clean | awk '
         /^[ \t]*\[.*\]/ { name = $0; gsub(/[][ \t]/, "", name); if (name != "global") seen[name] = 1; next }
@@ -3348,12 +3637,12 @@ tune_phpfpm() {
         ((shown += 1))
         reached=$(grep -cF "[pool $pool]" <<< "$logs")
         rec='' why=''
-        if ((reached > 0 && max > 0)); then
+        if ((age >= TUNE_MATURE && reached > 0 && max > 0)); then
             rec=$((max * 3 / 2))
             why="Its log shows the limit was hit $reached times. Each worker uses about $(human_kb "$rss")."
         fi
         tune_row 'PHP-FPM pools' "${pool:0:30} ($pm)" "$max" "$count workers, $(human_kb "$rss") each" "$(tune_pct "$count" "$max")" "$rec" "$why" 'reload'
-        if [[ -z $rec ]] && ((max > 0 && count * 100 / max >= 90)); then
+        if [[ -z $rec ]] && ((age >= TUNE_MATURE && max > 0 && count * 100 / max >= 90)); then
             tune_note 'PHP-FPM pools' "$pool is close to its limit, with no limit hits logged yet. Watch it at peak traffic."
         fi
     done <<< "$(awk '{ n[$5]++; m[$5] += $2 } END { for (p in n) print n[p], int(m[p] / n[p]), p }' <<< "$workers" | sort -rn)"
@@ -3369,15 +3658,20 @@ tune_phpfpm() {
 }
 
 tune_elastic() {
-    local name=$1 row heap_pct heap_max ram_max disk rec why ver group
+    local name=$1 row heap_pct heap_max ram_max disk rec why ver group up
     [[ -n $(sig_list RUNNING "^$name") ]] && has curl || return 0
     ver=$(run_t 5 curl -s -m 3 http://127.0.0.1:9200/ 2>/dev/null | clean | sed -n 's/.*"number" *: *"\([0-9.]*\)".*/\1/p' | head -n 1)
     if [[ -z $ver ]]; then tune_note "$name" 'It needs a password, so its limits could not be read.'; return 0; fi
     group="$name $ver"
+    up=$(run_t 5 curl -s -m 3 'http://127.0.0.1:9200/_nodes/stats/jvm?filter_path=nodes.*.jvm.uptime_in_millis' 2>/dev/null | clean |
+        sed -n 's/.*"uptime_in_millis" *: *\([0-9]*\).*/\1/p' | head -n 1)
+    up=$((${up:-0} / 1000))
+    tune_too_young "$group" "$up"
     while read -r row heap_pct heap_max ram_max disk; do
         [[ $heap_max =~ ^[0-9]+$ ]] || continue
         rec='' why=''
-        if ((heap_max > 33285996544)); then rec=31g why='Above about 31 GiB, the JVM loses compressed pointers and gets less usable heap.'
+        if ((up < TUNE_MATURE)); then :
+        elif ((heap_max > 33285996544)); then rec=31g why='Above about 31 GiB, the JVM loses compressed pointers and gets less usable heap.'
         elif ((heap_max * 2 > ram_max + ram_max / 10)); then rec=$(tune_size "$((ram_max / 2))") why='Heap should leave half of RAM to the file cache.'
         elif ((heap_pct >= 85)); then rec=$(tune_size "$((heap_max * 3 / 2))") why="Heap is $heap_pct% full, so long garbage collection pauses are likely."
         fi
@@ -3388,12 +3682,14 @@ tune_elastic() {
 }
 
 tune_mongo() {
-    local client=mongosh out cache used conn avail ver group rec why
+    local client=mongosh out cache used conn avail ver group rec why up ram=$((R_MEM_TOTAL * 1024))
     [[ -n $(sig_list RUNNING '^MongoDB') ]] || return 0
     has mongosh || client=mongo
     has "$client" || return 0
-    out=$(run_t 8 "$client" --quiet --eval 'var s = db.serverStatus(), c = s.wiredTiger.cache;
-        print("version\t" + s.version); print("cache\t" + c["maximum bytes configured"]);
+    # mongosh keeps a log and a config in its home folder, and reports usage unless told not to.
+    # A home inside /proc cannot be created, even by root.
+    out=$(run_t 8 env HOME=/proc/nonexistent DO_NOT_TRACK=1 "$client" --quiet --norc --eval 'var s = db.serverStatus(), c = s.wiredTiger.cache;
+        print("version\t" + s.version); print("uptime\t" + s.uptime); print("cache\t" + c["maximum bytes configured"]);
         print("used\t" + c["bytes currently in the cache"]); print("conn\t" + s.connections.current);
         print("avail\t" + s.connections.available);' 2>/dev/null | clean)
     if [[ -z $out || $out == *rror* ]]; then tune_note MongoDB 'It needs a login, so its limits could not be read.'; return 0; fi
@@ -3402,8 +3698,12 @@ tune_mongo() {
     used=$(tune_get "$out" used)
     conn=$(tune_get "$out" conn)
     avail=$(tune_get "$out" avail)
+    up=$(tune_get "$out" uptime)
+    tune_too_young "$group" "$up"
     rec='' why=''
-    if ((cache > 0 && used * 100 / cache >= 95)); then rec=$(tune_round "$((cache * 3 / 2))") why='The WiredTiger cache is full. Check it stays within RAM.'; fi
+    if ((up >= TUNE_MATURE && cache > 0 && used * 100 / cache >= 95 && cache * 3 / 2 < ram * 3 / 4)); then
+        rec=$(tune_round "$((cache * 3 / 2))") why='The WiredTiger cache is full. Check it stays within RAM.'
+    fi
     tune_row "$group" wiredTigerCacheSizeGB "$(tune_size "$cache")" "$(tune_size "$used") used" "$(tune_pct "$used" "$cache")" "${rec:+$(tune_size "$rec")}" "$why" 'restart'
     tune_row "$group" maxIncomingConnections "$((conn + avail))" "$conn now" "$(tune_pct "$conn" "$((conn + avail))")" '' ''
     tune_budget MongoDB "$cache"
@@ -3421,8 +3721,9 @@ tune_haproxy() {
     group="HAProxy $(tune_get "$out" Version)"
     max=$(tune_get "$out" Maxconn)
     now=$(tune_get "$out" CurrConns)
+    tune_too_young "$group" "$(tune_get "$out" Uptime_sec)"
     rec='' why=''
-    if ((max > 0 && now * 100 / max >= 80)); then rec=$((max * 3 / 2)) why="$now of $max connections are in use."; fi
+    if (($(tune_get "$out" Uptime_sec) >= TUNE_MATURE && max > 0 && now * 100 / max >= 80)); then rec=$((max * 3 / 2)) why="$now of $max connections are in use."; fi
     tune_row "$group" maxconn "$max" "$now now" "$(tune_pct "$now" "$max")" "$rec" "$why" 'reload'
 }
 
@@ -3437,8 +3738,9 @@ tune_varnish() {
     nuked=$(tune_get "$stats" MAIN.n_lru_nuked)
     hit=$(tune_get "$stats" MAIN.cache_hit)
     miss=$(tune_get "$stats" MAIN.cache_miss)
+    tune_too_young "$group" "$(tune_get "$stats" MAIN.uptime)"
     rec='' why=''
-    if ((nuked > 0)); then rec=$(tune_round "$(((used + free) * 3 / 2))") why="$nuked objects were pushed out for lack of room."; fi
+    if (($(tune_get "$stats" MAIN.uptime) >= TUNE_MATURE && nuked > 0)); then rec=$(tune_round "$(((used + free) * 3 / 2))") why="$nuked objects were pushed out for lack of room."; fi
     tune_row "$group" 'malloc storage' "$(tune_size "$((used + free))")" "$(tune_size "$used") used" "$(tune_pct "$used" "$((used + free))")" "${rec:+$(tune_size "$rec")}" "$why" 'restart'
     tune_note "$group" "$(tune_pct "$hit" "$((hit + miss))")% cache hit rate."
     tune_budget Varnish "$((used + free))"
@@ -3455,6 +3757,26 @@ tune_litespeed() {
     [[ $max =~ ^[0-9]+$ ]] && tune_row "$group" maxConnections "$max" "${now:-0} now" "$(tune_pct "${now:-0}" "$max")" '' ''
 }
 
+# The stock server.xml carries a maxThreads inside a comment, and the number of the real
+# connector is what counts. Comments can span lines, so they go first.
+tomcat_threads() {
+    awk '{
+        line = $0
+        while (line != "") {
+            if (off) {
+                p = index(line, "-->")
+                if (!p) next
+                line = substr(line, p + 3); off = 0
+            } else {
+                p = index(line, "<!--")
+                if (!p) { print line; next }
+                print substr(line, 1, p - 1)
+                line = substr(line, p + 4); off = 1
+            }
+        }
+    }' "$1" 2>/dev/null | grep -o 'maxThreads="[0-9]*"' | head -n 1 | tr -dc 0-9
+}
+
 tune_tomcat() {
     local file threads pid busy heap group
     [[ -n $(sig_list RUNNING '^Apache Tomcat') ]] || return 0
@@ -3462,7 +3784,7 @@ tune_tomcat() {
         [[ -r $file ]] && break
     done
     [[ -r ${file:-} ]] || return 0
-    threads=$(grep -o 'maxThreads="[0-9]*"' "$file" | head -n 1 | tr -dc 0-9)
+    threads=$(tomcat_threads "$file")
     threads=${threads:-200}
     pid=$(ps -eo pid=,args= 2>/dev/null | awk '/org\.apache\.catalina/ { print $1; exit }')
     group=Tomcat
@@ -3474,6 +3796,390 @@ tune_tomcat() {
     fi
     tune_row "$group" maxThreads "$threads" "${busy:-0} JVM threads in all" 0 '' ''
     tune_row "$group" 'JVM heap' "${heap:-default}" 'set with -Xmx' 0 '' ''
+}
+
+# Prometheus text as name<TAB>value, with labels dropped and series added up.
+tune_fetch() { run_t 5 curl -fs -m 3 "$1" 2>/dev/null | clean; }
+tune_metrics() {
+    awk '/^#/ { next } { sub(/\{[^}]*\}/, ""); if (NF >= 2) s[$1] += $2 } END { for (k in s) printf "%s\t%.0f\n", k, s[k] }' <<< "$1"
+}
+
+# Open files as a service counts them itself. The row appears only if it reports both numbers.
+tune_metric_files() {
+    local group=$1 data=$2 age=$3 open max rec='' why=''
+    open=$(tune_get "$data" process_open_fds)
+    max=$(tune_get "$data" process_max_fds)
+    ((max > 0)) || return 0
+    if ((age >= TUNE_MATURE && open * 100 / max >= 70)); then
+        rec=$((max * 2)) why="$open of $max file handles are in use. Reaching the limit makes new connections fail."
+    fi
+    tune_row "$group" 'open files' "$max" "$open open" "$(tune_pct "$open" "$max")" "$rec" "$why" 'restart'
+}
+
+tune_disk_row() {
+    local group=$1 label=$2 path=$3 used free size pct
+    read -r size used free pct <<< "$(run_t 5 df -Pk "$path" 2>/dev/null | awk 'NR == 2 { sub(/%/, "", $5); print $2, $3, $4, $5 }')"
+    [[ $size =~ ^[0-9]+$ ]] || return 0
+    tune_row "$group" "disk $label" "$(human_kb "$size")" "$(human_kb "$free") free" "${pct:-0}" '' ''
+}
+
+tune_rabbitmq() {
+    local raw data group=RabbitMQ limit used avail low up rec why version ram=$((R_MEM_TOTAL * 1024))
+    [[ -n $(sig_list RUNNING '^RabbitMQ') ]] || return 0
+    if has curl; then raw=$(tune_fetch http://127.0.0.1:15692/metrics); fi
+    if [[ -z ${raw:-} ]]; then
+        tune_note "$group" 'Its Prometheus port 15692 did not answer, so limits were not read. rabbitmqctl is left out on purpose: its wrapper switches user, which writes to the auth log.'
+        return 0
+    fi
+    data=$(tune_metrics "$raw")
+    version=$(sed -n 's/.*rabbitmq_version="\([0-9.]*\)".*/\1/p' <<< "$raw" | head -n 1)
+    [[ -z $version ]] || group="RabbitMQ $version"
+    up=$(tune_get "$data" rabbitmq_erlang_uptime_seconds)
+    tune_too_young "$group" "$up"
+    limit=$(tune_get "$data" rabbitmq_resident_memory_limit_bytes)
+    used=$(tune_get "$data" rabbitmq_process_resident_memory_bytes)
+    rec='' why=''
+    if ((limit > 0)); then
+        if ((up >= TUNE_MATURE && $(tune_get "$data" rabbitmq_alarms_memory_used_watermark) > 0 && limit * 3 / 2 < ram * 3 / 4)); then
+            rec=$((limit * 3 / 2)) why='The memory alarm is on, so publishers are blocked. Consuming the queues comes first.'
+        fi
+        tune_row "$group" vm_memory_high_watermark "$(tune_size "$limit")" "$(tune_size "$used") used" "$(tune_pct "$used" "$limit")" "${rec:+$(tune_size "$rec")}" "$why" 'restart' "$rec"
+        tune_budget RabbitMQ "$limit"
+    fi
+    avail=$(tune_get "$data" rabbitmq_disk_space_available_bytes)
+    low=$(tune_get "$data" rabbitmq_disk_space_available_limit_bytes)
+    if ((low > 0 && avail > 0)); then
+        tune_row "$group" disk_free_limit "$(tune_size "$low")" "$(tune_size "$avail") free" "$(tune_pct "$low" "$avail")" '' ''
+    fi
+    tune_metric_files "$group" "$(awk -F '\t' '$1 == "rabbitmq_process_open_fds" { print "process_open_fds\t" $2 } $1 == "rabbitmq_process_max_fds" { print "process_max_fds\t" $2 }' <<< "$data")" "$up"
+    tune_note "$group" "$(tune_get "$data" rabbitmq_connections) connections, $(tune_get "$data" rabbitmq_queue_messages) messages in queues."
+}
+
+# The query goes in the URL of a read-only GET. log_queries keeps it out of its query log.
+tune_clickhouse_query() {
+    run_t 5 curl -fs -m 4 -G --data-urlencode "query=$1" --data log_queries=0 http://127.0.0.1:8123/ 2>/dev/null | clean
+}
+
+tune_clickhouse() {
+    local version group settings metrics events up max now mem limit ratio rec why
+    [[ -n $(sig_list RUNNING '^ClickHouse') ]] || return 0
+    if ! has curl || ! version=$(tune_clickhouse_query 'SELECT version()') || [[ -z $version ]]; then
+        tune_note ClickHouse 'Port 8123 did not answer without a password, so its limits could not be read.'
+        return 0
+    fi
+    group="ClickHouse $version"
+    up=$(tune_clickhouse_query 'SELECT uptime()')
+    [[ $up =~ ^[0-9]+$ ]] || up=0
+    tune_too_young "$group" "$up"
+    metrics=$(tune_clickhouse_query "SELECT metric, value FROM system.metrics WHERE metric IN ('TCPConnection','HTTPConnection','Query','MemoryTracking') FORMAT TabSeparated")
+    events=$(tune_clickhouse_query "SELECT event, value FROM system.events WHERE event IN ('RejectedInserts','DelayedInserts','QueryMemoryLimitExceeded') FORMAT TabSeparated")
+    # server_settings only exists on 23.4 and newer.
+    settings=$(tune_clickhouse_query "SELECT name, value FROM system.server_settings WHERE name IN ('max_connections','max_concurrent_queries','max_server_memory_usage','max_server_memory_usage_to_ram_ratio') FORMAT TabSeparated")
+    max=$(tune_get "$settings" max_connections)
+    now=$(($(tune_get "$metrics" TCPConnection) + $(tune_get "$metrics" HTTPConnection)))
+    if ((max > 0)); then
+        rec='' why=''
+        if ((up >= TUNE_MATURE && now * 100 / max >= 85)); then rec=$((max * 3 / 2)) why="$now of $max connections are in use."; fi
+        tune_row "$group" max_connections "$max" "$now now" "$(tune_pct "$now" "$max")" "$rec" "$why" 'restart'
+    fi
+    max=$(tune_get "$settings" max_concurrent_queries)
+    now=$(tune_get "$metrics" Query)
+    if ((max > 0)); then tune_row "$group" max_concurrent_queries "$max" "$now running" "$(tune_pct "$now" "$max")" '' ''; fi
+    mem=$(tune_get "$metrics" MemoryTracking)
+    limit=$(tune_get "$settings" max_server_memory_usage)
+    ratio=$(tune_get "$settings" max_server_memory_usage_to_ram_ratio)
+    if ((limit == 0)) && [[ $ratio != 0 ]]; then
+        limit=$(awk -v r="$ratio" -v k="$R_MEM_TOTAL" 'BEGIN { printf "%.0f", r * k * 1024 }')
+    fi
+    if ((limit > 0)); then
+        tune_row "$group" max_server_memory_usage "$(tune_size "$limit")" "$(tune_size "$mem") used" "$(tune_pct "$mem" "$limit")" '' ''
+        tune_budget ClickHouse "$limit"
+    fi
+    if (($(tune_get "$events" RejectedInserts) > 0)); then
+        tune_note "$group" "$(tune_get "$events" RejectedInserts) inserts were rejected for too many parts. Insert in bigger, rarer batches."
+    fi
+    if (($(tune_get "$events" QueryMemoryLimitExceeded) > 0)); then
+        tune_note "$group" "$(tune_get "$events" QueryMemoryLimitExceeded) queries hit a memory limit."
+    fi
+}
+
+tune_influx() {
+    local raw data group=InfluxDB version
+    [[ -n $(sig_list RUNNING '^InfluxDB') ]] || return 0
+    has curl || { tune_note "$group" 'Reading it needs curl.'; return 0; }
+    version=$(run_t 5 curl -s -m 3 -I http://127.0.0.1:8086/ping 2>/dev/null | clean | tr -d '\r' | awk -F ': *' 'tolower($1) == "x-influxdb-version" { print $2 }')
+    [[ -n $version ]] || version=$(tune_fetch http://127.0.0.1:8086/health | sed -n 's/.*"version": *"\([^"]*\)".*/\1/p')
+    [[ -z $version ]] || group="InfluxDB $version"
+    tune_note "$group" 'InfluxDB sets no memory limit of its own, so there is no limit to compare with.'
+    raw=$(tune_fetch http://127.0.0.1:8086/metrics)
+    if [[ -n $raw ]]; then
+        data=$(tune_metrics "$raw")
+        tune_note "$group" "It uses $(tune_size "$(tune_get "$data" go_memstats_alloc_bytes)") of heap right now."
+        tune_metric_files "$group" "$data" 0
+    fi
+}
+
+tune_minio() {
+    local group=MinIO line path
+    [[ -n $(sig_list RUNNING '^MinIO') ]] || return 0
+    tune_note "$group" 'Its metrics need a token, so its limits could not be read.'
+    # This file also holds the root password, so only this one line is looked at.
+    line=$(awk -F= '$1 == "MINIO_VOLUMES" { print $2; exit }' "$LHA_ROOT/etc/default/minio" 2>/dev/null | clean | tr -d '"')
+    for path in $line; do
+        [[ $path == /* && $path != *'{'* ]] || continue
+        tune_disk_row "$group" "$path" "$LHA_ROOT$path"
+    done
+}
+
+tune_keepalived() {
+    local group=Keepalived conf vips held=0 total=0 ip addresses
+    [[ -n $(sig_list RUNNING '^Keepalived') ]] || return 0
+    conf=$LHA_ROOT/etc/keepalived/keepalived.conf
+    if [[ ! -r $conf ]]; then tune_note "$group" 'Its config cannot be read here.'; return 0; fi
+    vips=$(awk '/virtual_ipaddress[ \t]*\{/ { on = 1; next } on && /\}/ { on = 0 } on && NF { sub(/\/.*/, "", $1); print $1 }' "$conf" | clean)
+    addresses=$(run_t 3 ip -o addr show 2>/dev/null | clean)
+    for ip in $vips; do
+        ((total += 1))
+        [[ $addresses != *" $ip/"* ]] || ((held += 1))
+    done
+    tune_note "$group" "This node holds $held of its $total virtual addresses now. Keepalived has no capacity limit to read."
+}
+
+tune_squid() {
+    local out port max now up group=Squid version rec='' why='' mem
+    [[ -n $(sig_list RUNNING '^Squid') ]] || return 0
+    port=$(port_of squid)
+    if has curl; then out=$(tune_fetch "http://127.0.0.1:${port:-3128}/squid-internal-mgr/info"); fi
+    if [[ -z ${out:-} ]]; then tune_note "$group" 'Its manager page did not answer from this machine, so limits were not read.'; return 0; fi
+    version=$(sed -n 's/.*Squid Object Cache: Version \([0-9.]*\).*/\1/p' <<< "$out" | head -n 1)
+    [[ -z $version ]] || group="Squid $version"
+    max=$(awk -F ':' '/Maximum number of file descriptors/ { gsub(/[^0-9]/, "", $2); print $2; exit }' <<< "$out")
+    now=$(awk -F ':' '/Number of file desc currently in use/ { gsub(/[^0-9]/, "", $2); print $2; exit }' <<< "$out")
+    up=$(awk -F ':' '/UP Time/ { sub(/\..*/, "", $2); gsub(/[^0-9]/, "", $2); print $2; exit }' <<< "$out")
+    tune_too_young "$group" "${up:-0}"
+    if [[ $max =~ ^[1-9][0-9]*$ && $now =~ ^[0-9]+$ ]]; then
+        if ((${up:-0} >= TUNE_MATURE && now * 100 / max >= 70)); then rec=$((max * 2)) why="$now of $max file handles are in use."; fi
+        tune_row "$group" max_filedescriptors "$max" "$now open" "$(tune_pct "$now" "$max")" "$rec" "$why" 'restart'
+    fi
+    mem=$(awk -F ':' '/Storage Mem capacity/ { sub(/%.*/, "", $2); gsub(/[^0-9.]/, "", $2); printf "%d", $2; exit }' <<< "$out")
+    if [[ $mem =~ ^[0-9]+$ ]]; then tune_row "$group" cache_mem 'config' "$mem% used" "$mem" '' ''; fi
+}
+
+# Caddy and Traefik: Go programs with their numbers on a metrics page, if that page is on.
+tune_go_proxy() {
+    local name=$1 url=$2 raw data group version
+    group=$name
+    raw=$(tune_fetch "$url")
+    if [[ -z $raw ]]; then tune_note "$group" 'Its metrics page is off, so only the numbers below for its process are known.'; return 0; fi
+    data=$(tune_metrics "$raw")
+    version=$(sed -n 's/.*[^a-z_]version="\(v*[0-9][^"]*\)".*/\1/p' <<< "$raw" | head -n 1)
+    [[ -z $version ]] || group="$name $version"
+    tune_metric_files "$group" "$data" "$3"
+    tune_note "$group" "It uses $(tune_size "$(tune_get "$data" go_memstats_alloc_bytes)") of heap right now."
+}
+
+tune_caddy() {
+    [[ -n $(sig_list RUNNING '^Caddy') ]] || return 0
+    has curl || return 0
+    tune_go_proxy Caddy http://127.0.0.1:2019/metrics "$(tune_age caddy)"
+}
+
+tune_traefik() {
+    local port
+    [[ -n $(sig_list RUNNING '^Traefik') ]] || return 0
+    has curl || return 0
+    # Port 8080 is common, so ask it only when Traefik itself holds it.
+    for port in 8080 8082; do
+        if [[ $(port_owner "$port") == traefik ]]; then
+            tune_go_proxy Traefik "http://127.0.0.1:$port/metrics" "$(tune_age traefik)"
+            return 0
+        fi
+    done
+    tune_note Traefik 'No metrics port was found, so only the numbers below for its process are known.'
+}
+
+# The fullest listen queue of a program: "waiting limit". It needs ss, so it can be empty.
+tune_backlog() {
+    ss_quiet tcp_diag unix_diag || return 0
+    run_t 3 ss -lntxp 2>/dev/null | clean | grep -F "\"$1\"" | awk '{
+        for (i = 1; i < NF; i++) if ($i == "LISTEN" && $(i + 2) + 0 > 0) {
+            q = $(i + 1) + 0; l = $(i + 2) + 0
+            if (l && q * 100 / l >= best) { best = q * 100 / l; w = q; m = l }
+        }
+    } END { if (m) print w, m }'
+}
+
+# Gunicorn and uWSGI: pre-forked workers. A full listen queue is the proof they are all busy.
+tune_workers() {
+    local name=$1 comm=$2 setting=$3 rows count cpu rss waiting limit rec='' why='' age
+    rows=$(ps -eo pid=,ppid=,pcpu=,rss=,comm= 2>/dev/null | awk -v c="$comm" '$5 == c')
+    if [[ -z $rows ]]; then tune_note "$name" "Its workers could not be told apart from other programs, so they were not counted."; return 0; fi
+    read -r count cpu rss <<< "$(awk '{ id[$1] = 1; up[NR] = $2; c[NR] = $3; m[NR] = $4 }
+        END {
+            for (i = 1; i <= NR; i++) if (up[i] in id) { n++; tc += c[i]; tm += m[i] }
+            if (!n) for (i = 1; i <= NR; i++) { n++; tc += c[i]; tm += m[i] }
+            printf "%d %d %d\n", n, tc / n, tm / n
+        }' <<< "$rows")"
+    age=$(tune_age "$comm")
+    tune_too_young "$name" "$age"
+    read -r waiting limit <<< "$(tune_backlog "$comm")"
+    if [[ $limit =~ ^[1-9][0-9]*$ ]]; then
+        if ((age >= TUNE_MATURE && waiting * 100 / limit >= 50)); then
+            rec=$((count * 3 / 2 > count ? count * 3 / 2 : count + 1)) why="$waiting requests wait in a queue of $limit, so all workers are busy. Look for slow requests too."
+        fi
+        tune_row "$name" 'listen queue' "$limit" "$waiting waiting" "$(tune_pct "$waiting" "$limit")" '' ''
+    fi
+    tune_row "$name" "$setting" "$count" "$(human_kb "$rss") each, ${cpu}% CPU" "$cpu" "$rec" "$why" 'restart'
+    tune_budget "$name" "$((count * rss * 1024))"
+}
+
+# One flag of a process, without reading the rest: arguments can hold passwords.
+proc_flag() {
+    local arg found=''
+    while IFS= read -r -d '' arg; do
+        case $arg in "$2"*) found=${arg#"$2"} ;; esac
+    done < "$1" 2>/dev/null
+    printf '%s' "$found"
+}
+
+# 512m, 2g or 1048576 in bytes.
+size_bytes() {
+    local text=$1 number=${1%[kKmMgGtT]}
+    [[ $number =~ ^[0-9]+$ ]] || { printf 0; return 0; }
+    case $text in
+        *[kK]) printf '%d' "$((number * 1024))" ;;
+        *[mM]) printf '%d' "$((number * 1048576))" ;;
+        *[gG]) printf '%d' "$((number * 1073741824))" ;;
+        *[tT]) printf '%d' "$((number * 1099511627776))" ;;
+        *) printf '%d' "$number" ;;
+    esac
+}
+
+# Every JVM, whatever it runs. Inside numbers need jstat or JMX, which are left out on purpose.
+tune_jvm() {
+    local pid rss name heap bytes shown=0
+    while read -r pid rss; do
+        [[ -n $pid ]] || continue
+        ((shown < 6)) || break
+        ((shown += 1))
+        runtime_role "/proc/$pid/cmdline"
+        name=${REPLY:-java}
+        heap=$(proc_flag "/proc/$pid/cmdline" -Xmx)
+        bytes=$(size_bytes "$heap")
+        tune_row 'JVM services' "$name (pid $pid) heap" "${heap:-JVM default}" "$(human_kb "$rss") in RAM" "$(tune_pct "$((rss * 1024))" "$bytes")" '' ''
+        case $name in
+            elasticsearch|opensearch) ;;
+            *) ((bytes == 0)) || tune_budget "JVM $name" "$bytes" ;;
+        esac
+    done <<< "$(ps -eo pid=,rss=,comm= 2>/dev/null | awk '$3 == "java" { print $2, $1 }' | sort -rn | awk '{ print $2, $1 }')"
+    if ((shown > 0)); then
+        tune_note 'JVM services' 'RAM use includes more than heap. Use inside the heap needs jstat or JMX, which this tool does not start, so there is no advice here.'
+    fi
+}
+
+tune_node() {
+    local pid rss heap bytes pct shown=0 rec why age
+    while read -r pid rss; do
+        [[ -n $pid ]] || continue
+        ((shown < 5)) || break
+        ((shown += 1))
+        heap=$(proc_flag "/proc/$pid/cmdline" --max-old-space-size=)
+        rec='' why=''
+        if [[ $heap =~ ^[0-9]+$ ]]; then
+            bytes=$((heap * 1048576))
+            pct=$(tune_pct "$((rss * 1024))" "$bytes")
+            age=$(tune_age_pid "$pid")
+            if ((${age:-0} >= TUNE_MATURE && pct >= 100)); then
+                rec="$((heap * 3 / 2))" why='Memory is past its heap limit, so garbage collection works hard. A leak is the first suspect.'
+            fi
+            tune_row Node.js "pid $pid heap, MiB" "$heap" "$(human_kb "$rss") in RAM" "$pct" "$rec" "$why" 'restart'
+        else
+            tune_row Node.js "pid $pid" 'no limit set' "$(human_kb "$rss") in RAM" 0 '' ''
+        fi
+    done <<< "$(ps -eo pid=,rss=,comm= 2>/dev/null | awk '$3 == "node" || $3 == "nodejs" { print $2, $1 }' | sort -rn | awk '{ print $2, $1 }')"
+    if ((shown > 0)); then
+        tune_note Node.js 'A heap limit is only known from --max-old-space-size on the command line. NODE_OPTIONS is not read, because environments can hold secrets.'
+    fi
+}
+
+tune_kafka() {
+    local group=Kafka file jar version dirs dir
+    [[ -n $(sig_list RUNNING '^Apache Kafka') ]] || return 0
+    for jar in "$LHA_ROOT"/opt/kafka/libs/kafka_*.jar "$LHA_ROOT"/usr/share/java/kafka/kafka_*.jar "$LHA_ROOT"/usr/share/kafka/libs/kafka_*.jar; do
+        case $jar in *-test*|*-sources*|*-javadoc*|*'*'*) continue ;; esac
+        version=${jar##*-} version=${version%.jar}
+        break
+    done
+    [[ -z ${version:-} ]] || group="Kafka $version"
+    for file in "$LHA_ROOT"/etc/kafka/server.properties "$LHA_ROOT"/etc/kafka/kraft/server.properties \
+        "$LHA_ROOT"/opt/kafka/config/server.properties "$LHA_ROOT"/opt/kafka/config/kraft/server.properties; do
+        [[ -r $file ]] || continue
+        dirs=$(awk -F= '$1 == "log.dirs" || $1 == "log.dir" { print $2; exit }' "$file" | clean | tr ',' ' ')
+        break
+    done
+    for dir in ${dirs:-}; do [[ ! -d $LHA_ROOT$dir ]] || tune_disk_row "$group" "$dir" "$LHA_ROOT$dir"; done
+    tune_note "$group" 'Broker limits live in JMX, which this tool does not open. Open files, threads and heap are shown below.'
+}
+
+tune_cassandra() {
+    local group=Cassandra conf jar version dirs dir
+    [[ -n $(sig_list RUNNING '^Apache Cassandra') ]] || return 0
+    for jar in "$LHA_ROOT"/usr/share/cassandra/apache-cassandra-[0-9]*.jar "$LHA_ROOT"/opt/cassandra/lib/apache-cassandra-[0-9]*.jar; do
+        case $jar in *'*'*) continue ;; esac
+        version=${jar##*apache-cassandra-} version=${version%.jar}
+        break
+    done
+    [[ -z ${version:-} ]] || group="Cassandra $version"
+    for conf in "$LHA_ROOT"/etc/cassandra/cassandra.yaml "$LHA_ROOT"/opt/cassandra/conf/cassandra.yaml; do
+        [[ -r $conf ]] || continue
+        dirs=$(awk '/^data_file_directories:/ { on = 1; next } on && /^[ \t]*-/ { print $2; next } on { exit }' "$conf" | clean)
+        break
+    done
+    for dir in ${dirs:-/var/lib/cassandra/data}; do [[ ! -d $LHA_ROOT$dir ]] || tune_disk_row "$group" "$dir" "$LHA_ROOT$dir"; done
+    tune_note "$group" 'nodetool is left out on purpose: it writes a history file. Heap, threads and open files are shown below.'
+}
+
+# Prometheus only. The ceph command is left out, because nothing proves it writes nothing.
+tune_ceph() {
+    local raw data group=Ceph status total used word
+    [[ -n $(sig_list RUNNING '^Ceph') ]] || return 0
+    if has curl; then raw=$(tune_fetch http://127.0.0.1:9283/metrics); fi
+    if [[ -z ${raw:-} ]]; then
+        tune_note "$group" 'The Prometheus module of ceph-mgr did not answer here, so the cluster state was not read.'
+        return 0
+    fi
+    data=$(tune_metrics "$raw")
+    total=$(tune_get "$data" ceph_cluster_total_bytes)
+    used=$(tune_get "$data" ceph_cluster_total_used_bytes)
+    if ((total > 0)); then
+        tune_row "$group" 'raw capacity' "$(tune_size "$total")" "$(tune_size "$used") used" "$(tune_pct "$used" "$total")" '' ''
+    fi
+    status=$(tune_get "$data" ceph_health_status)
+    case $status in 0) word=HEALTH_OK ;; 1) word=HEALTH_WARN ;; *) word=HEALTH_ERR ;; esac
+    tune_note "$group" "Cluster health is $word, with $(tune_get "$data" ceph_osd_up) OSDs up of $(tune_get "$data" ceph_osd_in) in."
+}
+
+# Plain state files. The gluster command logs every call to its own log, so it stays out.
+tune_gluster() {
+    local base=$LHA_ROOT/var/lib/glusterd group=GlusterFS info name state count brick path peers=0
+    [[ -n $(sig_list RUNNING '^GlusterFS') ]] || return 0
+    if [[ ! -d $base/vols ]]; then tune_note "$group" 'Its state folder cannot be read here.'; return 0; fi
+    for info in "$base"/vols/*/info; do
+        [[ -r $info ]] || continue
+        name=${info%/info} name=${name##*/}
+        state=$(awk -F= '$1 == "status" { print $2; exit }' "$info")
+        count=$(awk -F= '$1 == "count" { print $2; exit }' "$info")
+        if [[ $state != 1 ]]; then tune_note "$group" "Volume $name is not started."; fi
+        for brick in "$base/vols/$name"/bricks/*; do
+            [[ -r $brick ]] || continue
+            path=$(awk -F= '$1 == "path" { print $2; exit }' "$brick")
+            [[ -n $path && -d $LHA_ROOT$path ]] || continue
+            tune_disk_row "$group" "$name:$path" "$LHA_ROOT$path"
+        done
+        tune_note "$group" "Volume $name has ${count:-0} bricks."
+    done
+    for info in "$base"/peers/*; do [[ ! -f $info ]] || ((peers += 1)); done
+    tune_note "$group" "$peers other servers in this pool."
 }
 
 tune_containers() {
@@ -3521,12 +4227,17 @@ tune_kernel() {
         fi
         tune_row "$group" net.core.somaxconn "$value" "$overflows overflows" 0 "$rec" "$why" 'live'
     fi
-    read -r low high < /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null
-    if [[ $low =~ ^[0-9]+$ ]] && has ss; then
-        range=$((high - low))
-        tw=$(run_t 5 ss -Htan state time-wait 2>/dev/null | wc -l | tr -d ' ')
+    read -r low high 2>/dev/null < "$LHA_ROOT/proc/sys/net/ipv4/ip_local_port_range"
+    if [[ $low =~ ^[0-9]+$ ]]; then
+        range=$((high - low + 1))
+        # Only sockets on a port of this range are spent outgoing ports. A web server collects
+        # plenty of TIME-WAIT on port 80, and that costs no port at all.
+        tw=$(tcp_count 06 "$low" "$high")
         rec='' why=''
-        if ((tw * 100 / range >= 70)); then rec='1024 65535' why='Outgoing ports are running out, which fails new connections to databases and backends.'; fi
+        if ((tw * 100 / range >= 70 && low > 10240)); then
+            # Below this, an outgoing connection can sit on a port a service wants at its next start.
+            rec="10240 $high" why='Outgoing ports are running out, which fails new connections to databases and backends.'
+        fi
         tune_row "$group" ip_local_port_range "$low-$high" "$tw in TIME-WAIT" "$(tune_pct "$tw" "$range")" "$rec" "$why" 'live'
     fi
     if [[ -r /proc/sys/fs/file-nr ]]; then
@@ -3564,7 +4275,7 @@ tune_any_program() {
     done <<< "$NET_ROWS"
     while read -r pct proc limit fds threads rss; do
         [[ -n $proc ]] || continue
-        if ((pct >= 70)); then
+        if ((pct >= 70 && $(tune_age "$proc") >= TUNE_MATURE)); then
             tune_row 'Every program with an open port' "$proc open files" "$limit" "$fds open, $threads threads, $(human_kb "$rss")" "$pct" "$((limit * 2))" \
                 'It is near its open file limit. Reaching it makes new connections fail.' 'restart'
         else
@@ -3592,6 +4303,22 @@ tune_collect() {
     tune_varnish
     tune_phpfpm
     tune_tomcat
+    tune_rabbitmq
+    tune_kafka
+    tune_cassandra
+    tune_clickhouse
+    tune_influx
+    tune_minio
+    tune_ceph
+    tune_gluster
+    tune_keepalived
+    tune_squid
+    tune_caddy
+    tune_traefik
+    [[ -z $(sig_list RUNNING '^Gunicorn') ]] || tune_workers Gunicorn gunicorn workers
+    [[ -z $(sig_list RUNNING '^uWSGI') ]] || tune_workers uWSGI uwsgi processes
+    tune_node
+    tune_jvm
     tune_containers
     tune_kube
     tune_kernel
@@ -3603,6 +4330,8 @@ tune_print_group() {
     sub "$group"
     printf '  %-28s %-12s %-30s %5s  %s\n' SETTING NOW USED FULL ADVICE
     while IFS='|' read -r _ setting now used pct rec why how; do
+        # kubectl top prints <unknown> for a node without metrics.
+        [[ $pct =~ ^[0-9]+$ ]] || pct=0
         color=$c_grn
         if ((pct >= 90)); then color=$c_red; elif ((pct >= 75)); then color=$c_yel; fi
         if ((pct > 100)); then pct=100; fi
@@ -3766,6 +4495,420 @@ view_trends() {
     [[ -z $hour ]] || printf '  Busiest hour: %s.\n' "$hour"
 }
 
+# ---------------------------------------------------------------------------
+# Errors: what each running application wrote to its own log, grouped and explained.
+# Read-only, and only a bounded tail of each file. Log lines can hold private data, so they
+# appear in this view and nowhere else: not in --report, not in --json.
+# ---------------------------------------------------------------------------
+ERR_BYTES=2097152 ERR_LINES=3000 ERR_SHOW=6
+ERR_ANY='error|fatal|panic|critical|severe|exception|failed|failure|denied|refused|timed out|out of memory'
+ERR_QUIET='level=info|level=debug| info | debug |no error|0 errors|errors: 0|error_log|errorlog|on-failure'
+
+# Regex~plain cause~next step. First match wins, so specific lines come before general ones.
+err_hints() {
+    cat <<'EOF'
+worker_connections are not enough~Nginx ran out of connection slots~Raise worker_connections, and check it with --tune
+upstream timed out~The app behind the web server answered too slowly~Find the slow requests in the app or database, then look at proxy_read_timeout
+no live upstreams~Every backend of this site is marked down~Check that the backend service runs
+upstream prematurely closed~The backend crashed or closed the connection mid-request~Read the error log of the backend
+upstream sent too big header~The backend sent larger headers than the buffer allows~Raise proxy_buffer_size or fastcgi_buffer_size
+primary script unknown~PHP-FPM cannot find the script nginx asked for~Compare root and SCRIPT_FILENAME in the site config
+connect\(\) .*failed.*while connecting to upstream~The app behind the web server is down or not listening~Check the backend service and its port or socket
+client intended to send too large body~An upload is bigger than client_max_body_size~Raise client_max_body_size for that site if the upload is legitimate
+ssl_do_handshake\(\) failed~Clients failed the TLS handshake, usually scanners or very old clients~Ignore it unless real visitors complain
+could not build.*hash~A hash table in the nginx config is too small~Follow the setting that nginx names in this line
+reached maxrequestworkers|reached maxclients~Apache used all its workers, so visitors waited~Check MaxRequestWorkers with --tune
+premature end of script headers~A CGI or PHP script died before it answered~Run the script by hand, or read the PHP log
+client denied by server configuration~A Require rule blocked a request~Expected for private paths. Otherwise check the site config
+script timed out~A script ran longer than the server allows~Find what the script waits for, usually the database
+reached pm.max_children|max_children setting~PHP-FPM used all its workers, so requests waited~Check the pool with --tune, and look for slow scripts first
+seems busy~PHP-FPM cannot keep up with incoming requests~Look for slow scripts, then check pm.max_children with --tune
+execution timed out|request_terminate_timeout~A PHP script hit its time limit~Find what the script waits for, usually the database
+allowed memory size.*exhausted~A PHP script hit memory_limit~Fix the script, or raise memory_limit for that site
+exited on signal 11|sigsegv~A worker crashed~Update PHP and its extensions. Disable extensions one by one to find it
+php fatal error~A PHP script stopped on an error~Read the file and line in the message
+too many connections~The database refused clients at max_connections~Check it with --tune. Look for slow queries before raising it
+too many clients|remaining connection slots~PostgreSQL refused clients at max_connections~Use a pooler such as PgBouncer, or check max_connections with --tune
+out of shared memory~PostgreSQL ran out of lock or shared memory~Look at max_locks_per_transaction, and at long transactions
+checkpoints are occurring too frequently~PostgreSQL writes more than its WAL settings allow~Raise max_wal_size
+could not resize shared memory~The shared memory segment hit a limit~Check free space in /dev/shm, also inside containers
+password authentication failed~A client logged in with the wrong password~Check the app config. Repeated from many addresses, it is an attack
+deadlock (found|detected)~Two transactions blocked each other, and one was rolled back~The app should retry. Look at the order of its updates
+aborted connection~A client disappeared without closing, or a timeout hit~Check max_allowed_packet, wait_timeout and app crashes
+access denied for user~A client used a wrong user, password or host~Check the app config and the grants of that user
+crashed and should be repaired~A MyISAM table is damaged~Back it up, then run REPAIR TABLE
+table .* is full~A table or the temporary space reached its limit~Check free disk and tmp_table_size
+got error 28~MySQL could not write, because the disk is full~Check free space on the data and tmp folders
+log sequence number .* is in the future~InnoDB data and redo log disagree. This can mean damage~Back up first, then read the MySQL recovery documentation
+can't save in background: fork|cannot allocate memory.*fork~Redis could not fork to save, so saves are failing~Set vm.overcommit_memory=1, or add memory
+oom command not allowed~Redis reached maxmemory, so writes are refused~Check maxmemory and maxmemory-policy with --tune
+max number of clients reached~Redis refused clients at maxclients~Look for leaking connections, then check maxclients with --tune
+background saving error|rdb.*error~Saving to disk failed, so a restart would lose data~Check free disk and the owner of the data folder
+fsync is taking too long~The disk is too slow for AOF~Check disk latency with iostat -x 1 3
+memory overcommit must be enabled~A background save can fail under memory pressure~Set vm.overcommit_memory=1
+wiredtiger error~The MongoDB storage engine reported an error~Check the disk, and read the full message
+flood.stage disk watermark~The disk is nearly full, so indices became read-only~Free disk space. The block lifts by itself on recent versions
+high disk watermark~The disk is filling, so shards move away from this node~Free disk space, or add a node
+circuitbreakingexception|data too large~A request would have used too much heap~Reduce the request, or look at heap use with --tune
+master not discovered~This node cannot find a cluster master~Check the network between nodes, and discovery settings
+no server available|has no server available~A load balancer backend has no healthy server left~Check the backend servers and their health checks
+server .* is down~A health check failed for one backend server~Check that server
+child .* died|child .* not responding~The Varnish worker process crashed or hung~Read the panic text with varnishadm panic.show
+could not get storage~Varnish ran out of cache storage~Check the malloc size with --tune
+outofmemoryerror~The JVM ran out of heap~Check -Xmx and look for a memory leak
+java.net.bindexception~The port this service wants is already taken~ss -lntp shows the owner
+memory resource limit alarm|memory_high_watermark set~RabbitMQ hit its memory limit, so publishers are blocked~Consume the queues, then check the limit with --tune
+disk free limit|disk_free_limit~RabbitMQ is short of disk, so publishers are blocked~Free disk space, or consume the queues
+file descriptor limit~RabbitMQ is near its open file limit~Raise LimitNOFILE in its service unit
+retry time not reached~Exim is waiting before it tries a host again~Normal for a host that is down. Check the queue with exim -bp
+spool file is locked~Another Exim process is already delivering this message~Harmless unless it repeats for hours
+unroutable address|unrouteable address~Exim has no route for this recipient~Check the address and the local domains list
+sasl.*authentication failed~Someone failed to log in to SMTP~Repeated from many addresses, it is a password attack. Check fail2ban
+does not resolve to address|hostname .* verification failed~The client's reverse DNS does not match~Normal for bots. Ignore it unless real mail is affected
+mail for .* loops back to myself~Postfix thinks this domain is both local and remote~Check mydestination and the MX record
+queue file write error~Postfix could not write to its queue~Check free disk space
+database .* is older than source file~A postmap table is out of date~Run postmap on that file, then reload Postfix
+mail_max_userip_connections|exceeded.*connections~One user has too many IMAP connections from one address~Raise mail_max_userip_connections, or fix the mail client
+corrupted index~A Dovecot index file is damaged~Dovecot rebuilds it by itself. Repeated, check the disk
+zone .* not loaded~BIND could not load a zone~Run named-checkzone on that zone
+refused notify~BIND refused a NOTIFY from a server it does not trust~Check also-notify and allow-notify
+network unreachable resolving~BIND tried a network this server does not have, usually IPv6~Harmless, or start named with -4
+dnssec.*failed|no valid rrsig~A DNSSEC answer could not be validated~Check the zone with dnsviz, and the clock on this server
+no space left on device~The disk is full~Open CPU, RAM and disk, then use the disk-full fix
+disk quota exceeded~A quota is full~Check quotas for that user
+too many open files~A program reached its open file limit~Raise LimitNOFILE in its service unit. --tune shows each program
+cannot allocate memory|out of memory~The program could not get memory~Check RAM use and the limits with --tune
+permission denied~A program may not read or write a file or socket~Compare the owner of that path with the user of the service
+read-only file system~The disk went read-only, usually after errors~dmesg | tail -30
+address already in use~The port this program wants is already taken~ss -lntup shows the owner
+connection refused~Nothing is listening where this program connects~Check that the service it depends on runs
+connection timed out|operation timed out~The other side did not answer in time~Check the network path and firewall
+certificate.*(expired|verify failed)~A TLS certificate is not valid~Open Websites, domains and SSL
+broken pipe|connection reset by peer~The other side closed the connection~Usually harmless. Look closer only if it is frequent
+EOF
+}
+
+# Groups log lines from stdin. Prints the worst groups, then a line "@@@ lines groups".
+err_group() {
+    # The patterns go by environment: awk -v would eat their backslashes.
+    { err_hints; printf '@@@DATA\n'; clean | tr '\200-\377' '?'; } | ERR_WANT=$1 ERR_SKIP=${2:-} awk -v limit="$ERR_SHOW" \
+        -v sq="'" -v dim="$c_dim" -v off="$c_off" -v grn="$c_grn" '
+        function mask(s,   low, pass, rs, rl, mid, cut, q, re) {
+            q = "[\"" sq " ]*"
+            re = "(pass(w(or)?d|phrase)?|pwd|secret|token|api[-_]?key|access[-_]?key|cookie)" q "[=:]" q "[^ ,;&\"" sq "*][^ ,;&\"" sq "]*"
+            for (pass = 0; pass < 20; pass++) {
+                low = tolower(s)
+                if (!match(low, re)) break
+                rs = RSTART; rl = RLENGTH
+                mid = substr(s, rs, rl)
+                cut = match(mid, /[=:]/)
+                s = substr(s, 1, rs - 1) substr(mid, 1, cut) "***" substr(s, rs + rl)
+            }
+            for (pass = 0; pass < 20; pass++) {
+                low = tolower(s)
+                if (!match(low, /(bearer|basic) +[a-z0-9._~+\/=-][a-z0-9._~+\/=-]*/)) break
+                rs = RSTART; rl = RLENGTH
+                mid = substr(s, rs, rl)
+                cut = index(mid, " ")
+                s = substr(s, 1, rs + cut - 1) "***" substr(s, rs + rl)
+            }
+            for (pass = 0; pass < 20; pass++) {
+                if (!match(s, /:\/\/[^:\/ ]+:[^@\/ ]+@/)) break
+                s = substr(s, 1, RSTART + 2) "***@" substr(s, RSTART + RLENGTH)
+            }
+            return s
+        }
+        function norm(s) {
+            s = tolower(s)
+            sub(/, client: .*/, "", s)
+            sub(/^\[[^]]*\] */, "", s)
+            sub(/^[a-z][a-z][a-z] +[0-9]+ [0-9:]+ [^ ]+ /, "", s)
+            gsub(/"[^"]*"/, "q", s)
+            gsub(sq "[^" sq "]*" sq, "q", s)
+            gsub(/[a-z0-9._+-]+@[a-z0-9.-]+/, "e", s)
+            gsub(/\/[^ ,:;)]+/, "p", s)
+            gsub(/0x[0-9a-f]+/, "h", s)
+            gsub(/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]+/, "h", s)
+            gsub(/[0-9]+/, "n", s)
+            return substr(s, 1, 110)
+        }
+        BEGIN { hints = 1; want = ENVIRON["ERR_WANT"]; skip = ENVIRON["ERR_SKIP"] }
+        hints {
+            if ($0 == "@@@DATA") { hints = 0; next }
+            if (split($0, h, "~") >= 3) { nh++; hp[nh] = h[1]; hc[nh] = h[2]; hx[nh] = h[3] }
+            next
+        }
+        {
+            low = tolower($0)
+            if (low !~ want) next
+            if (skip != "" && low ~ skip) next
+            total++
+            line = mask($0)
+            k = norm(line)
+            if (!(k in count)) { kinds++; key[kinds] = k }
+            count[k]++
+            sample[k] = line
+        }
+        END {
+            for (shown = 0; shown < limit && shown < kinds; shown++) {
+                best = 0
+                for (i = 1; i <= kinds; i++)
+                    if (!(key[i] in done) && (best == 0 || count[key[i]] > count[key[best]])) best = i
+                k = key[best]; done[k] = 1
+                printf "  %6dx  %s\n", count[k], substr(sample[k], 1, 150)
+                low = tolower(sample[k])
+                for (i = 1; i <= nh; i++) {
+                    if (low ~ hp[i]) {
+                        printf "           %sCause:%s %s\n           %sNext:%s %s%s%s\n", dim, off, hc[i], dim, off, grn, hx[i], off
+                        break
+                    }
+                }
+            }
+            if (kinds > limit) printf "  %sand %d more kinds of error%s\n", dim, kinds - limit, off
+            printf "@@@ %d %d\n", total, kinds
+        }'
+}
+
+# Prints one group, and the summary line stays out of the report.
+err_show() {
+    local out rest lines kinds
+    out=$(err_group "$1" "${2:-}")
+    rest=${out##*@@@ }
+    out=${out%@@@ *}
+    read -r lines kinds <<< "$rest"
+    ((ERR_LINES_SEEN += ${lines:-0}))
+    ((ERR_KINDS += ${kinds:-0}))
+    if ((${lines:-0} == 0)); then printf '  No errors in what was read.\n'
+    else printf '%s' "$out"
+    fi
+}
+
+err_tail() { run_t 6 tail -c "$ERR_BYTES" "$1" 2>/dev/null | tail -n "$ERR_LINES"; }
+
+# How old a log is, so old trouble does not read as new trouble.
+err_age() {
+    local stamp now
+    stamp=$(stat -c %Y "$1" 2>/dev/null) || return 0
+    now=$(date +%s)
+    [[ $stamp =~ ^[0-9]+$ && $now =~ ^[0-9]+$ ]] || return 0
+    ((now >= stamp)) || return 0
+    printf ', last written %s ago' "$(human_age "$((now - stamp))")"
+}
+
+# The running application, or one whose service has failed: that is when its log matters most.
+err_on() { [[ -n $(sig_list RUNNING "$1") ]] || grep -qE "^($2)\.service" <<< "$SVC_FAILED"; }
+
+# err_app NAME UNITS WANT SKIP PATH...: newest readable files first, then the journal.
+err_app() {
+    local name=$1 unit_list=$2 want=$3 skip=$4 file unit data denied=0 used=0
+    local -a found=()
+    shift 4
+    for file in "$@"; do
+        # A log linked to stderr can be this report itself, so only plain paths count.
+        [[ -n $file && -f $file ]] || continue
+        case $file in *.gz|*.xz|*.bz2|*.zip|/dev/*) continue ;; esac
+        if [[ ! -r $file ]]; then denied=1; continue; fi
+        [[ -s $file ]] || continue
+        found+=("$file")
+    done
+    ((ERR_APPS += 1))
+    sub "$name"
+    if ((${#found[@]})); then
+        while IFS= read -r file; do
+            [[ -n $file ]] || continue
+            ((used < 2)) || break
+            ((used += 1))
+            printf '  %s%s%s%s\n' "$c_dim" "${file#"$LHA_ROOT"}" "$(err_age "$file")" "$c_off"
+            data=$(err_tail "$file")
+            err_show "$want" "$skip" <<< "$data"
+        done <<< "$(ls -t -- "${found[@]}" 2>/dev/null)"
+        return 0
+    fi
+    if has journalctl; then
+        for unit in $unit_list; do
+            [[ $active_units == *$'\n'"$unit.service "* ]] || continue
+            printf '  %sjournal of %s%s\n' "$c_dim" "$unit" "$c_off"
+            data=$(run_t 8 journalctl -u "$unit" -n "$ERR_LINES" --no-pager -q -o cat 2>/dev/null)
+            err_show "$want" "$skip" <<< "$data"
+            return 0
+        done
+    fi
+    if ((denied)); then printf '  Its log needs root to read.\n'
+    else printf '  No log file or journal was found for it here.\n'
+    fi
+}
+
+# Paths written in a config file: first word is the directive, second is the path.
+err_conf_path() {
+    local key=$1
+    shift
+    awk -v k="$key" -v sq="'" 'tolower($1) == k && $2 ~ /\// {
+        v = $2; gsub(/[;"]/, "", v); gsub(sq, "", v)
+        if (v ~ /^\//) print v
+    }' "$@" 2>/dev/null
+}
+
+err_mysql_log() {
+    local client=mysql value
+    has mysql || client=mariadb
+    has "$client" || return 0
+    value=$(run_t 5 "$client" --connect-timeout=3 -NBe 'SELECT @@log_error' 2>/dev/null | clean)
+    [[ $value == /* ]] && printf '%s\n' "$value"
+}
+
+err_apps() {
+    local R=$LHA_ROOT line
+    local -a conf=()
+    if err_on '^(Nginx|OpenResty|Tengine)' 'nginx|ea-nginx|openresty'; then
+        while IFS= read -r line; do [[ -z $line ]] || conf+=("$R$line"); done <<< "$(err_conf_path error_log "$R"/etc/nginx/nginx.conf "$R"/etc/nginx/conf.d/*.conf "$R"/usr/local/nginx/conf/nginx.conf)"
+        err_app Nginx 'nginx ea-nginx openresty' '\[(emerg|alert|crit|error)\]' '' "${conf[@]}" "$R"/var/log/nginx/error.log \
+            "$R"/var/log/ea-nginx/error.log "$R"/usr/local/nginx/logs/error.log "$R"/www/wwwlogs/nginx_error.log "$R"/usr/local/openresty/nginx/logs/error.log
+    fi
+    if err_on '^Apache HTTP' 'apache2|httpd'; then
+        err_app Apache 'apache2 httpd' '(:|\[)(emerg|alert|crit|error)\]' '' "$R"/var/log/apache2/error.log "$R"/var/log/apache2/error_log \
+            "$R"/var/log/httpd/error_log "$R"/etc/apache2/logs/error_log "$R"/usr/local/apache/logs/error_log "$R"/www/wwwlogs/error_log
+    fi
+    if err_on '^(LiteSpeed server|OpenLiteSpeed)' 'lsws|lshttpd|openlitespeed'; then
+        err_app LiteSpeed 'lsws lshttpd openlitespeed' '\[(error|crit|alert|emerg|fatal)\]' '' "$R"/usr/local/lsws/logs/error.log "$R"/usr/local/lsws/logs/stderr.log
+    fi
+    if err_on '^PHP-FPM' 'php[-0-9.]*fpm[0-9.]*|ea-php[0-9]*-php-fpm|plesk-php[0-9]*-fpm|alt-php[0-9]*-php-fpm'; then
+        err_app PHP-FPM "$(awk '$1 ~ /php.*fpm/ { sub(/\.service$/, "", $1); print $1 }' <<< "$active_units" | tr '\n' ' ')" \
+            '(warning|error|alert|emergency|fatal)[]: ]' '' "$R"/var/log/php*-fpm.log "$R"/var/log/php-fpm/error.log "$R"/var/log/php-fpm/www-error.log \
+            "$R"/opt/cpanel/ea-php*/root/usr/var/log/php-fpm/error.log "$R"/opt/cpanel/ea-php*/root/usr/var/log/php-fpm.log \
+            "$R"/var/opt/remi/php*/log/php-fpm/error.log "$R"/www/server/php/*/var/log/php-fpm.log \
+            "$R"/opt/plesk/php/*/var/log/php-fpm.log "$R"/var/log/plesk-php*-fpm/error.log
+    fi
+    if err_on '^(MariaDB server|MySQL-compatible)' 'mariadb|mysql|mysqld'; then
+        conf=()
+        line=$(err_mysql_log)
+        [[ -z $line ]] || conf+=("$R$line")
+        err_app 'MySQL or MariaDB' 'mariadb mysql mysqld' '\[(error|err|fatal)\]|too many connections|aborted connection|crashed|deadlock' '' "${conf[@]}" \
+            "$R"/var/log/mysql/error.log "$R"/var/log/mysql/mysqld.log "$R"/var/log/mysqld.log "$R"/var/log/mariadb/mariadb.log \
+            "$R"/var/lib/mysql/*.err "$R"/www/server/data/*.err
+    fi
+    if err_on '^PostgreSQL server' 'postgresql(@.*|-[0-9.]*)?'; then
+        err_app PostgreSQL "$(awk '$1 ~ /^postgresql/ { sub(/\.service$/, "", $1); print $1 }' <<< "$active_units" | tr '\n' ' ')" \
+            '(error|fatal|panic):|too frequently' '' "$R"/var/log/postgresql/*.log "$R"/var/lib/pgsql/*/data/log/*.log "$R"/var/lib/pgsql/data/log/*.log \
+            "$R"/var/lib/pgsql/*/data/pg_log/*.log "$R"/var/lib/pgsql/data/pg_log/*.log "$R"/var/lib/postgresql/*/main/log/*.log "$R"/var/lib/postgresql/data/log/*.log
+    fi
+    if err_on '^Redis server' 'redis|redis-server'; then
+        conf=()
+        while IFS= read -r line; do [[ -z $line ]] || conf+=("$R$line"); done <<< "$(err_conf_path logfile "$R"/etc/redis/redis.conf "$R"/etc/redis.conf "$R"/etc/redis/*.conf)"
+        err_app Redis 'redis-server redis' ' # |oom command|error' '' "${conf[@]}" "$R"/var/log/redis/redis-server.log "$R"/var/log/redis/redis.log "$R"/var/log/redis_*.log
+    fi
+    if err_on '^Valkey server' 'valkey|valkey-server'; then
+        conf=()
+        while IFS= read -r line; do [[ -z $line ]] || conf+=("$R$line"); done <<< "$(err_conf_path logfile "$R"/etc/valkey/valkey.conf "$R"/etc/valkey.conf)"
+        err_app Valkey 'valkey-server valkey' ' # |oom command|error' '' "${conf[@]}" "$R"/var/log/valkey/valkey-server.log "$R"/var/log/valkey/valkey.log
+    fi
+    if err_on '^MongoDB' 'mongod|mongodb'; then
+        conf=()
+        while IFS= read -r line; do [[ -z $line ]] || conf+=("$R$line"); done <<< "$(err_conf_path path: "$R"/etc/mongod.conf)"
+        err_app MongoDB 'mongod mongodb' '"s":"[ef]"| [ef]  [a-z]' '' "${conf[@]}" "$R"/var/log/mongodb/mongod.log "$R"/var/log/mongodb/mongodb.log
+    fi
+    if err_on '^Elasticsearch' 'elasticsearch'; then
+        err_app Elasticsearch elasticsearch '\]\[(error|fatal|critical) *\]|outofmemory|watermark' '' "$R"/var/log/elasticsearch/*.log "$R"/usr/share/elasticsearch/logs/*.log
+    fi
+    if err_on '^OpenSearch' 'opensearch'; then
+        err_app OpenSearch opensearch '\]\[(error|fatal|critical) *\]|outofmemory|watermark' '' "$R"/var/log/opensearch/*.log "$R"/usr/share/opensearch/logs/*.log
+    fi
+    if err_on '^HAProxy' 'haproxy'; then
+        err_app HAProxy haproxy 'no server available|is down|has no server|\[alert\]|\[emerg\]' '' "$R"/var/log/haproxy.log "$R"/var/log/haproxy/*.log
+    fi
+    if err_on '^Varnish' 'varnish|varnishd'; then
+        err_app Varnish 'varnish varnishd' 'panic|child .* (died|not responding)|could not|error' '' "$R"/var/log/varnish/varnishd.log
+    fi
+    if err_on '^Apache Tomcat' 'tomcat[0-9]*'; then
+        err_app Tomcat "$(awk '$1 ~ /^tomcat/ { sub(/\.service$/, "", $1); print $1 }' <<< "$active_units" | tr '\n' ' ')" \
+            'severe|outofmemory| error |exception' '' "$R"/var/log/tomcat*/catalina.out "$R"/var/log/tomcat*/catalina.*.log \
+            "$R"/opt/tomcat/logs/catalina.out "$R"/opt/tomcat/logs/catalina.*.log "$R"/usr/local/tomcat/logs/catalina.*.log
+    fi
+    if err_on '^RabbitMQ' 'rabbitmq-server'; then
+        err_app RabbitMQ rabbitmq-server '\[(error|critical)\]|error report|alarm' '' "$R"/var/log/rabbitmq/*.log
+    fi
+    if err_on '^Apache Kafka' 'kafka|confluent-kafka'; then
+        err_app Kafka 'kafka confluent-kafka' ' (error|fatal) |outofmemory' '' "$R"/var/log/kafka/server.log "$R"/opt/kafka/logs/server.log
+    fi
+    if err_on '^ClickHouse' 'clickhouse-server'; then
+        err_app ClickHouse clickhouse-server '<(error|fatal|critical)>' '' "$R"/var/log/clickhouse-server/clickhouse-server.err.log
+    fi
+    if err_on '^Apache Cassandra' 'cassandra'; then
+        err_app Cassandra cassandra '^(error|fatal) |outofmemory' '' "$R"/var/log/cassandra/system.log
+    fi
+    if err_on '^Squid' 'squid'; then
+        err_app Squid squid 'error|fatal|warning: (no|all)' '' "$R"/var/log/squid/cache.log
+    fi
+    if err_on '^Caddy' 'caddy'; then err_app Caddy caddy "$ERR_ANY" "$ERR_QUIET" "$R"/var/log/caddy/*.log; fi
+    if err_on '^Traefik' 'traefik'; then err_app Traefik traefik "$ERR_ANY" "$ERR_QUIET" "$R"/var/log/traefik/traefik.log; fi
+    if err_on '^InfluxDB' 'influxd|influxdb'; then err_app InfluxDB 'influxdb influxd' "$ERR_ANY" "$ERR_QUIET" "$R"/var/log/influxdb/influxd.log; fi
+    if err_on '^MinIO' 'minio'; then err_app MinIO minio "$ERR_ANY" "$ERR_QUIET"; fi
+    if err_on '^Keepalived' 'keepalived'; then err_app Keepalived keepalived "$ERR_ANY" "$ERR_QUIET"; fi
+    if err_on '^GlusterFS' 'glusterd'; then err_app GlusterFS glusterd ' [ewac] \[' '' "$R"/var/log/glusterfs/glusterd.log; fi
+    if err_on '^Ceph' 'ceph'; then err_app Ceph '' "$ERR_ANY" "$ERR_QUIET" "$R"/var/log/ceph/ceph.log "$R"/var/log/ceph/ceph-mgr*.log; fi
+    if err_on '^Exim' 'exim|exim4'; then
+        err_app Exim 'exim exim4' ' \*\* |panic|error|failed|frozen' 'rejected rcpt|retry timeout exceeded' \
+            "$R"/var/log/exim_paniclog "$R"/var/log/exim/paniclog "$R"/var/log/exim4/paniclog \
+            "$R"/var/log/exim_mainlog "$R"/var/log/exim/main.log "$R"/var/log/exim4/mainlog
+    fi
+    if err_on '^Postfix' 'postfix|postfix@-'; then
+        err_app Postfix 'postfix postfix@-' 'postfix[-/a-z]*\[[0-9]+\]: (fatal|panic|error|warning):' '' "$R"/var/log/mail.log "$R"/var/log/maillog "$R"/var/log/mail/mail.log
+    fi
+    if err_on '^Dovecot' 'dovecot'; then
+        err_app Dovecot dovecot '(error|fatal|panic): ' 'postfix' "$R"/var/log/dovecot.log "$R"/var/log/dovecot/dovecot.log "$R"/var/log/mail.err "$R"/var/log/maillog
+    fi
+    if err_on '^PowerDNS authoritative' 'pdns'; then
+        err_app PowerDNS pdns 'error|fatal|exception|failed' '' "$R"/var/log/pdns.log
+    fi
+    if err_on '^PowerDNS Recursor' 'pdns-recursor'; then
+        err_app 'PowerDNS Recursor' pdns-recursor 'error|fatal|exception|failed' '' "$R"/var/log/pdns_recursor.log
+    fi
+    if err_on '^BIND' 'named|bind9'; then
+        err_app BIND 'named bind9' 'error|failed|not loaded|fatal|refused notify' 'query (cache )?denied' "$R"/var/log/named/*.log "$R"/var/log/bind/*.log "$R"/var/named/data/named.run
+    fi
+    if err_on '^cPanel' 'cpanel'; then
+        err_app cPanel cpanel '\] (error|die|fatal) |\[(error|die|fatal)\]| error ' '' "$R"/usr/local/cpanel/logs/error_log
+    fi
+}
+
+# Containers that are up or broken. docker logs reads what the engine already stored.
+err_containers() {
+    local i name image status shown engine
+    for ((i = 0; i < CT_N; i++)); do
+        engine=${CT_ENGINE[i]}
+        [[ $engine != crictl ]] || continue
+        shown=0
+        while IFS='|' read -r name image status _; do
+            [[ -n $name ]] || continue
+            case $status in Exited\ \(0\)*|Exited\ \(143\)*|Created*) continue ;; esac
+            ((shown < 12)) || break
+            ((shown += 1))
+            ((ERR_APPS += 1))
+            sub "Container $name ($engine)"
+            run_t 8 "$engine" logs --tail 300 "$name" 2>&1 | err_show "$ERR_ANY" "$ERR_QUIET"
+        done <<< "${CT_ROWS[i]}"
+    done
+}
+
+view_errors() {
+    ERR_APPS=0 ERR_LINES_SEEN=0 ERR_KINDS=0
+    title 'Errors from running applications' 'From a bounded tail of each log: grouped, counted, and explained where the error is a common one.'
+    printf '  %sThis view shows real log lines, which can hold private data. Think before sharing it.%s\n' "$c_yel" "$c_off"
+    printf '  %sThey appear only here, never in --report or --json. Passwords and tokens are masked, as far as a pattern can tell.%s\n' "$c_dim" "$c_off"
+    if ((LHA_UID != 0)); then printf '  %sWithout root, many logs cannot be read.%s\n' "$c_dim" "$c_off"; fi
+    err_apps
+    err_containers
+    if ((ERR_APPS == 0)); then
+        printf '\n  No known application was found running here.\n'
+    else
+        printf '\n  %d error lines of %d kinds, in the last %d lines or %d MiB of each log.\n' "$ERR_LINES_SEEN" "$ERR_KINDS" "$ERR_LINES" "$((ERR_BYTES / 1048576))"
+    fi
+    tips_begin
+    tip 'tail -f /var/log/nginx/error.log' 'watch one log live'
+    tip 'journalctl -u NAME -p err -n 50' 'errors of one service'
+    tip 'docker logs --tail 50 NAME' 'what a container printed last'
+    tip 'grep -c "error" FILE' 'count lines in a whole log'
+}
+
 view_resources_full() {
     view_resources
     metric_inventory
@@ -3780,7 +4923,8 @@ tui_open() {
         return 1
     fi
     if [[ ${tui_inherited:-no} != yes ]]; then
-        trap 'printf "\033[0m\033[?25h\033[?1049l" >&9' EXIT
+        LHA_EXIT_CMD='printf "\033[0m\033[?25h\033[?1049l" >&9'
+        trap "$LHA_EXIT_CMD" EXIT
         printf '\033[?1049h\033[?25l' >&9
     fi
     trap 'exit 130' INT
@@ -3906,6 +5050,7 @@ menu_page_debug() {
     menu_state '.*'
     menu_add "$REPLY" 'Problems and what to do' "$F_CRIT critical, $F_WARN warnings" 'START HERE' view_problems
     menu_add tool 'Logs: why did something stop?' 'may show private data' '' view_logs
+    menu_add tool 'Errors in application logs' 'grouped and explained, may show private data' '' view_errors
     menu_state services
     menu_add "$REPLY" 'Failed services' "$failed failed" 'LOOK CLOSER' view_apps
     menu_state 'resources|disk'
@@ -4005,7 +5150,7 @@ menu_frame() {
 
 tui_main() (
     local key choice=0 index frame term_rows term_cols accent secondary dim bold reset selected
-    local tui_inherited=no tui_active=yes menu_keys=123456789abcdefghijklmnoptuvwxyz page=main
+    local tui_inherited=no tui_active=yes menu_keys=123456789abcdefghilmnoptuvwxyz page=main
     local menu_n=0 menu_title='' action
     local -a menu_states menu_labels menu_badges menu_heads menu_actions
     tui_open || return 1
@@ -4364,6 +5509,8 @@ Views (each prints and exits):
   --db           Databases and caches
   --security     SSH, firewall, users, updates
   --logs         Crashes, reboots, why services stopped (may show private data)
+  --errors       Error logs of every running application, grouped, counted and explained
+                 (shows real log lines, so it may show private data)
   --jobs         Cron, timers, backups, monitoring
   --resources    CPU, RAM, disk, top processes
   --tune         How full each database and web server limit is, with advice from real load
@@ -4428,7 +5575,7 @@ main() {
     case ${1:-} in
         --trends) ;;
         --menu|--monitor|--metrics|--overview|--problems|--apps|--network|--containers|--docker|--k8s|\
-        --web|--db|--security|--logs|--jobs|--resources|--tune|--learn|--report|--check|--json)
+        --web|--db|--security|--logs|--errors|--jobs|--resources|--tune|--learn|--report|--check|--json)
             if (($# != 1)); then printf 'Unexpected arguments for %s\n' "$1" >&2; return 2; fi ;;
     esac
     case ${1:-} in
@@ -4445,6 +5592,7 @@ main() {
         --db) one_view view_data ;;
         --security) one_view view_security ;;
         --logs) one_view view_logs ;;
+        --errors) one_view view_errors ;;
         --jobs) one_view view_jobs ;;
         --resources) one_view view_resources ;;
         --tune) one_view view_tune ;;
@@ -4481,6 +5629,7 @@ main() {
 FX_HOME=${LHA_FIX_HOME:-/var/lib/linux-host-audit}
 FX_DRY=no FX_ASSUME=none FX_STAMP=0 FX_DEADMAN_PID=
 FX_SETTLE=${LHA_FIX_SETTLE:-4} FX_GUARD_RETRY=${LHA_FIX_GUARD_RETRY:-15} FX_DEADMAN_SECONDS=${LHA_FIX_DEADMAN:-120}
+FX_LOCK=${LHA_FIX_LOCK:-/dev/shm/linux-host-audit.lock} FX_TIMEOUT=300
 
 fx_say() { printf '%s\n' "$*"; }
 fx_log() { [[ -z ${FX_DIR:-} ]] || printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$FX_DIR/journal.log"; }
@@ -4525,9 +5674,18 @@ fx_backup() {
 
 # Replaces a file from stdin in one atomic step, keeping owner and mode.
 fx_write() {
-    local path=$1 temp=$1.lha-new
+    local path=$1 temp
+    # Writing through a link keeps it. Replacing it would leave the real file behind, unchanged.
+    if [[ -L $path ]]; then path=$(readlink -f "$path") || return 1; fi
+    temp=$path.lha-new
     fx_backup "$path" || return 1
     cat > "$temp" || { rm -f "$temp"; return 1; }
+    # A failed command at the start of the pipe leaves nothing here, and that must not win.
+    if [[ -s $path && ! -s $temp ]]; then
+        rm -f "$temp"
+        fx_log "refused to empty $path"
+        return 1
+    fi
     if [[ -e $path ]]; then
         chmod --reference="$path" "$temp" 2>/dev/null
         chown --reference="$path" "$temp" 2>/dev/null
@@ -4540,7 +5698,7 @@ fx_run() {
     local status
     fx_quote "$@"
     fx_log "run $REPLY"
-    if has timeout; then timeout 300 "$@" </dev/null >> "$FX_DIR/journal.log" 2>&1
+    if has timeout; then timeout "$FX_TIMEOUT" "$@" </dev/null >> "$FX_DIR/journal.log" 2>&1
     else "$@" </dev/null >> "$FX_DIR/journal.log" 2>&1
     fi
     status=$?
@@ -4592,19 +5750,24 @@ fx_guard_check() {
 fx_gates() {
     local load_x10
     if ((LHA_UID != 0)); then fx_say 'Fixes need root.'; return 1; fi
-    if ! mkdir "/dev/shm/linux-host-audit.lock" 2>/dev/null; then
-        fx_say 'Another fix is running. If it crashed: rmdir /dev/shm/linux-host-audit.lock'
-        return 1
-    fi
-    trap 'rmdir /dev/shm/linux-host-audit.lock 2>/dev/null' EXIT
+    # Before the lock: otherwise one refused fix would hold it, and block every fix after it.
     load_x10=$(awk -v l="$R_LOAD1" -v c="$H_CPUS" 'BEGIN { printf "%d", 10 * l / c }')
     if [[ $FX_RISK != low ]] && ((load_x10 >= 40)); then
         fx_say "Load is $R_LOAD1 on $H_CPUS cores. Medium and high risk fixes wait for a quieter moment."
         return 1
     fi
+    if ! mkdir "$FX_LOCK" 2>/dev/null; then
+        fx_say "Another fix is running. If it crashed: rmdir $FX_LOCK"
+        return 1
+    fi
+    # The menu keeps its own exit trap, which puts the terminal back. It has to survive this one.
+    trap "rmdir \"$FX_LOCK\" 2>/dev/null; ${LHA_EXIT_CMD:-:}" EXIT
 }
 
-fx_gates_end() { rmdir /dev/shm/linux-host-audit.lock 2>/dev/null; trap - EXIT; }
+fx_gates_end() {
+    rmdir "$FX_LOCK" 2>/dev/null
+    if [[ -n ${LHA_EXIT_CMD:-} ]]; then trap "$LHA_EXIT_CMD" EXIT; else trap - EXIT; fi
+}
 
 # Low risk: y. Medium and high: the word yes, typed. --yes only ever covers what it names.
 fx_confirm() {
@@ -4627,36 +5790,45 @@ fx_confirm() {
     fi
 }
 
-# For changes that could lock you out. The revert runs on its own, unless you confirm in time.
+# For changes that could lock you out. It runs before the change, because the session can die
+# during it. So it reads the undo list when it fires, and a cancel file stops it even if the
+# signal comes late: killing its sleep alone would make it run the undo at once.
 fx_deadman_start() {
     local script=$FX_DIR/deadman.sh
     {
         printf '#!/bin/bash\nsleep %s\n' "$FX_DEADMAN_SECONDS"
-        awk '{ line[NR] = $0 } END { for (i = NR; i > 0; i--) print line[i] }' "$FX_DIR/undo.list"
+        printf '[[ ! -e %q ]] || exit 0\n' "$FX_DIR/deadman.cancel"
+        printf 'awk %q %q | while IFS= read -r line; do bash -c "$line"; done\n' \
+            '{ line[NR] = $0 } END { for (i = NR; i > 0; i--) print line[i] }' "$FX_DIR/undo.list"
+        printf ': > %q\n' "$FX_DIR/undo.list"
         printf 'echo "$(date) reverted by dead-man timer" >> %q\n' "$FX_DIR/journal.log"
     } > "$script"
     nohup setsid bash "$script" >/dev/null 2>&1 </dev/null &
     FX_DEADMAN_PID=$!
+    FX_DEADMAN_AT=$((SECONDS + FX_DEADMAN_SECONDS))
     fx_log "dead-man armed: $FX_DEADMAN_SECONDS s, pid $FX_DEADMAN_PID"
 }
 
 fx_deadman_stop() {
     [[ -z $FX_DEADMAN_PID ]] && return 0
-    pkill -P "$FX_DEADMAN_PID" 2>/dev/null
+    : > "$FX_DIR/deadman.cancel"
     kill "$FX_DEADMAN_PID" 2>/dev/null
     FX_DEADMAN_PID=
     fx_log 'dead-man disarmed'
 }
 
 fx_deadman_ask() {
-    local answer=''
-    fx_say "Safety timer is running. Unless you confirm within $FX_DEADMAN_SECONDS seconds, this change undoes itself."
+    local answer='' left
+    # Stop listening a little before the timer fires, so a late keep cannot pass for a kept change.
+    left=$((FX_DEADMAN_AT - SECONDS - 3))
+    ((left > 0)) || left=1
+    fx_say "Safety timer is running. Unless you confirm within $left seconds, this change undoes itself."
     fx_say 'Open a NEW session to this server now, and check that you can still get in.'
     if [[ ${FX_DEADMAN_AUTO:-} == keep ]]; then fx_deadman_stop; return 0; fi
     if [[ ${FX_DEADMAN_AUTO:-} == wait ]]; then return 1; fi
     if { : </dev/tty; } 2>/dev/null; then
         printf 'New session works? Type keep to keep the change: ' >/dev/tty
-        IFS= read -r -t "$FX_DEADMAN_SECONDS" answer </dev/tty
+        IFS= read -r -t "$left" answer </dev/tty
     fi
     if [[ $answer == keep ]]; then fx_deadman_stop; return 0; fi
     return 1
@@ -4690,10 +5862,10 @@ fx_transaction() {
     fx_guard_take
     fx_log "applying $id $target: $FX_CAUSE"
     local status=0 reason=''
+    if [[ $FX_LOCKOUT == yes ]]; then fx_deadman_start; fi
     "ap_$name" "$target" || { status=1 reason='the fix did not complete'; }
     if ((status == 0)); then
         sleep "$FX_SETTLE"
-        if [[ $FX_LOCKOUT == yes ]]; then fx_deadman_start; fi
         if ! "ck_$name" "$target"; then status=1 reason='the problem is still there after the fix'
         elif ! fx_guard_check; then
             status=1 reason="something else stopped: $(tr '\n' ';' <<< "$FX_LOST")"
@@ -4743,6 +5915,10 @@ fx_undo_run() {
     for dir in "$FX_HOME/runs/$run" "/dev/shm/linux-host-audit/$run"; do
         if [[ -f $dir/undo.list ]]; then
             FX_DIR=$dir
+            if [[ ! -s $dir/undo.list ]]; then
+                fx_say "Nothing to undo in this run: it was undone already, or it could not be undone. $(cat "$dir/what")"
+                return 0
+            fi
             fx_rollback
             fx_say "Undone: $(cat "$dir/what")"
             return 0
@@ -4874,9 +6050,12 @@ dx_inodes_full() {
 }
 
 # Swap gives a memory-starved server room, and stops the OOM killer firing at the first spike.
+FX_SWAPFILE=${LHA_FIX_SWAPFILE:-/swapfile}
 fx_swap_possible() {
     local free
     [[ -z $H_CONTAINER ]] || return 1
+    # Rollback removes this file, so it has to be one this fix made.
+    [[ ! -e $FX_SWAPFILE ]] || return 1
     ((R_SWAP_TOTAL == 0)) || return 1
     case $(awk '$2 == "/" { print $3 }' /proc/mounts | tail -n 1) in ext*|xfs) ;; *) return 1 ;; esac
     free=$(df -Pk / | awk 'NR == 2 { print $4 }')
@@ -4894,7 +6073,7 @@ fx_swap_apply() {
     fx_run chmod 600 /swapfile || return 1
     fx_run mkswap /swapfile || return 1
     fx_run swapon /swapfile || return 1
-    { cat /etc/fstab; printf '/swapfile none swap sw 0 0\n'; } > /etc/fstab.lha-new && mv -f /etc/fstab.lha-new /etc/fstab
+    { cat /etc/fstab; printf '/swapfile none swap sw 0 0\n'; } | fx_write /etc/fstab
 }
 fx_swap_check() { awk '$1 == "/swapfile" { found = 1 } END { exit !found }' /proc/swaps; }
 
@@ -4973,11 +6152,37 @@ fx_config_test() {
         httpd*) has apachectl && out=$(run_t 10 apachectl configtest 2>&1) || FX_CONFIG_ERROR=$out ;;
         ssh|sshd) has sshd && out=$(run_t 10 sshd -t 2>&1) || FX_CONFIG_ERROR=$out ;;
         haproxy*) has haproxy && out=$(run_t 10 haproxy -c -f /etc/haproxy/haproxy.cfg 2>&1) || FX_CONFIG_ERROR=$out ;;
-        php*-fpm*) has php-fpm && out=$(run_t 10 php-fpm -t 2>&1) || FX_CONFIG_ERROR=$out ;;
-        postfix*) has postfix && out=$(run_t 10 postfix check 2>&1) || FX_CONFIG_ERROR=$out ;;
+        php*-fpm*) out=$(fx_phpfpm_test "$unit") || FX_CONFIG_ERROR=$out ;;
+        # postconf only reads. "postfix check" creates missing folders and changes owners.
+        postfix*) if has postconf; then
+                out=$(run_t 10 postconf -n 2>&1 >/dev/null)
+                [[ $out != *fatal* ]] || FX_CONFIG_ERROR=$out
+            fi ;;
         named*|bind9*) has named-checkconf && out=$(run_t 10 named-checkconf 2>&1) || FX_CONFIG_ERROR=$out ;;
     esac
     FX_CONFIG_ERROR=$(printf '%s' "$FX_CONFIG_ERROR" | clean | grep -v 'syntax is ok\|test is successful' | tail -n 2 | tr '\n' ' ' | cut -c1-200)
+}
+
+# The binary of a PHP version: unit php8.2-fpm runs php-fpm8.2.
+fx_phpfpm_bin() {
+    local unit=${1%.service} version=''
+    [[ $unit =~ ^php([0-9.]+)-fpm$ ]] && version=${BASH_REMATCH[1]}
+    if [[ -n $version ]] && has "php-fpm$version"; then printf 'php-fpm%s' "$version"
+    elif has php-fpm; then printf 'php-fpm'
+    fi
+}
+fx_phpfpm_test() {
+    local bin
+    bin=$(fx_phpfpm_bin "$1")
+    [[ -n $bin ]] || return 0
+    run_t 10 "$bin" -t 2>&1
+}
+
+# Which package owns a file. Rpm is asked only where it has a database: see rpm_usable.
+fx_owner_package() {
+    if has dpkg; then dpkg -S "$1" 2>/dev/null | cut -d: -f1
+    elif rpm_usable; then rpm -qf "$1" 2>/dev/null
+    fi
 }
 
 fx_unit_log() { run_t 8 journalctl -u "$1" -n 60 --no-pager -q -o cat 2>/dev/null | clean; }
@@ -5027,7 +6232,7 @@ dx_service_failed() {
                 path=$(run_t 3 systemctl show -p ExecStart --value -- "$unit" 2>/dev/null | grep -oE 'path=[^ ;]+' | head -n 1)
                 path=${path#path=}
                 FX_CAUSE="Its program could not run: ${path:-unknown path} is missing or not executable."
-                if has rpm; then pkg=$(rpm -qf "$path" 2>/dev/null); elif has dpkg; then pkg=$(dpkg -S "$path" 2>/dev/null | cut -d: -f1); fi
+                pkg=$(fx_owner_package "$path")
                 FX_STEPS=("ls -l $path" "Reinstall its package${pkg:+: $pkg}.")
                 return 0
             fi ;;
@@ -5096,7 +6301,11 @@ ck_mysql_down() { ck_service_failed "$FX_UNIT"; }
 dx_postgres_down() { fx_delegate "$(fx_first_unit postgresql)"; }
 ap_postgres_down() { ap_service_failed "$FX_UNIT"; }
 ck_postgres_down() { ck_service_failed "$FX_UNIT"; }
-dx_redis_down() { fx_delegate "$(fx_first_unit redis redis-server valkey valkey-server)"; }
+dx_redis_down() {
+    if [[ ${1:-} == Valkey ]]; then fx_delegate "$(fx_first_unit valkey valkey-server)"
+    else fx_delegate "$(fx_first_unit redis redis-server valkey valkey-server)"
+    fi
+}
 ap_redis_down() { ap_service_failed "$FX_UNIT"; }
 ck_redis_down() { ck_service_failed "$FX_UNIT"; }
 dx_engine_down() { fx_delegate "$(fx_first_unit "$1" "$1.socket")"; }
@@ -5163,6 +6372,10 @@ fx_ssh_port() { awk '$5 == "sshd" || $5 == "ssh" { print $2; exit }' <<< "$NET_R
 
 fx_public_ports() { awk '$3 == "public" { print $2 "/" $1 }' <<< "$NET_ROWS" | sort -u; }
 
+# A firewall also closes what listens on a private address, such as a database for the app
+# server next door, so that has to stay open too. Only local listeners do not matter.
+fx_open_ports() { awk '$3 != "local" { print $2 "/" $1 }' <<< "$NET_ROWS" | sort -u; }
+
 fx_remote_clients() {
     run_t 5 ss -Htn state established "( sport = :$1 )" 2>/dev/null |
         awk '{ print $NF }' | grep -v '^127\.\|^\[::1\]' | sed 's/:[0-9]*$//' | sort -u | head -n 5 | tr '\n' ' '
@@ -5189,7 +6402,7 @@ dx_no_firewall() {
         return 0
     fi
     FX_MODE=auto FX_RISK=high FX_LOCKOUT=yes
-    FX_PLAN=("Turn on $FX_TOOL." "Allow every port that is public today, SSH ($ssh) first, so nothing changes for working services."
+    FX_PLAN=("Turn on $FX_TOOL." "Allow every port other machines can reach today, SSH ($ssh) first, so nothing changes for working services."
         'New ports will be closed from now on.' 'Then close the ports you do not want one by one.')
 }
 ap_no_firewall() {
@@ -5198,13 +6411,13 @@ ap_no_firewall() {
     if [[ $FX_TOOL == ufw ]]; then
         fx_undo 'ufw --force disable'
         fx_run ufw allow "$ssh/tcp" || return 1
-        while read -r port; do [[ -z $port ]] || fx_run ufw allow "$port"; done <<< "$(fx_public_ports)"
+        while read -r port; do [[ -z $port ]] || fx_run ufw allow "$port" || return 1; done <<< "$(fx_open_ports)"
         fx_run ufw --force enable
     else
         fx_undo 'systemctl disable --now firewalld'
         fx_run systemctl enable --now firewalld || return 1
         fx_run firewall-cmd --permanent --add-port="$ssh/tcp" || return 1
-        while read -r port; do [[ -z $port ]] || fx_run firewall-cmd --permanent --add-port="$port"; done <<< "$(fx_public_ports)"
+        while read -r port; do [[ -z $port ]] || fx_run firewall-cmd --permanent --add-port="$port" || return 1; done <<< "$(fx_open_ports)"
         fx_run firewall-cmd --reload
     fi
 }
@@ -5230,6 +6443,9 @@ dx_ssh_root_password() {
 ap_ssh_root_password() {
     local unit=sshd file=/etc/ssh/sshd_config
     [[ $(run_t 3 systemctl is-active ssh 2>/dev/null) != active ]] || unit=ssh
+    # Undo runs newest first, and the reload has to come after the file is back.
+    fx_quote systemctl reload "$unit"
+    fx_undo "$REPLY"
     if grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d' "$file"; then
         # First match wins in sshd_config.d, so sort this file early.
         printf 'PermitRootLogin prohibit-password\n' | fx_write /etc/ssh/sshd_config.d/00-linux-host-audit.conf || return 1
@@ -5237,8 +6453,6 @@ ap_ssh_root_password() {
         { sed -E 's/^[[:space:]]*PermitRootLogin[[:space:]].*/PermitRootLogin prohibit-password/' "$file"
           grep -qiE '^[[:space:]]*PermitRootLogin[[:space:]]' "$file" || printf 'PermitRootLogin prohibit-password\n'; } | fx_write "$file" || return 1
     fi
-    fx_quote systemctl reload "$unit"
-    fx_undo "$REPLY"
     sshd -t || return 1
     fx_run systemctl reload "$unit"
 }
@@ -5290,10 +6504,17 @@ fx_block_plan() {
     FX_PLAN=("Block port $port from outside. Nothing is connected to it from another machine now." "Local apps keep using $label.")
     FX_STEPS=("This rule disappears at reboot. For good, make $label listen on 127.0.0.1 only.")
 }
+# By interface: a local app that connects to this machine's own address arrives from that
+# address, not from 127.0.0.1. A service on :: is open over IPv6 as well.
 fx_block_apply() {
-    fx_quote iptables -D INPUT -p tcp --dport "$FX_PORT" '!' -s 127.0.0.1 -j DROP
-    fx_undo "$REPLY"
-    fx_run iptables -I INPUT -p tcp --dport "$FX_PORT" '!' -s 127.0.0.1 -j DROP
+    local tool
+    for tool in iptables ip6tables; do
+        has "$tool" || continue
+        [[ $tool == iptables || -d /proc/sys/net/ipv6 ]] || continue
+        fx_quote "$tool" -D INPUT -p tcp --dport "$FX_PORT" '!' -i lo -j DROP
+        fx_undo "$REPLY"
+        fx_run "$tool" -I INPUT -p tcp --dport "$FX_PORT" '!' -i lo -j DROP || return 1
+    done
 }
 fx_block_check() { iptables -S INPUT 2>/dev/null | grep -q -- "--dport $FX_PORT .*-j DROP"; }
 
@@ -5312,8 +6533,10 @@ dx_db_exposed() {
 ap_db_exposed() { fx_block_apply; }
 ck_db_exposed() { fx_block_check; }
 dx_redis_open() {
+    local port
+    if [[ ${1:-} == Valkey ]]; then port=$(port_of valkey-server); else port=$(port_of redis-server); fi
     FX_CAUSE="$1 has no password and is public. Anyone can read it, or use it to take over the server."
-    fx_block_plan 6379 "$1"
+    fx_block_plan "${port:-6379}" "$1"
     FX_STEPS+=('Then set bind 127.0.0.1 and requirepass in its config.')
 }
 ap_redis_open() { fx_block_apply; }
@@ -5340,13 +6563,17 @@ dx_updates_security() {
     fi
 }
 ap_updates_security() {
+    # A timeout would kill dpkg in the middle of a package, and that is what breaks a server.
     # shellcheck disable=SC2086 # package names are split on purpose
-    fx_run env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get -y -o Dpkg::Options::=--force-confold \
+    FX_TIMEOUT=3600 fx_run env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get -y -o Dpkg::Options::=--force-confold \
         install --only-upgrade $FX_PACKAGES
 }
 ck_updates_security() {
-    ! run_t 15 apt-get -s -o Debug::NoLocking=true -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= upgrade 2>/dev/null |
-        grep -qF "Inst ${FX_PACKAGES%% *} "
+    local left name
+    left=$(run_t 15 apt-get -s -o Debug::NoLocking=true -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= upgrade 2>/dev/null)
+    for name in $FX_PACKAGES; do
+        [[ $left != *"Inst $name "* ]] || return 1
+    done
 }
 # Containers and Kubernetes. Reads logs and states, and restarts only what is already broken.
 
@@ -5615,11 +6842,16 @@ dx_backup_old() { FX_CAUSE="Backups in $1 stopped."; FX_STEPS=('grep -i backup /
 dx_monitoring_missing() { FX_CAUSE='Nothing alerts you when this server fails.'; FX_MODE=never; FX_STEPS=('Netdata or node_exporter are good starting points.' 'Or run from cron: linux-host-audit.sh --check, and alert on exit code 2.'); }
 dx_mail_queue() {
     FX_CAUSE='Many emails are waiting.'
-    FX_STEPS=('exim -bp | exiqsumm | tail' 'exim -bp | head -20 shows sender addresses.' 'If one account sends thousands, a site is hacked or a mailbox is stolen.')
+    if [[ -n $(sig_list RUNNING '^Exim') ]]; then
+        FX_STEPS=('exim -bp | exiqsumm | tail' 'exim -bp | head -20 shows sender addresses.')
+    else
+        FX_STEPS=('postqueue -p | tail shows the total.' 'postqueue -p | head -30 shows sender addresses.')
+    fi
+    FX_STEPS+=('If one account sends thousands, a site is hacked or a mailbox is stolen.')
 }
 dx_mysql_connections() { FX_CAUSE='Connections are close to max_connections.'; FX_STEPS=('SHOW FULL PROCESSLIST; look for slow queries first.' 'Raising the limit without that only uses more RAM.'); }
 dx_postgres_connections() { FX_CAUSE='Connections are close to max_connections.'; FX_STEPS=('select state, count(*) from pg_stat_activity group by 1;' 'A connection pooler such as PgBouncer usually fixes this.'); }
-dx_mysql_replication_stopped() { FX_MODE=never; FX_CAUSE='Replication stopped. Skipping an error can silently corrupt the replica.'; FX_STEPS=('SHOW SLAVE STATUS\G and read Last_Error.' 'Fix the cause. Rebuild the replica if in doubt.'); }
+dx_mysql_replication_stopped() { FX_MODE=never; FX_CAUSE='Replication stopped. Skipping an error can silently corrupt the replica.'; FX_STEPS=('SHOW REPLICA STATUS\G and read Last_Error. Before MySQL 8.0.22 and MariaDB 10.5: SHOW SLAVE STATUS\G' 'Fix the cause. Rebuild the replica if in doubt.'); }
 dx_search_red() { FX_CAUSE='Some primary shards have no node.'; FX_STEPS=('curl -s localhost:9200/_cat/shards?v | grep UNASSIGNED' 'curl -s localhost:9200/_cluster/allocation/explain?pretty'); }
 
 guide_fallback() {
@@ -5657,12 +6889,21 @@ tune_mysql_dir() {
     done
 }
 
+# Changes pm.max_children of one pool. A file can hold several pools, and the others stay.
+tune_fpm_edit() {
+    awk -v pool="[$2]" -v value="$3" '
+        /^[ \t]*\[/ { line = $0; gsub(/[ \t]/, "", line); inside = (line == pool) }
+        inside && /^[ \t]*pm\.max_children[ \t]*=/ { print "pm.max_children = " value; next }
+        { print }' "$1"
+}
+
 fx_mysql_client() { FX_SQL=mysql; has mysql || FX_SQL=mariadb; }
 fx_mysql_get() { run_t 6 "$FX_SQL" --connect-timeout=3 -NBe "SELECT @@GLOBAL.$1" 2>/dev/null; }
 
 dx_tune_apply() {
     local n=${1:-0} line
     tune_collect
+    [[ $n =~ ^[1-9][0-9]*$ ]] || n=0
     line=$(tune_advice | sed -n "${n}p")
     IFS='|' read -r TA_GROUP TA_SETTING TA_NOW _ _ TA_REC TA_WHY TA_HOW TA_RAW <<< "$line"
     if [[ -z $TA_SETTING ]]; then FX_CAUSE="There is no advice number $n."; return 0; fi
@@ -5716,8 +6957,11 @@ dx_tune_apply() {
                 FX_STEPS+=('cPanel rebuilds these files. Change it in MultiPHP Manager > PHP-FPM Settings.')
             elif [[ -n $TA_FILE ]]; then
                 TA_KIND=phpfpm FX_MODE=auto FX_RISK=medium
-                TA_UNIT=$(run_t 5 systemctl list-units --type=service --state=running --plain --no-legend 2>/dev/null | awk '$1 ~ /php.*fpm/ { print $1; exit }')
-                FX_PLAN=("Set pm.max_children = $TA_RAW in $TA_FILE." "Reload ${TA_UNIT:-php-fpm}.")
+                # With several PHP versions, the file says which one owns this pool.
+                if [[ $TA_FILE =~ ^/etc/php/([0-9.]+)/fpm/ ]]; then TA_UNIT=php${BASH_REMATCH[1]}-fpm.service
+                else TA_UNIT=$(run_t 5 systemctl list-units --type=service --state=running --plain --no-legend 2>/dev/null | awk '$1 ~ /php.*fpm/ { print $1; exit }')
+                fi
+                FX_PLAN=("Set pm.max_children = $TA_RAW for pool $TA_POOL in $TA_FILE." "Test the config, then reload ${TA_UNIT:-php-fpm}.")
                 FX_EXPECT_GONE=$TA_UNIT
             fi ;;
     esac
@@ -5735,12 +6979,23 @@ ap_tune_apply() {
             fx_quote "$FX_SQL" -e "SET GLOBAL $TA_SETTING = $old"
             fx_undo "$REPLY"
             fx_run "$FX_SQL" -e "SET GLOBAL $TA_SETTING = $TA_RAW" || return 1
+            line=''
+            # The smaller of these two is what counts, so they only ever move together.
             if [[ $TA_SETTING == tmp_table_size ]]; then
+                old=$(fx_mysql_get max_heap_table_size)
+                [[ -n $old ]] || return 1
+                fx_quote "$FX_SQL" -e "SET GLOBAL max_heap_table_size = $old"
+                fx_undo "$REPLY"
                 fx_run "$FX_SQL" -e "SET GLOBAL max_heap_table_size = $TA_RAW" || return 1
+                line=max_heap_table_size
             fi
             if [[ -n $TA_DIR ]]; then
                 file=$TA_DIR/zz-linux-host-audit.cnf
-                { printf '[mysqld]\n'; grep -v -e "^$TA_SETTING " -e '^\[mysqld\]' "$file" 2>/dev/null; printf '%s = %s\n' "$TA_SETTING" "$TA_RAW"; } | fx_write "$file"
+                { printf '[mysqld]\n'
+                  grep -v -e "^$TA_SETTING " -e "^${line:-none} " -e '^\[mysqld\]' "$file" 2>/dev/null
+                  printf '%s = %s\n' "$TA_SETTING" "$TA_RAW"
+                  [[ -z $line ]] || printf '%s = %s\n' "$line" "$TA_RAW"
+                } | fx_write "$file"
             fi ;;
         sysctl) fx_sysctl "$TA_SETTING" "$TA_RAW" ;;
         thp)
@@ -5760,7 +7015,10 @@ ap_tune_apply() {
         phpfpm)
             fx_quote systemctl reload "$TA_UNIT"
             fx_undo "$REPLY"
-            sed -E "s/^([[:space:]]*pm\.max_children[[:space:]]*=).*/\1 $TA_RAW/" "$TA_FILE" | fx_write "$TA_FILE" || return 1
+            tune_fpm_edit "$TA_FILE" "$TA_POOL" "$TA_RAW" | fx_write "$TA_FILE" || return 1
+            # No app config changes without its own test.
+            [[ -n $(fx_phpfpm_bin "$TA_UNIT") ]] || return 1
+            fx_phpfpm_test "$TA_UNIT" >/dev/null 2>&1 || return 1
             fx_run systemctl reload "$TA_UNIT" ;;
         *) return 1 ;;
     esac
@@ -5781,7 +7039,7 @@ ck_tune_apply() {
         thp) grep -q '\[madvise\]' /sys/kernel/mm/transparent_hugepage/enabled ;;
         redis) [[ $(run_t 5 "$TA_CLI" -h 127.0.0.1 config get maxmemory | tail -n 1 | tr -d '\r') == "$TA_RAW" ]] ;;
         nginx) grep -qE "^[[:space:]]*${TA_SETTING}[[:space:]]+$TA_RAW;" "$TA_FILE" && [[ $(run_t 3 systemctl is-active nginx) == active ]] ;;
-        phpfpm) [[ $(run_t 3 systemctl is-active "$TA_UNIT") == active ]] ;;
+        phpfpm) [[ $(tune_fpm_edit "$TA_FILE" "$TA_POOL" "$TA_RAW") == "$(cat "$TA_FILE")" && $(run_t 3 systemctl is-active "$TA_UNIT") == active ]] ;;
         *) return 1 ;;
     esac
 }
@@ -5811,8 +7069,9 @@ menu_page_apply() {
     ((n > 0)) || menu_add ok 'Nothing to change right now' '' 'ALL CLEAR' view_tune
 }
 
+# The menu splits its action on spaces, and a target can hold spaces: an OS name, say.
 fix_from_menu() {
-    local want=$1
+    local want=$*
     fix_find "$want" || { fx_say 'This problem is no longer there.'; return 0; }
     fx_transaction "${F_ID[FOUND_INDEX]}" "${F_TARGET[FOUND_INDEX]}"
 }
@@ -5832,8 +7091,8 @@ trend_record() {
     swap=$(awk '/^SwapTotal:/ { t = $2 } /^SwapFree:/ { f = $2 } END { if (t > 0) printf "%d", (t - f) * 100 / t; else print 0 }' /proc/meminfo)
     disk=$(disk_rows | awk '$2 + 0 > m { m = $2 + 0 } END { print m + 0 }')
     conns=0
-    if has ss; then conns=$(run_t 5 ss -Htn state established 2>/dev/null | wc -l | tr -d ' '); fi
-    php=$(ps -eo args= 2>/dev/null | grep -c '^php-fpm: pool')
+    conns=$(tcp_count 01 0 65535)
+    php=$(ps -eo args= 2>/dev/null | grep -c '^php-fpm[0-9.]*: pool')
     if ps -eo comm= 2>/dev/null | grep -qE '^(mariadbd|mysqld)$'; then
         file=mysql
         has mysql || file=mariadb
@@ -5864,7 +7123,10 @@ ap_trends_on() {
     fx_backup "$TREND_BIN" || return 1
     fx_run cp "$FX_SELF" "$TREND_BIN" || return 1
     fx_run chmod 755 "$TREND_BIN" || return 1
-    printf 'SHELL=/bin/bash\n*/5 * * * * root nice -n 19 ionice -c3 %s --record >/dev/null 2>&1\n' "$TREND_BIN" | fx_write "$TREND_CRON"
+    # Alpine and other small systems have no ionice, and cron would fail with no trace.
+    local quiet=''
+    if has ionice; then quiet='ionice -c3 '; fi
+    printf 'SHELL=/bin/bash\n*/5 * * * * root nice -n 19 %s%s --record >/dev/null 2>&1\n' "$quiet" "$TREND_BIN" | fx_write "$TREND_CRON"
     chmod 644 "$TREND_CRON"
     fx_run "$TREND_BIN" --record
 }

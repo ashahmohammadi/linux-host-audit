@@ -69,12 +69,24 @@ of advice. A service running for less than a day gets numbers, but no advice.
 Overview, problems with fixes, applications (found by port, service and process, so unknown apps
 appear too), ports and firewall, Docker, Podman, LXD, Incus, Proxmox, libvirt, Kubernetes (k8s, k3s,
 k0s, RKE2, MicroK8s, OpenShift), websites, domains and SSL, databases and caches, security, logs,
-scheduled jobs, backups, a live monitor, and a guided tour.
+application errors, scheduled jobs, backups, a live monitor, and a guided tour.
+
+`--errors` reads a bounded tail of the error log of each running application: nginx, Apache, LiteSpeed,
+PHP-FPM, MySQL, MariaDB, PostgreSQL, Redis, Valkey, MongoDB, Elasticsearch, OpenSearch, HAProxy, Varnish,
+Tomcat, RabbitMQ, Kafka, ClickHouse, Cassandra, Squid, Exim, Postfix, Dovecot, PowerDNS, BIND, cPanel,
+and the logs of each container. It groups repeated errors, counts them, and turns common ones into a
+plain cause and a next step. Log lines can hold private data, so they appear in this view only, never
+in `--report` or `--json`. Passwords and tokens are masked, as far as a pattern can tell.
 
 Tuning has its own rules for MySQL, MariaDB, PostgreSQL, Redis, Valkey, Memcached, MongoDB,
-Elasticsearch, OpenSearch, Nginx, Apache, LiteSpeed, HAProxy, Varnish, PHP-FPM, Tomcat, containers,
-Kubernetes and the Linux kernel. Any other program with an open port still gets its open file, thread
-and memory numbers.
+Elasticsearch, OpenSearch, Nginx, Apache, LiteSpeed, HAProxy, Varnish, PHP-FPM, Tomcat, RabbitMQ,
+ClickHouse, Squid, Caddy, Gunicorn, uWSGI, containers, Kubernetes and the Linux kernel. Kafka, Cassandra,
+InfluxDB, MinIO, Traefik, Keepalived, Ceph, GlusterFS, Node.js and every JVM get the real numbers they
+expose without a password, and a plain note where a limit cannot be read. Any other program with an
+open port still gets its open file, thread and memory numbers.
+
+Advice needs evidence. A service running for less than a day gets numbers only, and so does a limit
+that nothing has come near.
 
 `--help` lists every view. `--check` prints one status line and exits 0, 1 or 2 for cron or monitoring.
 
@@ -91,6 +103,10 @@ contract: other tools can act on them without reading the English text, so never
 - Pending updates are not checked on dnf and yum, because those tools write to their logs.
 - Database details need passwordless local access. It never asks for a password.
 - `kubectl` keeps its own small cache in `~/.kube`, which is the one write this tool can cause.
+- Some tools are left out on purpose, because they write or log something: `rabbitmqctl`, `nodetool`,
+  `gluster` and `ceph`. Those services show what their own metrics page or state files say.
+- `ss` is used only where its kernel modules are loaded already. Otherwise the kernel would load them,
+  so listeners and connections come from `/proc`, or from `netstat` if it is there.
 - PostgreSQL details need root and `setpriv`. Password-protected services show less.
 - A clean report means these checks found nothing. It does not prove a server is secure.
 
@@ -98,5 +114,6 @@ contract: other tools can act on them without reading the English text, so never
 
 `bash tests/run.sh` runs simulated servers with fake `docker`, `kubectl`, `ss` and other tools.
 `tests/fix-real.sh` breaks a throwaway machine on purpose and fixes it. Never run it on a real server.
-CI runs the second one, old and new distros, and real databases and web servers across versions.
+CI runs the second one, old and new distros, and real databases, web servers and queues across versions.
+`tests/parse-real.sh` checks the parsers on each distro's own awk, because mawk fails quietly.
 Run `tests/run.sh` yourself before a release, because it is not in CI.

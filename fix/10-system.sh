@@ -113,9 +113,12 @@ dx_inodes_full() {
 }
 
 # Swap gives a memory-starved server room, and stops the OOM killer firing at the first spike.
+FX_SWAPFILE=${LHA_FIX_SWAPFILE:-/swapfile}
 fx_swap_possible() {
     local free
     [[ -z $H_CONTAINER ]] || return 1
+    # Rollback removes this file, so it has to be one this fix made.
+    [[ ! -e $FX_SWAPFILE ]] || return 1
     ((R_SWAP_TOTAL == 0)) || return 1
     case $(awk '$2 == "/" { print $3 }' /proc/mounts | tail -n 1) in ext*|xfs) ;; *) return 1 ;; esac
     free=$(df -Pk / | awk 'NR == 2 { print $4 }')
@@ -133,7 +136,7 @@ fx_swap_apply() {
     fx_run chmod 600 /swapfile || return 1
     fx_run mkswap /swapfile || return 1
     fx_run swapon /swapfile || return 1
-    { cat /etc/fstab; printf '/swapfile none swap sw 0 0\n'; } > /etc/fstab.lha-new && mv -f /etc/fstab.lha-new /etc/fstab
+    { cat /etc/fstab; printf '/swapfile none swap sw 0 0\n'; } | fx_write /etc/fstab
 }
 fx_swap_check() { awk '$1 == "/swapfile" { found = 1 } END { exit !found }' /proc/swaps; }
 

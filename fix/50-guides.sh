@@ -102,11 +102,16 @@ dx_backup_old() { FX_CAUSE="Backups in $1 stopped."; FX_STEPS=('grep -i backup /
 dx_monitoring_missing() { FX_CAUSE='Nothing alerts you when this server fails.'; FX_MODE=never; FX_STEPS=('Netdata or node_exporter are good starting points.' 'Or run from cron: linux-host-audit.sh --check, and alert on exit code 2.'); }
 dx_mail_queue() {
     FX_CAUSE='Many emails are waiting.'
-    FX_STEPS=('exim -bp | exiqsumm | tail' 'exim -bp | head -20 shows sender addresses.' 'If one account sends thousands, a site is hacked or a mailbox is stolen.')
+    if [[ -n $(sig_list RUNNING '^Exim') ]]; then
+        FX_STEPS=('exim -bp | exiqsumm | tail' 'exim -bp | head -20 shows sender addresses.')
+    else
+        FX_STEPS=('postqueue -p | tail shows the total.' 'postqueue -p | head -30 shows sender addresses.')
+    fi
+    FX_STEPS+=('If one account sends thousands, a site is hacked or a mailbox is stolen.')
 }
 dx_mysql_connections() { FX_CAUSE='Connections are close to max_connections.'; FX_STEPS=('SHOW FULL PROCESSLIST; look for slow queries first.' 'Raising the limit without that only uses more RAM.'); }
 dx_postgres_connections() { FX_CAUSE='Connections are close to max_connections.'; FX_STEPS=('select state, count(*) from pg_stat_activity group by 1;' 'A connection pooler such as PgBouncer usually fixes this.'); }
-dx_mysql_replication_stopped() { FX_MODE=never; FX_CAUSE='Replication stopped. Skipping an error can silently corrupt the replica.'; FX_STEPS=('SHOW SLAVE STATUS\G and read Last_Error.' 'Fix the cause. Rebuild the replica if in doubt.'); }
+dx_mysql_replication_stopped() { FX_MODE=never; FX_CAUSE='Replication stopped. Skipping an error can silently corrupt the replica.'; FX_STEPS=('SHOW REPLICA STATUS\G and read Last_Error. Before MySQL 8.0.22 and MariaDB 10.5: SHOW SLAVE STATUS\G' 'Fix the cause. Rebuild the replica if in doubt.'); }
 dx_search_red() { FX_CAUSE='Some primary shards have no node.'; FX_STEPS=('curl -s localhost:9200/_cat/shards?v | grep UNASSIGNED' 'curl -s localhost:9200/_cluster/allocation/explain?pretty'); }
 
 guide_fallback() {

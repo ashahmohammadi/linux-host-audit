@@ -4,6 +4,10 @@ fx_ssh_port() { awk '$5 == "sshd" || $5 == "ssh" { print $2; exit }' <<< "$NET_R
 
 fx_public_ports() { awk '$3 == "public" { print $2 "/" $1 }' <<< "$NET_ROWS" | sort -u; }
 
+# A firewall also closes what listens on a private address, such as a database for the app
+# server next door, so that has to stay open too. Only local listeners do not matter.
+fx_open_ports() { awk '$3 != "local" { print $2 "/" $1 }' <<< "$NET_ROWS" | sort -u; }
+
 fx_remote_clients() {
     run_t 5 ss -Htn state established "( sport = :$1 )" 2>/dev/null |
         awk '{ print $NF }' | grep -v '^127\.\|^\[::1\]' | sed 's/:[0-9]*$//' | sort -u | head -n 5 | tr '\n' ' '
@@ -30,7 +34,7 @@ dx_no_firewall() {
         return 0
     fi
     FX_MODE=auto FX_RISK=high FX_LOCKOUT=yes
-    FX_PLAN=("Turn on $FX_TOOL." "Allow every port that is public today, SSH ($ssh) first, so nothing changes for working services."
+    FX_PLAN=("Turn on $FX_TOOL." "Allow every port other machines can reach today, SSH ($ssh) first, so nothing changes for working services."
         'New ports will be closed from now on.' 'Then close the ports you do not want one by one.')
 }
 ap_no_firewall() {
@@ -39,13 +43,13 @@ ap_no_firewall() {
     if [[ $FX_TOOL == ufw ]]; then
         fx_undo 'ufw --force disable'
         fx_run ufw allow "$ssh/tcp" || return 1
-        while read -r port; do [[ -z $port ]] || fx_run ufw allow "$port"; done <<< "$(fx_public_ports)"
+        while read -r port; do [[ -z $port ]] || fx_run ufw allow "$port" || return 1; done <<< "$(fx_open_ports)"
         fx_run ufw --force enable
     else
         fx_undo 'systemctl disable --now firewalld'
         fx_run systemctl enable --now firewalld || return 1
         fx_run firewall-cmd --permanent --add-port="$ssh/tcp" || return 1
-        while read -r port; do [[ -z $port ]] || fx_run firewall-cmd --permanent --add-port="$port"; done <<< "$(fx_public_ports)"
+        while read -r port; do [[ -z $port ]] || fx_run firewall-cmd --permanent --add-port="$port" || return 1; done <<< "$(fx_open_ports)"
         fx_run firewall-cmd --reload
     fi
 }
@@ -71,6 +75,9 @@ dx_ssh_root_password() {
 ap_ssh_root_password() {
     local unit=sshd file=/etc/ssh/sshd_config
     [[ $(run_t 3 systemctl is-active ssh 2>/dev/null) != active ]] || unit=ssh
+    # Undo runs newest first, and the reload has to come after the file is back.
+    fx_quote systemctl reload "$unit"
+    fx_undo "$REPLY"
     if grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d' "$file"; then
         # First match wins in sshd_config.d, so sort this file early.
         printf 'PermitRootLogin prohibit-password\n' | fx_write /etc/ssh/sshd_config.d/00-linux-host-audit.conf || return 1
@@ -78,8 +85,6 @@ ap_ssh_root_password() {
         { sed -E 's/^[[:space:]]*PermitRootLogin[[:space:]].*/PermitRootLogin prohibit-password/' "$file"
           grep -qiE '^[[:space:]]*PermitRootLogin[[:space:]]' "$file" || printf 'PermitRootLogin prohibit-password\n'; } | fx_write "$file" || return 1
     fi
-    fx_quote systemctl reload "$unit"
-    fx_undo "$REPLY"
     sshd -t || return 1
     fx_run systemctl reload "$unit"
 }
@@ -131,10 +136,17 @@ fx_block_plan() {
     FX_PLAN=("Block port $port from outside. Nothing is connected to it from another machine now." "Local apps keep using $label.")
     FX_STEPS=("This rule disappears at reboot. For good, make $label listen on 127.0.0.1 only.")
 }
+# By interface: a local app that connects to this machine's own address arrives from that
+# address, not from 127.0.0.1. A service on :: is open over IPv6 as well.
 fx_block_apply() {
-    fx_quote iptables -D INPUT -p tcp --dport "$FX_PORT" '!' -s 127.0.0.1 -j DROP
-    fx_undo "$REPLY"
-    fx_run iptables -I INPUT -p tcp --dport "$FX_PORT" '!' -s 127.0.0.1 -j DROP
+    local tool
+    for tool in iptables ip6tables; do
+        has "$tool" || continue
+        [[ $tool == iptables || -d /proc/sys/net/ipv6 ]] || continue
+        fx_quote "$tool" -D INPUT -p tcp --dport "$FX_PORT" '!' -i lo -j DROP
+        fx_undo "$REPLY"
+        fx_run "$tool" -I INPUT -p tcp --dport "$FX_PORT" '!' -i lo -j DROP || return 1
+    done
 }
 fx_block_check() { iptables -S INPUT 2>/dev/null | grep -q -- "--dport $FX_PORT .*-j DROP"; }
 
@@ -153,8 +165,10 @@ dx_db_exposed() {
 ap_db_exposed() { fx_block_apply; }
 ck_db_exposed() { fx_block_check; }
 dx_redis_open() {
+    local port
+    if [[ ${1:-} == Valkey ]]; then port=$(port_of valkey-server); else port=$(port_of redis-server); fi
     FX_CAUSE="$1 has no password and is public. Anyone can read it, or use it to take over the server."
-    fx_block_plan 6379 "$1"
+    fx_block_plan "${port:-6379}" "$1"
     FX_STEPS+=('Then set bind 127.0.0.1 and requirepass in its config.')
 }
 ap_redis_open() { fx_block_apply; }
@@ -181,11 +195,15 @@ dx_updates_security() {
     fi
 }
 ap_updates_security() {
+    # A timeout would kill dpkg in the middle of a package, and that is what breaks a server.
     # shellcheck disable=SC2086 # package names are split on purpose
-    fx_run env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get -y -o Dpkg::Options::=--force-confold \
+    FX_TIMEOUT=3600 fx_run env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get -y -o Dpkg::Options::=--force-confold \
         install --only-upgrade $FX_PACKAGES
 }
 ck_updates_security() {
-    ! run_t 15 apt-get -s -o Debug::NoLocking=true -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= upgrade 2>/dev/null |
-        grep -qF "Inst ${FX_PACKAGES%% *} "
+    local left name
+    left=$(run_t 15 apt-get -s -o Debug::NoLocking=true -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= upgrade 2>/dev/null)
+    for name in $FX_PACKAGES; do
+        [[ $left != *"Inst $name "* ]] || return 1
+    done
 }

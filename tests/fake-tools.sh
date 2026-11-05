@@ -28,6 +28,7 @@ ip)
         *' route get '*) echo '1.1.1.1 via 10.0.0.1 dev eth0 src 10.0.0.5 uid 0' ;;
         *' route show default '*) [[ $SCENARIO == broken ]] || echo 'default via 10.0.0.1 dev eth0' ;;
         *' route show '*) echo 'default via 10.0.0.1 dev eth0' ;;
+        *' -o addr '*) echo '2: eth0    inet 10.0.0.50/24 brd 10.0.0.255 scope global eth0' ;;
         *' -brief '*) echo 'eth0 UP 10.0.0.5/24' ;;
     esac ;;
 ss)
@@ -43,7 +44,8 @@ ss)
     if [[ $SCENARIO == broken ]]; then
         echo 'tcp LISTEN 0 511 0.0.0.0:6379 0.0.0.0:* users:(("redis-server",pid=960,fd=6))'
         echo 'tcp LISTEN 0 128 0.0.0.0:2375 0.0.0.0:* users:(("dockerd",pid=970,fd=6))'
-    fi ;;
+    fi
+    [[ $SCENARIO != redisport ]] || echo 'tcp LISTEN 0 511 127.0.0.1:6380 0.0.0.0:* users:(("redis-server",pid=961,fd=6))' ;;
 ufw) [[ $SCENARIO == clean ]] && echo 'Status: active' || echo 'Status: inactive' ;;
 systemctl)
     case $args in
@@ -122,20 +124,101 @@ kubectl)
     esac ;;
 mysql|mariadb)
     if [[ $SCENARIO == broken ]]; then echo 'ERROR 2002: Cannot connect' >&2; exit 1; fi
-    if [[ $args == *'SLAVE'* ]]; then exit 0; fi
+    # MySQL 8.4 has only the new statement, and MariaDB 10.4 only the old one.
+    if [[ $SCENARIO == replica84 ]]; then
+        if [[ $args == *'SLAVE'* ]]; then echo 'ERROR 1064: syntax' >&2; exit 1; fi
+        if [[ $args == *'REPLICA'* ]]; then printf '    Replica_IO_Running: No\n   Replica_SQL_Running: Yes\n Seconds_Behind_Source: 7\n'; exit 0; fi
+    elif [[ $SCENARIO == replica104 ]]; then
+        if [[ $args == *'REPLICA'* ]]; then echo 'ERROR 1064: syntax' >&2; exit 1; fi
+        if [[ $args == *'SLAVE'* ]]; then printf '     Slave_IO_Running: Yes\n    Slave_SQL_Running: Yes\nSeconds_Behind_Master: 3\n'; exit 0; fi
+    fi
+    if [[ $args == *'SLAVE'* || $args == *'REPLICA'* ]]; then exit 0; fi
+    case $args in
+        *'SHOW GLOBAL VARIABLES'*)
+            printf 'version\t10.11.6-MariaDB\nmax_connections\t151\ninnodb_buffer_pool_size\t2199023255552\ninnodb_log_file_size\t52428800\ninnodb_log_files_in_group\t2\ntmp_table_size\t16777216\nmax_heap_table_size\t16777216\nquery_cache_type\tON\nquery_cache_size\t1048576\n'
+            exit 0 ;;
+        *'SHOW GLOBAL STATUS ')
+            printf 'Uptime\t200000\nMax_used_connections\t9\nThreads_connected\t2\nInnodb_buffer_pool_pages_total\t134217728\nInnodb_buffer_pool_pages_free\t100000000\nInnodb_buffer_pool_reads\t1\nInnodb_buffer_pool_read_requests\t100\nInnodb_os_log_written\t59652323555\n'
+            exit 0 ;;
+        *'SELECT @@GLOBAL.'*) echo 16777216; exit 0 ;;
+        *'SET GLOBAL'*) exit 0 ;;
+        *'@@log_error'*) echo stderr; exit 0 ;;
+    esac
     printf 'Threads_connected\t95\nUptime\t90000\nmax_connections\t100\n' ;;
-redis-cli)
+redis-cli|valkey-cli)
+    if [[ $SCENARIO == redissock ]]; then echo 'Could not connect to Redis at 127.0.0.1:6379: Connection refused'; exit 1; fi
     if [[ $args == *ping* ]]; then echo PONG
+    elif [[ $args == *'config get maxclients'* ]]; then printf 'maxclients\n10000\n'
     else
         status=ok
         [[ $SCENARIO != broken ]] || status=err
         printf 'used_memory_human:2M\r\nconnected_clients:3\r\nrole:master\r\nrdb_last_bgsave_status:%s\r\n' "$status"
+        printf 'redis_version:7.2.4\r\nused_memory:%s\r\nmaxmemory:0\r\nuptime_in_seconds:%s\r\n' "${FAKE_REDIS_USED:-2097152}" "${FAKE_UPTIME:-100}"
     fi ;;
+postqueue)
+    printf '3Pq4Yh1b7Zz9xyV  1024 Tue Nov  4 10:00:00  sender@example.org\n                                         rcpt@example.net\n\n'
+    echo '-- 50 Kbytes in 1200 Requests.' ;;
+postconf) ;;
+sshd) ;;
+httpd)
+    case $1 in -v) echo 'Server version: Apache/2.4.62 (Unix)' ;; -V) echo 'Server MPM:     event' ;; esac ;;
+php-fpm8.2) ;;
+curl)
+    [[ $SCENARIO == apps ]] || exit 7
+    case $args in
+        *15692/metrics*)
+            cat <<'METRICS'
+# TYPE rabbitmq_build_info untyped
+rabbitmq_build_info{rabbitmq_version="3.13.7",erlang_version="26.2"} 1
+rabbitmq_erlang_uptime_seconds 200000
+rabbitmq_resident_memory_limit_bytes 1073741824
+rabbitmq_process_resident_memory_bytes 268435456
+rabbitmq_disk_space_available_bytes 53687091200
+rabbitmq_disk_space_available_limit_bytes 50000000
+rabbitmq_alarms_memory_used_watermark 0
+rabbitmq_process_open_fds 900
+rabbitmq_process_max_fds 1024
+rabbitmq_connections 12
+rabbitmq_queue_messages{queue="a"} 40
+rabbitmq_queue_messages{queue="b"} 2
+METRICS
+            ;;
+        *8123*)
+            case $args in
+                *'version()'*) echo 24.8.4.13 ;;
+                *'uptime()'*) echo 200000 ;;
+                *system.metrics*) printf 'TCPConnection\t90\nHTTPConnection\t5\nQuery\t3\nMemoryTracking\t1073741824\n' ;;
+                *system.events*) printf 'RejectedInserts\t7\n' ;;
+                *server_settings*) printf 'max_connections\t100\nmax_concurrent_queries\t100\nmax_server_memory_usage\t0\nmax_server_memory_usage_to_ram_ratio\t0.9\n' ;;
+            esac ;;
+        *8086/ping*) printf 'HTTP/1.1 204 No Content\r\nX-Influxdb-Version: 1.8.10\r\n\r\n' ;;
+        *8086/metrics*) echo 'go_memstats_alloc_bytes 104857600' ;;
+        *9283/metrics*)
+            printf 'ceph_health_status 1\nceph_cluster_total_bytes 1099511627776\nceph_cluster_total_used_bytes 549755813888\n'
+            printf 'ceph_osd_up{ceph_daemon="osd.0"} 1\nceph_osd_up{ceph_daemon="osd.1"} 1\nceph_osd_in{ceph_daemon="osd.0"} 1\nceph_osd_in{ceph_daemon="osd.1"} 1\n' ;;
+        *2019/metrics*) printf 'caddy_build_info{version="v2.8.4"} 1\nprocess_open_fds 12\nprocess_max_fds 1024\ngo_memstats_alloc_bytes 1048576\n' ;;
+        *squid-internal-mgr/info*)
+            printf 'Squid Object Cache: Version 5.7\nUP Time:\t200000.123 seconds\nFile descriptor usage for squid:\n\tMaximum number of file descriptors:   1024\n\tNumber of file desc currently in use:  800\nInternal Data Structures:\n\tStorage Mem capacity:\t 12.5%% used, 87.5%% free\n' ;;
+        *) exit 7 ;;
+    esac ;;
 iptables) echo '-P INPUT ACCEPT' ;;
+ip6tables) ;;
 apt-get) printf 'Inst libssl3 [3.0] (3.1 Ubuntu:24.04/noble-security [amd64])\nInst vim [1] (2 Ubuntu:24.04/noble-updates [amd64])\n' ;;
 crontab) echo '0 3 * * * /usr/local/bin/cleanup.sh' ;;
 last) echo 'reboot   system boot  6.8.0 Wed Nov  4 10:00   still running' ;;
 ps)
+    if [[ $SCENARIO == apps ]]; then
+        case $args in
+            *'etimes=,comm='*) printf '%s nginx\n%s gunicorn\n%s uwsgi\n%s httpd\n' "${FAKE_UPTIME:-200000}" "${FAKE_UPTIME:-200000}" "${FAKE_UPTIME:-200000}" "${FAKE_UPTIME:-200000}"; exit 0 ;;
+            *'etimes= -p'*) echo "${FAKE_UPTIME:-200000}"; exit 0 ;;
+            *'pid=,ppid=,pcpu=,rss=,comm='*)
+                printf '100 1 0.0 20000 gunicorn\n101 100 40.0 50000 gunicorn\n102 100 60.0 70000 gunicorn\n'
+                printf '200 1 0.0 20000 uwsgi\n201 200 10.0 30000 uwsgi\n'
+                exit 0 ;;
+            *'pid=,rss=,comm='*) printf '300 400000 java\n310 90000 node\n'; exit 0 ;;
+        esac
+    fi
+    if [[ $SCENARIO == fpm && $args == *'pid=,rss=,args='* ]]; then echo '100 2000 php-fpm8.2: pool www'; exit 0; fi
     # Real ps can show a password in arguments; the audit must only ask for comm.
     if [[ $args == *args* || $args == *cmd* || $args == *' aux '* ]]; then echo 'mysql -pSECRET-ARG'; exit 0; fi
     if [[ $args == ' -eo comm= ' ]]; then

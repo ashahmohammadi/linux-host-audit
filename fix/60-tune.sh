@@ -29,12 +29,21 @@ tune_mysql_dir() {
     done
 }
 
+# Changes pm.max_children of one pool. A file can hold several pools, and the others stay.
+tune_fpm_edit() {
+    awk -v pool="[$2]" -v value="$3" '
+        /^[ \t]*\[/ { line = $0; gsub(/[ \t]/, "", line); inside = (line == pool) }
+        inside && /^[ \t]*pm\.max_children[ \t]*=/ { print "pm.max_children = " value; next }
+        { print }' "$1"
+}
+
 fx_mysql_client() { FX_SQL=mysql; has mysql || FX_SQL=mariadb; }
 fx_mysql_get() { run_t 6 "$FX_SQL" --connect-timeout=3 -NBe "SELECT @@GLOBAL.$1" 2>/dev/null; }
 
 dx_tune_apply() {
     local n=${1:-0} line
     tune_collect
+    [[ $n =~ ^[1-9][0-9]*$ ]] || n=0
     line=$(tune_advice | sed -n "${n}p")
     IFS='|' read -r TA_GROUP TA_SETTING TA_NOW _ _ TA_REC TA_WHY TA_HOW TA_RAW <<< "$line"
     if [[ -z $TA_SETTING ]]; then FX_CAUSE="There is no advice number $n."; return 0; fi
@@ -88,8 +97,11 @@ dx_tune_apply() {
                 FX_STEPS+=('cPanel rebuilds these files. Change it in MultiPHP Manager > PHP-FPM Settings.')
             elif [[ -n $TA_FILE ]]; then
                 TA_KIND=phpfpm FX_MODE=auto FX_RISK=medium
-                TA_UNIT=$(run_t 5 systemctl list-units --type=service --state=running --plain --no-legend 2>/dev/null | awk '$1 ~ /php.*fpm/ { print $1; exit }')
-                FX_PLAN=("Set pm.max_children = $TA_RAW in $TA_FILE." "Reload ${TA_UNIT:-php-fpm}.")
+                # With several PHP versions, the file says which one owns this pool.
+                if [[ $TA_FILE =~ ^/etc/php/([0-9.]+)/fpm/ ]]; then TA_UNIT=php${BASH_REMATCH[1]}-fpm.service
+                else TA_UNIT=$(run_t 5 systemctl list-units --type=service --state=running --plain --no-legend 2>/dev/null | awk '$1 ~ /php.*fpm/ { print $1; exit }')
+                fi
+                FX_PLAN=("Set pm.max_children = $TA_RAW for pool $TA_POOL in $TA_FILE." "Test the config, then reload ${TA_UNIT:-php-fpm}.")
                 FX_EXPECT_GONE=$TA_UNIT
             fi ;;
     esac
@@ -107,12 +119,23 @@ ap_tune_apply() {
             fx_quote "$FX_SQL" -e "SET GLOBAL $TA_SETTING = $old"
             fx_undo "$REPLY"
             fx_run "$FX_SQL" -e "SET GLOBAL $TA_SETTING = $TA_RAW" || return 1
+            line=''
+            # The smaller of these two is what counts, so they only ever move together.
             if [[ $TA_SETTING == tmp_table_size ]]; then
+                old=$(fx_mysql_get max_heap_table_size)
+                [[ -n $old ]] || return 1
+                fx_quote "$FX_SQL" -e "SET GLOBAL max_heap_table_size = $old"
+                fx_undo "$REPLY"
                 fx_run "$FX_SQL" -e "SET GLOBAL max_heap_table_size = $TA_RAW" || return 1
+                line=max_heap_table_size
             fi
             if [[ -n $TA_DIR ]]; then
                 file=$TA_DIR/zz-linux-host-audit.cnf
-                { printf '[mysqld]\n'; grep -v -e "^$TA_SETTING " -e '^\[mysqld\]' "$file" 2>/dev/null; printf '%s = %s\n' "$TA_SETTING" "$TA_RAW"; } | fx_write "$file"
+                { printf '[mysqld]\n'
+                  grep -v -e "^$TA_SETTING " -e "^${line:-none} " -e '^\[mysqld\]' "$file" 2>/dev/null
+                  printf '%s = %s\n' "$TA_SETTING" "$TA_RAW"
+                  [[ -z $line ]] || printf '%s = %s\n' "$line" "$TA_RAW"
+                } | fx_write "$file"
             fi ;;
         sysctl) fx_sysctl "$TA_SETTING" "$TA_RAW" ;;
         thp)
@@ -132,7 +155,10 @@ ap_tune_apply() {
         phpfpm)
             fx_quote systemctl reload "$TA_UNIT"
             fx_undo "$REPLY"
-            sed -E "s/^([[:space:]]*pm\.max_children[[:space:]]*=).*/\1 $TA_RAW/" "$TA_FILE" | fx_write "$TA_FILE" || return 1
+            tune_fpm_edit "$TA_FILE" "$TA_POOL" "$TA_RAW" | fx_write "$TA_FILE" || return 1
+            # No app config changes without its own test.
+            [[ -n $(fx_phpfpm_bin "$TA_UNIT") ]] || return 1
+            fx_phpfpm_test "$TA_UNIT" >/dev/null 2>&1 || return 1
             fx_run systemctl reload "$TA_UNIT" ;;
         *) return 1 ;;
     esac
@@ -153,7 +179,7 @@ ck_tune_apply() {
         thp) grep -q '\[madvise\]' /sys/kernel/mm/transparent_hugepage/enabled ;;
         redis) [[ $(run_t 5 "$TA_CLI" -h 127.0.0.1 config get maxmemory | tail -n 1 | tr -d '\r') == "$TA_RAW" ]] ;;
         nginx) grep -qE "^[[:space:]]*${TA_SETTING}[[:space:]]+$TA_RAW;" "$TA_FILE" && [[ $(run_t 3 systemctl is-active nginx) == active ]] ;;
-        phpfpm) [[ $(run_t 3 systemctl is-active "$TA_UNIT") == active ]] ;;
+        phpfpm) [[ $(tune_fpm_edit "$TA_FILE" "$TA_POOL" "$TA_RAW") == "$(cat "$TA_FILE")" && $(run_t 3 systemctl is-active "$TA_UNIT") == active ]] ;;
         *) return 1 ;;
     esac
 }
@@ -183,8 +209,9 @@ menu_page_apply() {
     ((n > 0)) || menu_add ok 'Nothing to change right now' '' 'ALL CLEAR' view_tune
 }
 
+# The menu splits its action on spaces, and a target can hold spaces: an OS name, say.
 fix_from_menu() {
-    local want=$1
+    local want=$*
     fix_find "$want" || { fx_say 'This problem is no longer there.'; return 0; }
     fx_transaction "${F_ID[FOUND_INDEX]}" "${F_TARGET[FOUND_INDEX]}"
 }

@@ -1,29 +1,48 @@
 #!/bin/bash
 # Runs the tuning view inside one real service container, and compares numbers with the service.
-image=$1 env=$2 expect=$3 value=$4
-docker run -d --name svc -e "$env" "$image" >/dev/null || exit 1
-sleep 30
+# The env argument can hold several settings, separated by a semicolon. A command is optional.
+image=$1 env=$2 expect=$3 value=$4 command=$5 wait=${6:-30}
+args=()
+IFS=';' read -r -a settings <<< "$env"
+for item in "${settings[@]}"; do args+=(-e "$item"); done
+# shellcheck disable=SC2086 # a command is split on purpose
+docker run -d --name svc "${args[@]}" "$image" $command >/dev/null || exit 1
+sleep "$wait"
 if [[ $(docker inspect -f '{{.State.Running}}' svc) != true ]]; then
     echo "FAIL: $image did not start. This is about the service, not the audit:"
     docker logs svc 2>&1 | tail -n 15
     exit 1
 fi
 docker cp linux-host-audit.sh svc:/tmp/audit.sh
-docker exec svc sh -c '
-    command -v bash >/dev/null || exit 9
-    if ! command -v awk >/dev/null || ! command -v ps >/dev/null; then
+docker exec -u 0 svc sh -c '
+    if ! command -v bash >/dev/null || ! command -v awk >/dev/null || ! command -v ps >/dev/null || ! command -v curl >/dev/null; then
         if command -v microdnf >/dev/null; then microdnf install -y gawk procps-ng >/dev/null 2>&1
-        elif command -v apt-get >/dev/null; then apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq gawk procps >/dev/null 2>&1
+        elif command -v dnf >/dev/null; then dnf install -y gawk procps-ng >/dev/null 2>&1
+        elif command -v yum >/dev/null; then yum install -y gawk procps-ng >/dev/null 2>&1
+        elif command -v apt-get >/dev/null; then apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq gawk procps curl >/dev/null 2>&1
+        elif command -v apk >/dev/null; then apk add -q bash gawk procps curl >/dev/null 2>&1
         fi
     fi'
-out=$(docker exec -e MYSQL_PWD=t -e LHA_TUNE_MATURE=0 -e NO_COLOR=1 svc bash /tmp/audit.sh --tune 2>&1)
+files() { docker exec -u 0 svc sh -c 'find /root /home -xdev -type f 2>/dev/null | sort'; }
+before=$(files)
+out=$(docker exec -u 0 -e MYSQL_PWD=t -e LHA_TUNE_MATURE=0 -e NO_COLOR=1 svc bash /tmp/audit.sh --tune 2>&1)
 status=$?
 printf '%s\n' "$out"
+errors=$(docker exec -u 0 -e MYSQL_PWD=t -e NO_COLOR=1 svc bash /tmp/audit.sh --errors 2>&1)
+errors_status=$?
+printf '%s\n' "$errors" | tail -n 25
 bad=0
 [[ $status == 0 ]] || { echo "FAIL: exit $status"; bad=1; }
 grep -qF "$expect" <<< "$out" || { echo "FAIL: missing $expect"; bad=1; }
 grep -qF "$value" <<< "$out" || { echo "FAIL: missing $value"; bad=1; }
-if grep -E 'command not found|syntax error|division by 0|bad substitution|arithmetic|invalid arithmetic' <<< "$out"; then echo 'FAIL: shell error'; bad=1; fi
+[[ $errors_status == 0 ]] || { echo "FAIL: --errors exit $errors_status"; bad=1; }
+if grep -E 'command not found|syntax error|division by 0|bad substitution|arithmetic|invalid arithmetic' <<< "$out$errors"; then echo 'FAIL: shell error'; bad=1; fi
+# The audit writes nothing, and client tools love to leave files in a home folder.
+if [[ $(files) != "$before" ]]; then
+    echo 'FAIL: files appeared in a home folder:'
+    diff <(printf '%s\n' "$before") <(files) | head -n 10
+    bad=1
+fi
 
 # The number on screen must be the number the service reports.
 case $image in

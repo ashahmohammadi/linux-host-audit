@@ -14,8 +14,8 @@ trend_record() {
     swap=$(awk '/^SwapTotal:/ { t = $2 } /^SwapFree:/ { f = $2 } END { if (t > 0) printf "%d", (t - f) * 100 / t; else print 0 }' /proc/meminfo)
     disk=$(disk_rows | awk '$2 + 0 > m { m = $2 + 0 } END { print m + 0 }')
     conns=0
-    if has ss; then conns=$(run_t 5 ss -Htn state established 2>/dev/null | wc -l | tr -d ' '); fi
-    php=$(ps -eo args= 2>/dev/null | grep -c '^php-fpm: pool')
+    conns=$(tcp_count 01 0 65535)
+    php=$(ps -eo args= 2>/dev/null | grep -c '^php-fpm[0-9.]*: pool')
     if ps -eo comm= 2>/dev/null | grep -qE '^(mariadbd|mysqld)$'; then
         file=mysql
         has mysql || file=mariadb
@@ -46,7 +46,10 @@ ap_trends_on() {
     fx_backup "$TREND_BIN" || return 1
     fx_run cp "$FX_SELF" "$TREND_BIN" || return 1
     fx_run chmod 755 "$TREND_BIN" || return 1
-    printf 'SHELL=/bin/bash\n*/5 * * * * root nice -n 19 ionice -c3 %s --record >/dev/null 2>&1\n' "$TREND_BIN" | fx_write "$TREND_CRON"
+    # Alpine and other small systems have no ionice, and cron would fail with no trace.
+    local quiet=''
+    if has ionice; then quiet='ionice -c3 '; fi
+    printf 'SHELL=/bin/bash\n*/5 * * * * root nice -n 19 %s%s --record >/dev/null 2>&1\n' "$quiet" "$TREND_BIN" | fx_write "$TREND_CRON"
     chmod 644 "$TREND_CRON"
     fx_run "$TREND_BIN" --record
 }

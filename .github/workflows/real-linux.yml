@@ -51,7 +51,7 @@ jobs:
                     exit 0
                 fi
             fi
-            bash /w/tests/real-smoke.sh'
+            bash /w/tests/real-smoke.sh && bash /w/tests/parse-real.sh'
 
   host:
     runs-on: ubuntu-latest
@@ -61,6 +61,7 @@ jobs:
         run: |
           sudo bash tests/real-smoke.sh
           bash tests/real-smoke.sh
+          sudo bash tests/listeners-real.sh
           sudo bash linux-host-audit.sh --problems | tee problems.txt
           ! grep -F 'disk errors' problems.txt
           sudo bash linux-host-audit.sh --json | python3 -m json.tool > report.json
@@ -72,26 +73,52 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - { image: 'mariadb:10.5', env: 'MARIADB_ROOT_PASSWORD=t', expect: 'MariaDB 10.5', value: 'max_connections' }
           - { image: 'mariadb:10.6', env: 'MARIADB_ROOT_PASSWORD=t', expect: 'MariaDB 10.6', value: 'max_connections' }
           - { image: 'mariadb:10.11', env: 'MARIADB_ROOT_PASSWORD=t', expect: 'MariaDB 10.11', value: 'innodb_buffer_pool_size' }
           - { image: 'mariadb:11.4', env: 'MARIADB_ROOT_PASSWORD=t', expect: 'MariaDB 11.4', value: 'innodb_buffer_pool_size' }
+          - { image: 'mariadb:11.8', env: 'MARIADB_ROOT_PASSWORD=t', expect: 'MariaDB 11.8', value: 'innodb_buffer_pool_size' }
           - { image: 'mysql:5.7', env: 'MYSQL_ROOT_PASSWORD=t', expect: 'MySQL 5.7', value: 'max_connections' }
           - { image: 'mysql:8.0', env: 'MYSQL_ROOT_PASSWORD=t', expect: 'MySQL 8.0', value: 'innodb_redo_log_capacity' }
           - { image: 'mysql:8.4', env: 'MYSQL_ROOT_PASSWORD=t', expect: 'MySQL 8.4', value: 'innodb_redo_log_capacity' }
+          - { image: 'mysql:9.1', env: 'MYSQL_ROOT_PASSWORD=t', expect: 'MySQL 9.1', value: 'innodb_redo_log_capacity' }
           - { image: 'postgres:12', env: 'POSTGRES_PASSWORD=t', expect: 'PostgreSQL 12', value: 'shared_buffers' }
           - { image: 'postgres:16', env: 'POSTGRES_PASSWORD=t', expect: 'PostgreSQL 16', value: 'shared_buffers' }
+          - { image: 'postgres:17', env: 'POSTGRES_PASSWORD=t', expect: 'PostgreSQL 17', value: 'shared_buffers' }
+          - { image: 'postgres:18', env: 'POSTGRES_PASSWORD=t', expect: 'PostgreSQL 18', value: 'shared_buffers' }
           - { image: 'redis:6', env: 'X=1', expect: 'Redis 6', value: 'maxclients' }
           - { image: 'redis:7', env: 'X=1', expect: 'Redis 7', value: 'maxclients' }
+          - { image: 'valkey/valkey:7.2', env: 'X=1', expect: 'Valkey 7.2', value: 'maxclients' }
           - { image: 'valkey/valkey:8', env: 'X=1', expect: 'Valkey 8', value: 'maxclients' }
+          - { image: 'redis:8', env: 'X=1', expect: 'Redis 8', value: 'maxclients' }
+          - { image: 'memcached:1.6', env: 'X=1', expect: 'memcached open files', value: 'Every program with an open port' }
+          - { image: 'rabbitmq:3.13', env: 'X=1', expect: 'RabbitMQ 3.13', value: 'vm_memory_high_watermark', wait: 40 }
+          - { image: 'rabbitmq:4.0', env: 'X=1', expect: 'RabbitMQ 4.0', value: 'disk_free_limit', wait: 40 }
+          - { image: 'clickhouse/clickhouse-server:24.8', env: 'CLICKHOUSE_SKIP_USER_SETUP=1', expect: 'ClickHouse 24.8', value: 'max_connections' }
+          - { image: 'clickhouse/clickhouse-server:25.3', env: 'CLICKHOUSE_SKIP_USER_SETUP=1', expect: 'ClickHouse 25.3', value: 'max_concurrent_queries' }
+          - { image: 'influxdb:1.8', env: 'X=1', expect: 'InfluxDB 1.8', value: 'no memory limit' }
+          - { image: 'influxdb:2.7', env: 'X=1', expect: 'InfluxDB', value: 'no memory limit' }
+          - { image: 'cassandra:4.1', env: 'X=1', expect: 'Cassandra 4.1', value: 'JVM services', wait: 90 }
+          - { image: 'apache/kafka:3.8.0', env: 'X=1', expect: 'Kafka 3.8', value: 'JVM services', wait: 40 }
+          - { image: 'elasticsearch:8.15.0', env: 'discovery.type=single-node;xpack.security.enabled=false;ES_JAVA_OPTS=-Xms512m -Xmx512m', expect: 'Elasticsearch 8.15', value: 'heap', wait: 60 }
+          - { image: 'opensearchproject/opensearch:2.17.0', env: 'discovery.type=single-node;DISABLE_SECURITY_PLUGIN=true;DISABLE_INSTALL_DEMO_CONFIG=true;OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m', expect: 'OpenSearch 2.17', value: 'heap', wait: 60 }
+          - { image: 'tomcat:10.1', env: 'X=1', expect: 'Tomcat', value: 'maxThreads' }
+          - { image: 'caddy:2.8', env: 'X=1', expect: 'Caddy', value: 'open files' }
+          - { image: 'traefik:v3.1', env: 'X=1', expect: 'Traefik', value: 'No metrics port' }
+          - { image: 'node:22-slim', env: 'X=1', expect: 'Node.js', value: 'no limit set', command: 'node -e setInterval(()=>0,1000)', wait: 10 }
+          - { image: 'python:3.12-slim', env: 'X=1', expect: 'Tuning and capacity', value: 'Server now', command: 'python -m http.server 8000', wait: 10 }
           - { image: 'mongo:6', env: 'X=1', expect: 'MongoDB 6', value: 'wiredTigerCacheSizeGB' }
           - { image: 'mongo:7', env: 'X=1', expect: 'MongoDB 7', value: 'maxIncomingConnections' }
+          - { image: 'nginx:1.24', env: 'X=1', expect: 'Nginx 1.24', value: 'worker_connections' }
           - { image: 'nginx:1.27', env: 'X=1', expect: 'Nginx 1.27', value: 'worker_connections' }
           - { image: 'httpd:2.4', env: 'X=1', expect: 'Apache 2.4', value: 'MaxRequestWorkers' }
+          - { image: 'php:7.4-fpm', env: 'X=1', expect: 'PHP-FPM pools', value: 'www (dynamic)' }
           - { image: 'php:8.3-fpm', env: 'X=1', expect: 'PHP-FPM pools', value: 'www (dynamic)' }
+          - { image: 'php:8.4-fpm', env: 'X=1', expect: 'PHP-FPM pools', value: 'www (dynamic)' }
     steps:
       - uses: actions/checkout@v4
       - name: Read a real ${{ matrix.image }}, and compare with what it reports itself
-        run: bash tests/tune-real.sh '${{ matrix.image }}' '${{ matrix.env }}' '${{ matrix.expect }}' '${{ matrix.value }}'
+        run: bash tests/tune-real.sh '${{ matrix.image }}' '${{ matrix.env }}' '${{ matrix.expect }}' '${{ matrix.value }}' '${{ matrix.command }}' '${{ matrix.wait }}'
 
   fixer:
     runs-on: ubuntu-latest

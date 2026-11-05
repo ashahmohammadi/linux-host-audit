@@ -10,11 +10,37 @@ fx_config_test() {
         httpd*) has apachectl && out=$(run_t 10 apachectl configtest 2>&1) || FX_CONFIG_ERROR=$out ;;
         ssh|sshd) has sshd && out=$(run_t 10 sshd -t 2>&1) || FX_CONFIG_ERROR=$out ;;
         haproxy*) has haproxy && out=$(run_t 10 haproxy -c -f /etc/haproxy/haproxy.cfg 2>&1) || FX_CONFIG_ERROR=$out ;;
-        php*-fpm*) has php-fpm && out=$(run_t 10 php-fpm -t 2>&1) || FX_CONFIG_ERROR=$out ;;
-        postfix*) has postfix && out=$(run_t 10 postfix check 2>&1) || FX_CONFIG_ERROR=$out ;;
+        php*-fpm*) out=$(fx_phpfpm_test "$unit") || FX_CONFIG_ERROR=$out ;;
+        # postconf only reads. "postfix check" creates missing folders and changes owners.
+        postfix*) if has postconf; then
+                out=$(run_t 10 postconf -n 2>&1 >/dev/null)
+                [[ $out != *fatal* ]] || FX_CONFIG_ERROR=$out
+            fi ;;
         named*|bind9*) has named-checkconf && out=$(run_t 10 named-checkconf 2>&1) || FX_CONFIG_ERROR=$out ;;
     esac
     FX_CONFIG_ERROR=$(printf '%s' "$FX_CONFIG_ERROR" | clean | grep -v 'syntax is ok\|test is successful' | tail -n 2 | tr '\n' ' ' | cut -c1-200)
+}
+
+# The binary of a PHP version: unit php8.2-fpm runs php-fpm8.2.
+fx_phpfpm_bin() {
+    local unit=${1%.service} version=''
+    [[ $unit =~ ^php([0-9.]+)-fpm$ ]] && version=${BASH_REMATCH[1]}
+    if [[ -n $version ]] && has "php-fpm$version"; then printf 'php-fpm%s' "$version"
+    elif has php-fpm; then printf 'php-fpm'
+    fi
+}
+fx_phpfpm_test() {
+    local bin
+    bin=$(fx_phpfpm_bin "$1")
+    [[ -n $bin ]] || return 0
+    run_t 10 "$bin" -t 2>&1
+}
+
+# Which package owns a file. Rpm is asked only where it has a database: see rpm_usable.
+fx_owner_package() {
+    if has dpkg; then dpkg -S "$1" 2>/dev/null | cut -d: -f1
+    elif rpm_usable; then rpm -qf "$1" 2>/dev/null
+    fi
 }
 
 fx_unit_log() { run_t 8 journalctl -u "$1" -n 60 --no-pager -q -o cat 2>/dev/null | clean; }
@@ -64,7 +90,7 @@ dx_service_failed() {
                 path=$(run_t 3 systemctl show -p ExecStart --value -- "$unit" 2>/dev/null | grep -oE 'path=[^ ;]+' | head -n 1)
                 path=${path#path=}
                 FX_CAUSE="Its program could not run: ${path:-unknown path} is missing or not executable."
-                if has rpm; then pkg=$(rpm -qf "$path" 2>/dev/null); elif has dpkg; then pkg=$(dpkg -S "$path" 2>/dev/null | cut -d: -f1); fi
+                pkg=$(fx_owner_package "$path")
                 FX_STEPS=("ls -l $path" "Reinstall its package${pkg:+: $pkg}.")
                 return 0
             fi ;;
@@ -133,7 +159,11 @@ ck_mysql_down() { ck_service_failed "$FX_UNIT"; }
 dx_postgres_down() { fx_delegate "$(fx_first_unit postgresql)"; }
 ap_postgres_down() { ap_service_failed "$FX_UNIT"; }
 ck_postgres_down() { ck_service_failed "$FX_UNIT"; }
-dx_redis_down() { fx_delegate "$(fx_first_unit redis redis-server valkey valkey-server)"; }
+dx_redis_down() {
+    if [[ ${1:-} == Valkey ]]; then fx_delegate "$(fx_first_unit valkey valkey-server)"
+    else fx_delegate "$(fx_first_unit redis redis-server valkey valkey-server)"
+    fi
+}
 ap_redis_down() { ap_service_failed "$FX_UNIT"; }
 ck_redis_down() { ck_service_failed "$FX_UNIT"; }
 dx_engine_down() { fx_delegate "$(fx_first_unit "$1" "$1.socket")"; }

@@ -209,6 +209,18 @@ fx_undo_run "$(ls -t "$FX_HOME/runs" | head -n 1)"
 check 'undo restored it' "[[ \$(awk -F: '\$1 == \"lhatest\" { print \$2 }' /etc/shadow) == '' ]]"
 userdel lhatest
 
+echo '=== lockout protection: confirming keeps the change, the timer does nothing later'
+systemctl start nginx
+printf 'original\n' > /etc/lha-marker
+dx_test_keep() { FX_MODE=auto FX_RISK=low FX_CAUSE=test FX_PLAN=(test) FX_LOCKOUT=yes; }
+ap_test_keep() { printf 'changed\n' | fx_write /etc/lha-marker; }
+ck_test_keep() { return 0; }
+FX_DEADMAN_SECONDS=8 FX_DEADMAN_AUTO=keep
+fx_transaction test-keep '' >/dev/null 2>&1
+sleep 11
+check 'kept change stays' "grep -q changed /etc/lha-marker"
+FX_DEADMAN_AUTO=
+
 echo '=== port block: exposed port closed from outside, undo opens it'
 python3 -m http.server 6399 >/dev/null 2>&1 &
 pid=$!
@@ -218,6 +230,7 @@ FX_MODE=auto FX_PORT=6399
 fx_begin 'block test'
 fx_block_apply
 check 'rule added' "fx_block_check"
+check 'rule keeps the loopback interface' "iptables -S INPUT | grep -- '--dport 6399' | grep -q '! -i lo'"
 check 'local access still works' "curl -s -o /dev/null -m 3 http://127.0.0.1:6399/"
 fx_rollback
 check 'rule removed' "! fx_block_check"
@@ -234,10 +247,10 @@ printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExample
 systemctl enable --now ssh 2>/dev/null
 mkdir -p /etc/ssh/sshd_config.d
 printf 'PermitRootLogin yes\n' > /etc/ssh/sshd_config.d/01-test.conf
-FX_DEADMAN_SECONDS=8 FX_DEADMAN_AUTO=wait
+FX_DEADMAN_SECONDS=25 FX_DEADMAN_AUTO=wait
 fx_transaction ssh-root-password '' | tail -n 3
 check 'change applied' "sshd -T | grep -qE '^permitrootlogin (prohibit-password|without-password)'"
-sleep 12
+sleep 28
 check 'timer reverted it' "[[ \$(sshd -T | awk '\$1 == \"permitrootlogin\" { print \$2 }') == yes ]]"
 check 'sshd still healthy' "sshd -t"
 rm -f /etc/ssh/sshd_config.d/01-test.conf /root/.ssh/authorized_keys
@@ -247,11 +260,11 @@ echo '=== lockout protection: firewall'
 if has ufw; then
     ufw --force disable >/dev/null
     fresh
-    FX_DEADMAN_SECONDS=8 FX_DEADMAN_AUTO=wait
+    FX_DEADMAN_SECONDS=30 FX_DEADMAN_AUTO=wait
     fx_transaction no-firewall '' | tail -n 3
     check 'firewall on' "ufw status | grep -q 'Status: active'"
     check 'ssh port allowed' "ufw status | grep -q '22/tcp'"
-    sleep 12
+    sleep 33
     check 'timer turned it off' "ufw status | grep -q 'Status: inactive'"
     rm -rf /dev/shm/linux-host-audit.lock
 fi
