@@ -91,11 +91,12 @@ contract: other tools can act on them without reading the English text, so never
 - Pending updates are not checked on dnf and yum, because those tools write to their logs.
 - Database details need passwordless local access. It never asks for a password.
 - `kubectl` keeps its own small cache in `~/.kube`, which is the one write this tool can cause.
-- Only MySQL and Redis are queried for details. Others show running or listening only.
+- PostgreSQL details need root and `setpriv`. Password-protected services show less.
 - A clean report means these checks found nothing. It does not prove a server is secure.
 
 ## Tests
 
 `bash tests/run.sh` runs simulated servers with fake `docker`, `kubectl`, `ss` and other tools.
 `tests/fix-real.sh` breaks a throwaway machine on purpose and fixes it. Never run it on a real server.
-CI runs both, plus old and new distros, and real databases and web servers across versions.
+CI runs the second one, old and new distros, and real databases and web servers across versions.
+Run `tests/run.sh` yourself before a release, because it is not in CI.
