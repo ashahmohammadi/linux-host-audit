@@ -684,8 +684,8 @@ runtime_role() {
             kafka.Kafka) REPLY=kafka; break ;;
             org.apache.zookeeper.server.quorum.QuorumPeerMain) REPLY=zookeeper; break ;;
             org.apache.cassandra.service.CassandraDaemon) REPLY=cassandra; break ;;
-            org.elasticsearch.bootstrap.Elasticsearch) REPLY=elasticsearch; break ;;
-            org.opensearch.bootstrap.OpenSearch) REPLY=opensearch; break ;;
+            *org.elasticsearch.bootstrap.Elasticsearch) REPLY=elasticsearch; break ;;
+            *org.opensearch.bootstrap.OpenSearch) REPLY=opensearch; break ;;
             io.confluent.ksql.rest.server.KsqlServerMain) REPLY=ksql; break ;;
             org.apache.activemq.console.Main|*/activemq.jar) REPLY=activemq; break ;;
             -Dsolr.*) REPLY=solr; break ;;
@@ -1658,16 +1658,8 @@ net_listeners() {
             if (match($0, /pid=[0-9]+/)) pid = substr($0, RSTART + 4, RLENGTH - 4)
             print $1, port, addr, proc, pid
         }' <<< "$raw"
-    elif has netstat && raw=$(run_t 5 netstat -lntup 2>/dev/null); then
-        awk '$1 ~ /^(tcp|udp)6?$/ {
-            n = split($4, a, ":"); port = a[n]
-            addr = substr($4, 1, length($4) - length(port) - 1)
-            proc = "?"; pid = "-"; last = $NF
-            if (split(last, p, "/") == 2) { pid = p[1]; proc = p[2] }
-            sub(/6$/, "", $1)
-            print $1, port, addr, proc, pid
-        }' <<< "$raw"
     else
+        # Not netstat: it prints a piece of the command line as the program name.
         proc_listeners
     fi
 }

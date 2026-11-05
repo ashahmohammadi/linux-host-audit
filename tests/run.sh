@@ -375,6 +375,8 @@ has_text "$out" '2147483648'
 has_text "$out" '536870912'
 no_text "$out" 'hunter4'
 equals "$(inside 'runtime_role /nonexistent; echo "[$REPLY]"')" '[]' 'a process that vanished has no role'
+printf 'java\0-m\0org.elasticsearch.server/org.elasticsearch.bootstrap.Elasticsearch\0' > "$fake/cmdline"
+has_text "$(inside "runtime_role '$fake/cmdline'; echo \"role \$REPLY\"")" 'role elasticsearch'
 
 # Applications added to tuning. Numbers come from the fake service, or there is only a note.
 scenario=apps

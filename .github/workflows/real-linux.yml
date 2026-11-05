@@ -91,7 +91,7 @@ jobs:
           - { image: 'valkey/valkey:7.2', env: 'X=1', expect: 'Valkey 7.2', value: 'maxclients' }
           - { image: 'valkey/valkey:8', env: 'X=1', expect: 'Valkey 8', value: 'maxclients' }
           - { image: 'redis:8', env: 'X=1', expect: 'Redis 8', value: 'maxclients' }
-          - { image: 'memcached:1.6', env: 'X=1', expect: 'memcached open files', value: 'Every program with an open port' }
+          - { image: 'memcached:1.6', env: 'X=1', expect: 'Memcached 1.6', value: 'memcached open files' }
           - { image: 'rabbitmq:3.13', env: 'X=1', expect: 'RabbitMQ 3.13', value: 'vm_memory_high_watermark', wait: 40 }
           - { image: 'rabbitmq:4.0', env: 'X=1', expect: 'RabbitMQ 4.0', value: 'disk_free_limit', wait: 40 }
           - { image: 'clickhouse/clickhouse-server:24.8', env: 'CLICKHOUSE_SKIP_USER_SETUP=1', expect: 'ClickHouse 24.8', value: 'max_connections' }

@@ -19,16 +19,21 @@ docker exec -u 0 svc sh -c '
         if command -v microdnf >/dev/null; then microdnf install -y gawk procps-ng >/dev/null 2>&1
         elif command -v dnf >/dev/null; then dnf install -y gawk procps-ng >/dev/null 2>&1
         elif command -v yum >/dev/null; then yum install -y gawk procps-ng >/dev/null 2>&1
-        elif command -v apt-get >/dev/null; then apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq gawk procps curl >/dev/null 2>&1
+        elif command -v apt-get >/dev/null; then
+            apt-get update -qq >/dev/null 2>&1
+            for tool in gawk procps curl netcat-openbsd; do apt-get install -y -qq "$tool" >/dev/null 2>&1; done
         elif command -v apk >/dev/null; then apk add -q bash gawk procps curl >/dev/null 2>&1
         fi
     fi'
+if ! docker exec svc sh -c 'command -v ps >/dev/null && command -v awk >/dev/null'; then echo 'NOTE: this image has no ps or no awk, and they could not be installed.'; fi
+docker exec -u 0 svc sh -c 'command -v mongosh >/dev/null && env HOME=/proc/nonexistent DO_NOT_TRACK=1 mongosh --quiet --norc --eval "print(1)"; echo "DEBUG rc=$?"' 2>&1 | tail -n 12
 files() { docker exec -u 0 svc sh -c 'find /root /home -xdev -type f 2>/dev/null | sort'; }
 before=$(files)
-out=$(docker exec -u 0 -e MYSQL_PWD=t -e LHA_TUNE_MATURE=0 -e NO_COLOR=1 svc bash /tmp/audit.sh --tune 2>&1)
+# Privileged, because root on a real host may read /proc/PID/fd, and a plain exec may not.
+out=$(docker exec --privileged -u 0 -e MYSQL_PWD=t -e LHA_TUNE_MATURE=0 -e NO_COLOR=1 svc bash /tmp/audit.sh --tune 2>&1)
 status=$?
 printf '%s\n' "$out"
-errors=$(docker exec -u 0 -e MYSQL_PWD=t -e NO_COLOR=1 svc bash /tmp/audit.sh --errors 2>&1)
+errors=$(docker exec --privileged -u 0 -e MYSQL_PWD=t -e NO_COLOR=1 svc bash /tmp/audit.sh --errors 2>&1)
 errors_status=$?
 printf '%s\n' "$errors" | tail -n 25
 bad=0

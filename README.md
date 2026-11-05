@@ -106,7 +106,7 @@ contract: other tools can act on them without reading the English text, so never
 - Some tools are left out on purpose, because they write or log something: `rabbitmqctl`, `nodetool`,
   `gluster` and `ceph`. Those services show what their own metrics page or state files say.
 - `ss` is used only where its kernel modules are loaded already. Otherwise the kernel would load them,
-  so listeners and connections come from `/proc`, or from `netstat` if it is there.
+  so listeners and connections come from `/proc`.
 - PostgreSQL details need root and `setpriv`. Password-protected services show less.
 - A clean report means these checks found nothing. It does not prove a server is secure.
 
