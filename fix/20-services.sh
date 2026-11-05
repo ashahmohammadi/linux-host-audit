@@ -20,7 +20,7 @@ fx_config_test() {
 fx_unit_log() { run_t 8 journalctl -u "$1" -n 60 --no-pager -q -o cat 2>/dev/null | clean; }
 
 dx_service_failed() {
-    local unit=${1:-} result status log port owner path pkg
+    local unit=${1:-} result status log port owner path pkg last enabled
     [[ -n $unit ]] || { FX_CAUSE='No service was named.'; return 0; }
     result=$(run_t 3 systemctl show -p Result --value -- "$unit" 2>/dev/null)
     status=$(run_t 3 systemctl show -p ExecMainStatus --value -- "$unit" 2>/dev/null)
@@ -69,12 +69,28 @@ dx_service_failed() {
                 return 0
             fi ;;
     esac
-    FX_CAUSE="It stopped with result ${result:-unknown}, exit status ${status:-unknown}. Last log: $(tail -n 1 <<< "$log" | cut -c1-120)"
+    # The last lines are systemd's own summary. The reason is in what the program said before them.
+    last=$(grep -vE '^(Failed to start|Started |Starting |Stopped |Stopping )|Main process exited|Failed with result|Unit entered|Control process exited|Scheduled restart|Start request repeated|\.service:[0-9]+: ' <<< "$log" | tail -n 1 | cut -c1-130)
+    FX_CAUSE="It stopped with result ${result:-unknown}, exit status ${status:-unknown}. ${last:+Its last message: $last}"
+
+    # A one-shot task is a job, not a daemon. Running it again repeats whatever it does.
+    if [[ $(run_t 3 systemctl show -p Type --value -- "$unit" 2>/dev/null) == oneshot ]]; then
+        FX_MODE=never
+        FX_CAUSE+=' It is a one-shot task, and running it again would repeat its work.'
+        FX_STEPS=("Read what it does first: systemctl cat $unit" "${FX_STEPS[@]}"
+            "If the failure is old and harmless, clear the mark: systemctl reset-failed $unit")
+        return 0
+    fi
+    # Not enabled at boot usually means somebody turned it off, so starting it changes the server.
+    enabled=$(run_t 3 systemctl is-enabled "$unit" 2>/dev/null)
+    if [[ $enabled != enabled ]]; then
+        FX_MODE=never
+        FX_CAUSE+=" It is not enabled at boot ($enabled), so it may be off on purpose."
+        FX_STEPS=("If you want it on: systemctl enable --now $unit" "If not, clear the old failure: systemctl reset-failed $unit")
+        return 0
+    fi
     FX_MODE=auto FX_RISK=medium
     FX_PLAN=("Clear its failed state and start it once: systemctl start $unit")
-    if [[ $(run_t 3 systemctl show -p Type --value -- "$unit" 2>/dev/null) == oneshot ]]; then
-        FX_CAUSE+=' It is a one-shot task.'
-    fi
     FX_EXPECT_GONE=$unit
 }
 ap_service_failed() {

@@ -77,8 +77,11 @@ echo '=== failed service: clean retry works'
 cat > /etc/systemd/system/lha-flaky.service <<'EOF'
 [Service]
 ExecStart=/bin/sh -c 'test -f /run/lha-ok && exec sleep 600'
+[Install]
+WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
+systemctl enable lha-flaky 2>/dev/null
 systemctl start lha-flaky 2>/dev/null
 touch /run/lha-ok
 fresh
@@ -86,6 +89,37 @@ check 'failure is detected' "fix_find service-failed:lha-flaky.service"
 fx_transaction service-failed lha-flaky.service | tail -n 2
 check 'service is running' "[[ \$(systemctl is-active lha-flaky) == active ]]"
 systemctl stop lha-flaky
+
+echo '=== failed service: a one-shot job is never run again'
+cat > /etc/systemd/system/lha-job.service <<'EOF'
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo ran >> /run/lha-job-runs; exit 1'
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable lha-job 2>/dev/null
+systemctl start lha-job 2>/dev/null
+fresh
+out=$(fx_transaction service-failed lha-job.service 2>&1); status=$?
+check 'one-shot is not automatic' "((status == 3))"
+check 'one-shot ran only once' "(($(wc -l < /run/lha-job-runs) == 1))"
+systemctl disable lha-job 2>/dev/null; systemctl reset-failed lha-job
+
+echo '=== failed service: one that is switched off stays off'
+cat > /etc/systemd/system/lha-off.service <<'EOF'
+[Service]
+ExecStart=/bin/sh -c 'test -f /run/lha-off-ok && exec sleep 600'
+EOF
+systemctl daemon-reload
+systemctl start lha-off 2>/dev/null
+touch /run/lha-off-ok
+fresh
+out=$(fx_transaction service-failed lha-off.service 2>&1); status=$?
+check 'disabled service is not started' "((status == 3))"
+check 'disabled service still down' "[[ \$(systemctl is-active lha-off) != active ]]"
+systemctl reset-failed lha-off
 
 echo '=== failed service: broken config is reported and left alone'
 cp /etc/nginx/nginx.conf /etc/lha-nginx.good

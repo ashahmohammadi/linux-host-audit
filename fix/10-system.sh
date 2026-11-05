@@ -4,8 +4,10 @@ fx_mount_of() { df -P "$1" 2>/dev/null | awk 'NR == 2 { print $NF }'; }
 fx_bytes() { awk -v b="${1:-0}" 'BEGIN { split("B KiB MiB GiB TiB", u, " "); i = 1
     while (b >= 1024 && i < 5) { b /= 1024; i++ } printf "%.1f %s", b, u[i] }'; }
 fx_top_memory() {
-    ps -eo rss=,comm= --sort=-rss 2>/dev/null | head -n "${1:-5}" | clean |
-        awk '{ printf "%s%s %.1f GiB", (NR > 1 ? ", " : ""), $2, $1 / 1048576 }'
+    # Added up per program: 160 php-fpm workers are one memory user, not 160.
+    ps -eo rss=,comm= 2>/dev/null | clean | awk '{ m[$2] += $1; n[$2]++ }
+        END { for (p in m) printf "%d %d %s\n", m[p], n[p], p }' | sort -rn | head -n "${1:-5}" |
+        awk '{ printf "%s%s %.1f GiB", (NR > 1 ? ", " : ""), $3, $1 / 1048576; if ($2 > 1) printf " (%s processes)", $2 }'
 }
 
 # Persists a kernel setting in its own file, so it is easy to find and to remove.
@@ -159,7 +161,8 @@ ck_memory_low() { fx_swap_check; }
 dx_oom_kills() {
     FX_CAUSE="Killed: ${1:-unknown}. Biggest users now: $(fx_top_memory 4)."
     fx_mysql_advice
-    FX_STEPS+=('journalctl -k | grep -i "out of memory"' 'Add RAM if the numbers above already look reasonable.')
+    FX_STEPS+=('If php-fpm is a big user, lower pm.max_children, per pool or in your panel.'
+        'journalctl -k | grep -i "out of memory"' 'Add RAM if the numbers above already look reasonable.')
     if fx_swap_possible; then fx_swap_plan; FX_CAUSE+=' This server has no swap.'; fi
 }
 ap_oom_kills() { fx_swap_apply; }
