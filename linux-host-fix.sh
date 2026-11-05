@@ -3561,6 +3561,18 @@ Run as root for the complete picture. NO_COLOR=1 turns colors off.
 EOF
 }
 
+# Almost every check parses text with awk. Some minimal images do not ship it.
+need_awk() {
+    has awk && return 0
+    if has busybox && busybox awk 'BEGIN { exit 0 }' 2>/dev/null; then
+        awk() { busybox awk "$@"; }
+        return 0
+    fi
+    printf 'This tool needs awk, which this system does not have.\n' >&2
+    printf 'Install it first, for example: apt-get install gawk, dnf install gawk or zypper install gawk\n' >&2
+    return 3
+}
+
 one_view() {
     ui_colors
     run_checks
@@ -3589,6 +3601,7 @@ main() {
         printf 'This tool requires Linux.\n' >&2
         return 1
     fi
+    need_awk || return 3
     case ${1:-} in
         --menu|--monitor|--metrics|--overview|--problems|--apps|--network|--containers|--docker|--k8s|\
         --web|--db|--security|--logs|--jobs|--resources|--learn|--report|--check|--json)
@@ -4192,7 +4205,10 @@ dx_service_failed() {
     FX_CAUSE="It stopped with result ${result:-unknown}, exit status ${status:-unknown}. ${last:+Its last message: $last}"
 
     # A one-shot task is a job, not a daemon. Running it again repeats whatever it does.
-    if [[ $(run_t 3 systemctl show -p Type --value -- "$unit" 2>/dev/null) == oneshot ]]; then
+    # RemainAfterExit marks jobs too: rc-local on RHEL is Type=forking, and it reruns boot commands.
+    if [[ $(run_t 3 systemctl show -p Type --value -- "$unit" 2>/dev/null) == oneshot ||
+          $(run_t 3 systemctl show -p RemainAfterExit --value -- "$unit" 2>/dev/null) == yes ||
+          $unit == rc-local.service ]]; then
         FX_MODE=never
         FX_CAUSE+=' It is a one-shot task, and running it again would repeat its work.'
         FX_STEPS=("Read what it does first: systemctl cat $unit" "${FX_STEPS[@]}"
@@ -4877,6 +4893,7 @@ fix_main() {
     done
     action=${words[0]:-} value=${words[1]:-}
     if [[ $(uname -s) != Linux && -z ${LHA_TEST_PATH:-} ]]; then fx_say 'This tool requires Linux.'; return 1; fi
+    need_awk || return 3
     case $action in
         ''|--help|-h) fix_usage ;;
         --list) fix_list ;;

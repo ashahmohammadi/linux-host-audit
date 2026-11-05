@@ -3561,6 +3561,18 @@ Run as root for the complete picture. NO_COLOR=1 turns colors off.
 EOF
 }
 
+# Almost every check parses text with awk. Some minimal images do not ship it.
+need_awk() {
+    has awk && return 0
+    if has busybox && busybox awk 'BEGIN { exit 0 }' 2>/dev/null; then
+        awk() { busybox awk "$@"; }
+        return 0
+    fi
+    printf 'This tool needs awk, which this system does not have.\n' >&2
+    printf 'Install it first, for example: apt-get install gawk, dnf install gawk or zypper install gawk\n' >&2
+    return 3
+}
+
 one_view() {
     ui_colors
     run_checks
@@ -3589,6 +3601,7 @@ main() {
         printf 'This tool requires Linux.\n' >&2
         return 1
     fi
+    need_awk || return 3
     case ${1:-} in
         --menu|--monitor|--metrics|--overview|--problems|--apps|--network|--containers|--docker|--k8s|\
         --web|--db|--security|--logs|--jobs|--resources|--learn|--report|--check|--json)

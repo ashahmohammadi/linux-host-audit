@@ -43,6 +43,11 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/w:ro" "${{ matrix.image }}" sh -c '
             if command -v apk >/dev/null && ! command -v bash >/dev/null; then apk add -q bash; fi
+            if ! command -v awk >/dev/null; then
+                bash /w/linux-host-audit.sh --overview
+                test $? = 3 || exit 1
+                zypper -n -q install gawk
+            fi
             bash /w/tests/real-smoke.sh'
 
   host:

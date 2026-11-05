@@ -103,6 +103,7 @@ fix_main() {
     done
     action=${words[0]:-} value=${words[1]:-}
     if [[ $(uname -s) != Linux && -z ${LHA_TEST_PATH:-} ]]; then fx_say 'This tool requires Linux.'; return 1; fi
+    need_awk || return 3
     case $action in
         ''|--help|-h) fix_usage ;;
         --list) fix_list ;;

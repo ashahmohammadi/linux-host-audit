@@ -107,6 +107,25 @@ check 'one-shot is not automatic' "((status == 3))"
 check 'one-shot ran only once' "(($(wc -l < /run/lha-job-runs) == 1))"
 systemctl disable lha-job 2>/dev/null; systemctl reset-failed lha-job
 
+echo '=== failed service: a boot job in disguise is never run again'
+# Same shape as rc-local on the RHEL family: not one-shot, but it stays "active" after exiting.
+cat > /etc/systemd/system/lha-boot.service <<'EOF'
+[Service]
+Type=forking
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'echo ran >> /run/lha-boot-runs; exit 1'
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable lha-boot 2>/dev/null
+systemctl start lha-boot 2>/dev/null
+fresh
+out=$(fx_transaction service-failed lha-boot.service 2>&1); status=$?
+check 'boot job is not automatic' "((status == 3))"
+check 'boot job ran only once' "(($(wc -l < /run/lha-boot-runs) == 1))"
+systemctl disable lha-boot 2>/dev/null; systemctl reset-failed lha-boot
+
 echo '=== failed service: one that is switched off stays off'
 cat > /etc/systemd/system/lha-off.service <<'EOF'
 [Service]

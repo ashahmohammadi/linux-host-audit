@@ -74,7 +74,10 @@ dx_service_failed() {
     FX_CAUSE="It stopped with result ${result:-unknown}, exit status ${status:-unknown}. ${last:+Its last message: $last}"
 
     # A one-shot task is a job, not a daemon. Running it again repeats whatever it does.
-    if [[ $(run_t 3 systemctl show -p Type --value -- "$unit" 2>/dev/null) == oneshot ]]; then
+    # RemainAfterExit marks jobs too: rc-local on RHEL is Type=forking, and it reruns boot commands.
+    if [[ $(run_t 3 systemctl show -p Type --value -- "$unit" 2>/dev/null) == oneshot ||
+          $(run_t 3 systemctl show -p RemainAfterExit --value -- "$unit" 2>/dev/null) == yes ||
+          $unit == rc-local.service ]]; then
         FX_MODE=never
         FX_CAUSE+=' It is a one-shot task, and running it again would repeat its work.'
         FX_STEPS=("Read what it does first: systemctl cat $unit" "${FX_STEPS[@]}"
