@@ -75,8 +75,8 @@ ap_ssh_root_password() {
         # First match wins in sshd_config.d, so sort this file early.
         printf 'PermitRootLogin prohibit-password\n' | fx_write /etc/ssh/sshd_config.d/00-linux-host-audit.conf || return 1
     else
-        sed -E 's/^[[:space:]]*PermitRootLogin[[:space:]].*/PermitRootLogin prohibit-password/' "$file" | fx_write "$file" || return 1
-        grep -qE '^PermitRootLogin' "$file" || return 1
+        { sed -E 's/^[[:space:]]*PermitRootLogin[[:space:]].*/PermitRootLogin prohibit-password/' "$file"
+          grep -qiE '^[[:space:]]*PermitRootLogin[[:space:]]' "$file" || printf 'PermitRootLogin prohibit-password\n'; } | fx_write "$file" || return 1
     fi
     fx_quote systemctl reload "$unit"
     fx_undo "$REPLY"

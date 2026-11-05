@@ -4,11 +4,14 @@ fix_usage() {
     cat <<'EOF'
 Linux Host Fix: finds the exact cause of each problem, and fixes what is safe to fix.
 
+  bash linux-host-fix.sh                   Menus: monitor, troubleshoot and fix, tune and apply
   bash linux-host-fix.sh --list            Every problem, and how it can be handled
   bash linux-host-fix.sh --diagnose ID     Exact cause and plan. Changes nothing
   bash linux-host-fix.sh --dry-run         Diagnose everything. Changes nothing
   bash linux-host-fix.sh --fix ID[:TARGET] Fix one problem, after asking you
   bash linux-host-fix.sh --fix-all         Offer every automatic fix, one by one
+  bash linux-host-fix.sh --tune            Tuning advice from real load, numbered
+  bash linux-host-fix.sh --tune-apply N    Apply one piece of advice, after asking you
   bash linux-host-fix.sh --undo RUN        Reverse a past fix
   bash linux-host-fix.sh --history         List past fixes
 
@@ -67,7 +70,7 @@ fix_one() {
 }
 
 fix_all() {
-    local i count=$((F_N)) status worst=0 first=()
+    local i count status worst=0 sev
     run_checks
     count=$F_N
     # Disks first: many other fixes need free space. Security last: it can need a person.
@@ -98,6 +101,7 @@ fix_main() {
     for arg in "$@"; do
         case $arg in
             --yes=low|--yes=medium|--yes=high) FX_ASSUME=${arg#--yes=} ;;
+            --dry-run) [[ $# -gt 1 ]] && FX_DRY=yes || words+=("$arg") ;;
             *) words+=("$arg") ;;
         esac
     done
@@ -105,7 +109,13 @@ fix_main() {
     if [[ $(uname -s) != Linux && -z ${LHA_TEST_PATH:-} ]]; then fx_say 'This tool requires Linux.'; return 1; fi
     need_awk || return 3
     case $action in
-        ''|--help|-h) fix_usage ;;
+        '')
+            if [[ -t 1 && -n ${TERM:-} && $TERM != dumb ]] && { : </dev/tty; } 2>/dev/null; then tui_main
+            else fix_usage
+            fi ;;
+        --help|-h) fix_usage ;;
+        --tune) tune_list ;;
+        --tune-apply) run_checks; fx_transaction tune-apply "$value" ;;
         --list) fix_list ;;
         --diagnose) FX_DRY=yes; fix_one "$value" ;;
         --dry-run) FX_DRY=yes; fix_all ;;

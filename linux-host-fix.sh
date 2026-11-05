@@ -4,7 +4,7 @@
 # Never prints passwords, process arguments, container environments or Kubernetes secrets.
 # Bash 3.2+ on any Linux. Missing tools only hide the part of the report that needs them.
 
-LHA_VERSION=3.3.0
+LHA_VERSION=3.4.0
 
 section() { title "$1"; }
 has() { type -P "$1" >/dev/null 2>&1; }
@@ -3023,7 +3023,7 @@ view_json() {
 TUNE_MATURE=${LHA_TUNE_MATURE:-86400}
 
 # group|setting|now|used|percent full|recommended|why|how to apply
-tune_row() { TUNE_ROWS+="$1|$2|$3|$4|$5|$6|$7|${8:-}"$'\n'; }
+tune_row() { TUNE_ROWS+="$1|$2|$3|$4|$5|$6|$7|${8:-}|${9:-$6}"$'\n'; }
 tune_note() { TUNE_NOTES+="$1|$2"$'\n'; }
 tune_budget() { TUNE_BUDGET+="$1|$2"$'\n'; }
 tune_get() { awk -F '\t' -v k="$2" '$1 == k { print $2; found = 1; exit } END { if (!found) print 0 }' <<< "$1"; }
@@ -3097,8 +3097,7 @@ tune_mysql() {
             why="Only $fill% is used after $(human_age "$up"). The rest could serve other programs."
         fi
     fi
-    tune_row "$group" innodb_buffer_pool_size "$(tune_size "$pool")" "$fill% full, $hit% read hits" "$fill" "${rec:+$(tune_size "$rec")}" "$why" 'live'
-    [[ -z $rec ]] || TUNE_APPLY+="mysql innodb_buffer_pool_size $rec"$'\n'
+    tune_row "$group" innodb_buffer_pool_size "$(tune_size "$pool")" "$fill% full, $hit% read hits" "$fill" "${rec:+$(tune_size "$rec")}" "$why" 'live' "$rec"
 
     tmp=$(tune_get "$status" Created_tmp_tables)
     disk=$(tune_get "$status" Created_tmp_disk_tables)
@@ -3110,7 +3109,7 @@ tune_mysql() {
         rec=$((eff * 2 > 268435456 ? 268435456 : eff * 2))
         why="$(tune_pct "$disk" "$tmp")% of temporary tables spill to disk. Also check missing indexes. Set max_heap_table_size to match."
     fi
-    tune_row "$group" tmp_table_size "$(tune_size "$eff")" "$(tune_pct "$disk" "$tmp")% went to disk" "$(tune_pct "$disk" "$tmp")" "${rec:+$(tune_size "$rec")}" "$why" 'live'
+    tune_row "$group" tmp_table_size "$(tune_size "$eff")" "$(tune_pct "$disk" "$tmp")% went to disk" "$(tune_pct "$disk" "$tmp")" "${rec:+$(tune_size "$rec")}" "$why" 'live' "$rec"
 
     size=$(tune_get "$vars" table_open_cache)
     now=$(tune_get "$status" Open_tables)
@@ -3149,7 +3148,7 @@ tune_mysql() {
         why="$(tune_size "$rate") of redo log is written each hour. Too small a log causes write stalls."
     fi
     if ((size > 0)); then
-        tune_row "$group" "$log_name" "$(tune_size "$((size * files))")" "$(tune_size "$rate") per hour" "$(tune_pct "$rate" "$((size * files))")" "${rec:+$(tune_size "$rec")}" "$why" 'restart'
+        tune_row "$group" "$log_name" "$(tune_size "$((size * files))")" "$(tune_size "$rate") per hour" "$(tune_pct "$rate" "$((size * files))")" "${rec:+$(tune_size "$rec")}" "$why" 'restart' "$rec"
     fi
 
     now=$(tune_get "$status" Slow_queries)
@@ -3216,7 +3215,7 @@ tune_redis() {
     elif ((used * 100 / max >= 90 && evicted > 0)); then
         rec=$(tune_round "$((max * 3 / 2))") why="It is full, and has evicted $evicted keys."
     fi
-    tune_row "$group" maxmemory "$( ((max == 0)) && printf unlimited || tune_size "$max")" "$(tune_size "$used") used" "$(tune_pct "$used" "$max")" "${rec:+$(tune_size "$rec")}" "$why" 'live'
+    tune_row "$group" maxmemory "$( ((max == 0)) && printf unlimited || tune_size "$max")" "$(tune_size "$used") used" "$(tune_pct "$used" "$max")" "${rec:+$(tune_size "$rec")}" "$why" 'live' "$rec"
     conf=$(run_t 5 "$cli" -h 127.0.0.1 config get maxclients 2>/dev/null | tail -n 1 | tr -d '\r')
     clients=$(tune_get "$info" connected_clients)
     if [[ $conf =~ ^[0-9]+$ ]]; then tune_row "$group" maxclients "$conf" "$clients now" "$(tune_pct "$clients" "$conf")" '' ''; fi
@@ -3822,7 +3821,7 @@ menu_page_debug() {
     menu_add "$REPLY" 'Security' '' '' view_security
     menu_add tool 'All installed software' '' '' view_inventory
     if declare -F fix_list >/dev/null; then
-        menu_add tool 'Fix problems' 'cause, plan, confirmation, undo' 'FIX' fix_list
+        menu_add tool 'Fix problems' 'cause, plan, confirmation, undo' 'FIX' page:fix
     fi
 }
 
@@ -3841,6 +3840,9 @@ menu_page_tune() {
         menu_add "$state" "$group" "$advice changes advised" "$head" "view_tune_one:$group"
         head=''
     done <<< "$(tune_groups)"
+    if declare -F fix_list >/dev/null; then
+        menu_add tool 'Apply advice' 'test, backup, undo, one at a time' 'CHANGE' page:apply
+    fi
 }
 
 tui_menu_items() {
@@ -3849,7 +3851,8 @@ tui_menu_items() {
         monitor) menu_title=Monitor; menu_page_monitor ;;
         debug) menu_title='Troubleshoot and debug'; menu_page_debug ;;
         tune) menu_title=Tune; menu_page_tune ;;
-        *) menu_title=''; menu_page_main ;;
+        main) menu_title=''; menu_page_main ;;
+        *) "menu_page_$page" ;;
     esac
 }
 
@@ -3948,10 +3951,23 @@ tui_main() (
             page:*) page=${action#page:} choice=0 ;;
             monitor) (tui_inherited=yes; monitor_main) ;;
             view_tune_one:*) tui_report view_tune_one "${action#*:}" ;;
+            run:*) tui_direct "${action#run:}" ;;
             *) tui_report "$action" ;;
         esac
     done
 )
+
+# For actions that ask questions: no pager in the way, and a visible cursor.
+tui_direct() {
+    printf '\033[H\033[J\033[?25h' >&9
+    local -a words
+    read -r -a words <<< "$1"
+    "${words[@]}" >&9 2>&1
+    printf '\nPress Enter for the menu.\n' >&9
+    IFS= read -r -u 9 || :
+    printf '\033[?25l\033[H\033[J' >&9
+    tui_rescan
+}
 
 tui_report() {
     local charset=ascii
@@ -4877,7 +4893,7 @@ dx_service_failed() {
     fi
     case $(tr 'A-Z' 'a-z' <<< "$log") in
         *'address already in use'*)
-            port=$(grep -io 'address already in use' -B0 <<< "$log" >/dev/null; grep -oE ':[0-9]{2,5}' <<< "$log" | tail -n 1 | tr -d :)
+            port=$(grep -i 'already in use' <<< "$log" | grep -oE ':[0-9]{2,5}' | tail -n 1 | tr -d :)
             owner=$(awk -v p="$port" '$2 == p { print $5; exit }' <<< "$NET_ROWS")
             FX_CAUSE="Port ${port:-unknown} is already taken${owner:+ by $owner}."
             FX_STEPS=('Stop the other program, or give one of them another port.' "ss -lntup | grep :$port")
@@ -5113,8 +5129,8 @@ ap_ssh_root_password() {
         # First match wins in sshd_config.d, so sort this file early.
         printf 'PermitRootLogin prohibit-password\n' | fx_write /etc/ssh/sshd_config.d/00-linux-host-audit.conf || return 1
     else
-        sed -E 's/^[[:space:]]*PermitRootLogin[[:space:]].*/PermitRootLogin prohibit-password/' "$file" | fx_write "$file" || return 1
-        grep -qE '^PermitRootLogin' "$file" || return 1
+        { sed -E 's/^[[:space:]]*PermitRootLogin[[:space:]].*/PermitRootLogin prohibit-password/' "$file"
+          grep -qiE '^[[:space:]]*PermitRootLogin[[:space:]]' "$file" || printf 'PermitRootLogin prohibit-password\n'; } | fx_write "$file" || return 1
     fi
     fx_quote systemctl reload "$unit"
     fx_undo "$REPLY"
@@ -5499,17 +5515,210 @@ guide_fallback() {
     FX_CAUSE='No detailed diagnosis exists for this yet.'
     FX_STEPS=("See the Next command in the report for $1.")
 }
+# Applying tuning advice. Each change is one setting, tested, reversible, and watched by the guard.
+
+tune_advice() { awk -F '|' 'NF && $6 != ""' <<< "$TUNE_ROWS"; }
+
+tune_list() {
+    local n=0 group setting now used pct rec why how raw
+    run_checks
+    tune_collect
+    title 'Tuning advice you can apply' 'One at a time, then watch a day of traffic before the next.'
+    while IFS='|' read -r group setting now used pct rec why how raw; do
+        [[ -n $setting ]] || continue
+        ((n += 1))
+        printf '  %2d  %-26.26s %-26.26s %s -> %s\n' "$n" "$group" "$setting" "$now" "$rec"
+        printf '      %s%s%s\n' "$c_dim" "$why" "$c_off"
+    done <<< "$(tune_advice)"
+    ((n > 0)) || printf '  %s Nothing to change right now.\n' "$(badge OK)"
+    ((n == 0)) || printf '\n  Apply one with: --tune-apply NUMBER. See the plan first with: --tune-apply NUMBER --dry-run\n'
+}
+
+# The included folder that this server really reads, so a saved setting is not silently ignored.
+tune_mysql_dir() {
+    local dir
+    for dir in /etc/mysql/mariadb.conf.d /etc/mysql/mysql.conf.d /etc/mysql/conf.d /etc/my.cnf.d; do
+        [[ -d $dir ]] || continue
+        if grep -rqsE "^[[:space:]]*!includedir[[:space:]]+$dir" /etc/my.cnf /etc/mysql/my.cnf /etc/mysql/mariadb.cnf; then
+            printf '%s' "$dir"
+            return 0
+        fi
+    done
+}
+
+fx_mysql_client() { FX_SQL=mysql; has mysql || FX_SQL=mariadb; }
+fx_mysql_get() { run_t 6 "$FX_SQL" --connect-timeout=3 -NBe "SELECT @@GLOBAL.$1" 2>/dev/null; }
+
+dx_tune_apply() {
+    local n=${1:-0} line
+    tune_collect
+    line=$(tune_advice | sed -n "${n}p")
+    IFS='|' read -r TA_GROUP TA_SETTING TA_NOW _ _ TA_REC TA_WHY TA_HOW TA_RAW <<< "$line"
+    if [[ -z $TA_SETTING ]]; then FX_CAUSE="There is no advice number $n."; return 0; fi
+    FX_CAUSE="$TA_GROUP $TA_SETTING: $TA_WHY"
+    FX_STEPS=("Set $TA_SETTING to $TA_REC, now $TA_NOW.")
+    case $TA_GROUP in
+        MariaDB*|MySQL*)
+            fx_mysql_client
+            case $TA_SETTING in
+                max_connections|innodb_buffer_pool_size|tmp_table_size|table_open_cache|thread_cache_size|query_cache_type)
+                    TA_KIND=mysql TA_DIR=$(tune_mysql_dir)
+                    FX_MODE=auto FX_RISK=medium
+                    FX_PLAN=("SET GLOBAL $TA_SETTING = $TA_RAW, with no restart.")
+                    if [[ -n $TA_DIR ]]; then FX_PLAN+=("Save it in $TA_DIR/zz-linux-host-audit.cnf, so it survives a restart.")
+                    else FX_PLAN+=('No included config folder was found, so this lasts until the next restart.')
+                    fi ;;
+                *) FX_STEPS+=("Under [mysqld] in your config, then a planned restart: $TA_SETTING = $TA_REC") ;;
+            esac ;;
+        'Linux kernel')
+            case $TA_SETTING in
+                net.core.somaxconn|vm.swappiness)
+                    TA_KIND=sysctl FX_MODE=auto FX_RISK=low
+                    FX_PLAN=("sysctl $TA_SETTING=$TA_RAW, kept across reboots.") ;;
+                transparent_hugepage)
+                    TA_KIND=thp FX_MODE=auto FX_RISK=low
+                    FX_PLAN=('Set transparent hugepages to madvise, until the next boot.')
+                    FX_STEPS=('To keep it, add transparent_hugepage=madvise to the kernel command line.') ;;
+                ip_local_port_range)
+                    TA_KIND=sysctl TA_SETTING=net.ipv4.ip_local_port_range FX_MODE=auto FX_RISK=low
+                    FX_PLAN=("sysctl $TA_SETTING=$TA_RAW, kept across reboots.") ;;
+            esac ;;
+        Redis*|Valkey*)
+            if [[ $TA_SETTING == maxmemory ]]; then
+                TA_KIND=redis FX_MODE=auto FX_RISK=medium TA_CLI=redis-cli
+                has "$TA_CLI" || TA_CLI=valkey-cli
+                FX_PLAN=("CONFIG SET maxmemory $TA_RAW. This is above what it uses now, so nothing is evicted.")
+                FX_STEPS=('Also add it to the config file, or it resets at restart. Consider a maxmemory-policy.')
+            fi ;;
+        Nginx*)
+            if [[ -d /usr/local/cpanel ]]; then
+                FX_STEPS+=('cPanel manages this nginx config. Use the WHM NGINX Manager or its settings file.')
+            elif [[ $TA_SETTING == worker_connections || $TA_SETTING == worker_processes ]]; then
+                TA_KIND=nginx FX_MODE=auto FX_RISK=medium TA_FILE=/etc/nginx/nginx.conf
+                [[ -r $TA_FILE ]] || TA_FILE=/usr/local/nginx/conf/nginx.conf
+                FX_PLAN=("Set $TA_SETTING $TA_RAW in $TA_FILE." 'Test with nginx -t, then reload. Open connections stay.')
+            fi ;;
+        'PHP-FPM pools')
+            TA_POOL=${TA_SETTING%% *}
+            TA_FILE=$(grep -lsE "^\[$TA_POOL\]" /etc/php-fpm.d/*.conf /etc/php/*/fpm/pool.d/*.conf /usr/local/etc/php-fpm.d/*.conf | head -n 1)
+            if [[ -d /usr/local/cpanel ]]; then
+                FX_STEPS+=('cPanel rebuilds these files. Change it in MultiPHP Manager > PHP-FPM Settings.')
+            elif [[ -n $TA_FILE ]]; then
+                TA_KIND=phpfpm FX_MODE=auto FX_RISK=medium
+                TA_UNIT=$(run_t 5 systemctl list-units --type=service --state=running --plain --no-legend 2>/dev/null | awk '$1 ~ /php.*fpm/ { print $1; exit }')
+                FX_PLAN=("Set pm.max_children = $TA_RAW in $TA_FILE." "Reload ${TA_UNIT:-php-fpm}.")
+                FX_EXPECT_GONE=$TA_UNIT
+            fi ;;
+    esac
+    case $TA_HOW:$FX_MODE in
+        restart:*) FX_STEPS+=('This one needs a planned restart, so it is left to you.') ;;
+    esac
+}
+
+ap_tune_apply() {
+    local old file line
+    case $TA_KIND in
+        mysql)
+            old=$(fx_mysql_get "$TA_SETTING")
+            [[ -n $old ]] || return 1
+            fx_quote "$FX_SQL" -e "SET GLOBAL $TA_SETTING = $old"
+            fx_undo "$REPLY"
+            fx_run "$FX_SQL" -e "SET GLOBAL $TA_SETTING = $TA_RAW" || return 1
+            if [[ $TA_SETTING == tmp_table_size ]]; then
+                fx_run "$FX_SQL" -e "SET GLOBAL max_heap_table_size = $TA_RAW" || return 1
+            fi
+            if [[ -n $TA_DIR ]]; then
+                file=$TA_DIR/zz-linux-host-audit.cnf
+                { printf '[mysqld]\n'; grep -v -e "^$TA_SETTING " -e '^\[mysqld\]' "$file" 2>/dev/null; printf '%s = %s\n' "$TA_SETTING" "$TA_RAW"; } | fx_write "$file"
+            fi ;;
+        sysctl) fx_sysctl "$TA_SETTING" "$TA_RAW" ;;
+        thp)
+            fx_undo 'echo always > /sys/kernel/mm/transparent_hugepage/enabled'
+            echo madvise > /sys/kernel/mm/transparent_hugepage/enabled ;;
+        redis)
+            old=$(run_t 5 "$TA_CLI" -h 127.0.0.1 config get maxmemory | tail -n 1 | tr -d '\r')
+            fx_quote "$TA_CLI" -h 127.0.0.1 config set maxmemory "$old"
+            fx_undo "$REPLY"
+            fx_run "$TA_CLI" -h 127.0.0.1 config set maxmemory "$TA_RAW" ;;
+        nginx)
+            fx_quote systemctl reload nginx
+            fx_undo "$REPLY"
+            sed -E "s/^([[:space:]]*$TA_SETTING[[:space:]]+)[^;]+;/\1$TA_RAW;/" "$TA_FILE" | fx_write "$TA_FILE" || return 1
+            nginx -t >/dev/null 2>&1 || return 1
+            fx_run systemctl reload nginx ;;
+        phpfpm)
+            fx_quote systemctl reload "$TA_UNIT"
+            fx_undo "$REPLY"
+            sed -E "s/^([[:space:]]*pm\.max_children[[:space:]]*=).*/\1 $TA_RAW/" "$TA_FILE" | fx_write "$TA_FILE" || return 1
+            fx_run systemctl reload "$TA_UNIT" ;;
+        *) return 1 ;;
+    esac
+}
+
+ck_tune_apply() {
+    local value
+    case $TA_KIND in
+        mysql)
+            value=$(fx_mysql_get "$TA_SETTING")
+            case $TA_SETTING in
+                # The server rounds the pool to its chunk size, and resizes in the background.
+                innodb_buffer_pool_size) ((value * 10 >= TA_RAW * 9 && value * 10 <= TA_RAW * 11)) ;;
+                query_cache_type) [[ $value == OFF || $value == 0 ]] ;;
+                *) [[ $value == "$TA_RAW" ]] ;;
+            esac ;;
+        sysctl) [[ $(sysctl -n "$TA_SETTING" | tr -s '\t ' ' ') == "$TA_RAW" ]] ;;
+        thp) grep -q '\[madvise\]' /sys/kernel/mm/transparent_hugepage/enabled ;;
+        redis) [[ $(run_t 5 "$TA_CLI" -h 127.0.0.1 config get maxmemory | tail -n 1 | tr -d '\r') == "$TA_RAW" ]] ;;
+        nginx) grep -qE "^[[:space:]]*$TA_SETTING[[:space:]]+$TA_RAW;" "$TA_FILE" && [[ $(run_t 3 systemctl is-active nginx) == active ]] ;;
+        phpfpm) [[ $(run_t 3 systemctl is-active "$TA_UNIT") == active ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+# Menu pages, shown only in the fixer.
+menu_page_fix() {
+    local i state head='CHOOSE ONE, YOU SEE THE PLAN FIRST'
+    menu_title='Fix problems'
+    for ((i = 0; i < F_N && i < 30; i++)); do
+        case ${F_SEV[i]} in CRIT) state=crit ;; WARN) state=warn ;; *) state=tool ;; esac
+        menu_add "$state" "${F_ID[i]}" "${F_TARGET[i]}" "$head" "run:fix_from_menu ${F_ID[i]}:${F_TARGET[i]}"
+        head=''
+    done
+    ((F_N > 0)) || menu_add ok 'Nothing to fix' '' 'ALL CLEAR' view_problems
+}
+
+menu_page_apply() {
+    local n=0 group setting now used pct rec why how raw head='ONE AT A TIME, YOU SEE THE PLAN FIRST'
+    menu_title='Apply tuning'
+    tune_collect
+    while IFS='|' read -r group setting now used pct rec why how raw; do
+        [[ -n $setting ]] || continue
+        ((n += 1))
+        menu_add warn "$setting" "$now -> $rec" "$head" "run:fx_transaction tune-apply $n"
+        head=''
+    done <<< "$(tune_advice)"
+    ((n > 0)) || menu_add ok 'Nothing to change right now' '' 'ALL CLEAR' view_tune
+}
+
+fix_from_menu() {
+    local want=$1
+    fix_find "$want" || { fx_say 'This problem is no longer there.'; return 0; }
+    fx_transaction "${F_ID[FOUND_INDEX]}" "${F_TARGET[FOUND_INDEX]}"
+}
 # Command line of the fixer.
 
 fix_usage() {
     cat <<'EOF'
 Linux Host Fix: finds the exact cause of each problem, and fixes what is safe to fix.
 
+  bash linux-host-fix.sh                   Menus: monitor, troubleshoot and fix, tune and apply
   bash linux-host-fix.sh --list            Every problem, and how it can be handled
   bash linux-host-fix.sh --diagnose ID     Exact cause and plan. Changes nothing
   bash linux-host-fix.sh --dry-run         Diagnose everything. Changes nothing
   bash linux-host-fix.sh --fix ID[:TARGET] Fix one problem, after asking you
   bash linux-host-fix.sh --fix-all         Offer every automatic fix, one by one
+  bash linux-host-fix.sh --tune            Tuning advice from real load, numbered
+  bash linux-host-fix.sh --tune-apply N    Apply one piece of advice, after asking you
   bash linux-host-fix.sh --undo RUN        Reverse a past fix
   bash linux-host-fix.sh --history         List past fixes
 
@@ -5568,7 +5777,7 @@ fix_one() {
 }
 
 fix_all() {
-    local i count=$((F_N)) status worst=0 first=()
+    local i count status worst=0 sev
     run_checks
     count=$F_N
     # Disks first: many other fixes need free space. Security last: it can need a person.
@@ -5599,6 +5808,7 @@ fix_main() {
     for arg in "$@"; do
         case $arg in
             --yes=low|--yes=medium|--yes=high) FX_ASSUME=${arg#--yes=} ;;
+            --dry-run) [[ $# -gt 1 ]] && FX_DRY=yes || words+=("$arg") ;;
             *) words+=("$arg") ;;
         esac
     done
@@ -5606,7 +5816,13 @@ fix_main() {
     if [[ $(uname -s) != Linux && -z ${LHA_TEST_PATH:-} ]]; then fx_say 'This tool requires Linux.'; return 1; fi
     need_awk || return 3
     case $action in
-        ''|--help|-h) fix_usage ;;
+        '')
+            if [[ -t 1 && -n ${TERM:-} && $TERM != dumb ]] && { : </dev/tty; } 2>/dev/null; then tui_main
+            else fix_usage
+            fi ;;
+        --help|-h) fix_usage ;;
+        --tune) tune_list ;;
+        --tune-apply) run_checks; fx_transaction tune-apply "$value" ;;
         --list) fix_list ;;
         --diagnose) FX_DRY=yes; fix_one "$value" ;;
         --dry-run) FX_DRY=yes; fix_all ;;

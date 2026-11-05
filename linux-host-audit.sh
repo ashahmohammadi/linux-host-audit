@@ -4,7 +4,7 @@
 # Never prints passwords, process arguments, container environments or Kubernetes secrets.
 # Bash 3.2+ on any Linux. Missing tools only hide the part of the report that needs them.
 
-LHA_VERSION=3.3.0
+LHA_VERSION=3.4.0
 
 section() { title "$1"; }
 has() { type -P "$1" >/dev/null 2>&1; }
@@ -3023,7 +3023,7 @@ view_json() {
 TUNE_MATURE=${LHA_TUNE_MATURE:-86400}
 
 # group|setting|now|used|percent full|recommended|why|how to apply
-tune_row() { TUNE_ROWS+="$1|$2|$3|$4|$5|$6|$7|${8:-}"$'\n'; }
+tune_row() { TUNE_ROWS+="$1|$2|$3|$4|$5|$6|$7|${8:-}|${9:-$6}"$'\n'; }
 tune_note() { TUNE_NOTES+="$1|$2"$'\n'; }
 tune_budget() { TUNE_BUDGET+="$1|$2"$'\n'; }
 tune_get() { awk -F '\t' -v k="$2" '$1 == k { print $2; found = 1; exit } END { if (!found) print 0 }' <<< "$1"; }
@@ -3097,8 +3097,7 @@ tune_mysql() {
             why="Only $fill% is used after $(human_age "$up"). The rest could serve other programs."
         fi
     fi
-    tune_row "$group" innodb_buffer_pool_size "$(tune_size "$pool")" "$fill% full, $hit% read hits" "$fill" "${rec:+$(tune_size "$rec")}" "$why" 'live'
-    [[ -z $rec ]] || TUNE_APPLY+="mysql innodb_buffer_pool_size $rec"$'\n'
+    tune_row "$group" innodb_buffer_pool_size "$(tune_size "$pool")" "$fill% full, $hit% read hits" "$fill" "${rec:+$(tune_size "$rec")}" "$why" 'live' "$rec"
 
     tmp=$(tune_get "$status" Created_tmp_tables)
     disk=$(tune_get "$status" Created_tmp_disk_tables)
@@ -3110,7 +3109,7 @@ tune_mysql() {
         rec=$((eff * 2 > 268435456 ? 268435456 : eff * 2))
         why="$(tune_pct "$disk" "$tmp")% of temporary tables spill to disk. Also check missing indexes. Set max_heap_table_size to match."
     fi
-    tune_row "$group" tmp_table_size "$(tune_size "$eff")" "$(tune_pct "$disk" "$tmp")% went to disk" "$(tune_pct "$disk" "$tmp")" "${rec:+$(tune_size "$rec")}" "$why" 'live'
+    tune_row "$group" tmp_table_size "$(tune_size "$eff")" "$(tune_pct "$disk" "$tmp")% went to disk" "$(tune_pct "$disk" "$tmp")" "${rec:+$(tune_size "$rec")}" "$why" 'live' "$rec"
 
     size=$(tune_get "$vars" table_open_cache)
     now=$(tune_get "$status" Open_tables)
@@ -3149,7 +3148,7 @@ tune_mysql() {
         why="$(tune_size "$rate") of redo log is written each hour. Too small a log causes write stalls."
     fi
     if ((size > 0)); then
-        tune_row "$group" "$log_name" "$(tune_size "$((size * files))")" "$(tune_size "$rate") per hour" "$(tune_pct "$rate" "$((size * files))")" "${rec:+$(tune_size "$rec")}" "$why" 'restart'
+        tune_row "$group" "$log_name" "$(tune_size "$((size * files))")" "$(tune_size "$rate") per hour" "$(tune_pct "$rate" "$((size * files))")" "${rec:+$(tune_size "$rec")}" "$why" 'restart' "$rec"
     fi
 
     now=$(tune_get "$status" Slow_queries)
@@ -3216,7 +3215,7 @@ tune_redis() {
     elif ((used * 100 / max >= 90 && evicted > 0)); then
         rec=$(tune_round "$((max * 3 / 2))") why="It is full, and has evicted $evicted keys."
     fi
-    tune_row "$group" maxmemory "$( ((max == 0)) && printf unlimited || tune_size "$max")" "$(tune_size "$used") used" "$(tune_pct "$used" "$max")" "${rec:+$(tune_size "$rec")}" "$why" 'live'
+    tune_row "$group" maxmemory "$( ((max == 0)) && printf unlimited || tune_size "$max")" "$(tune_size "$used") used" "$(tune_pct "$used" "$max")" "${rec:+$(tune_size "$rec")}" "$why" 'live' "$rec"
     conf=$(run_t 5 "$cli" -h 127.0.0.1 config get maxclients 2>/dev/null | tail -n 1 | tr -d '\r')
     clients=$(tune_get "$info" connected_clients)
     if [[ $conf =~ ^[0-9]+$ ]]; then tune_row "$group" maxclients "$conf" "$clients now" "$(tune_pct "$clients" "$conf")" '' ''; fi
@@ -3822,7 +3821,7 @@ menu_page_debug() {
     menu_add "$REPLY" 'Security' '' '' view_security
     menu_add tool 'All installed software' '' '' view_inventory
     if declare -F fix_list >/dev/null; then
-        menu_add tool 'Fix problems' 'cause, plan, confirmation, undo' 'FIX' fix_list
+        menu_add tool 'Fix problems' 'cause, plan, confirmation, undo' 'FIX' page:fix
     fi
 }
 
@@ -3841,6 +3840,9 @@ menu_page_tune() {
         menu_add "$state" "$group" "$advice changes advised" "$head" "view_tune_one:$group"
         head=''
     done <<< "$(tune_groups)"
+    if declare -F fix_list >/dev/null; then
+        menu_add tool 'Apply advice' 'test, backup, undo, one at a time' 'CHANGE' page:apply
+    fi
 }
 
 tui_menu_items() {
@@ -3849,7 +3851,8 @@ tui_menu_items() {
         monitor) menu_title=Monitor; menu_page_monitor ;;
         debug) menu_title='Troubleshoot and debug'; menu_page_debug ;;
         tune) menu_title=Tune; menu_page_tune ;;
-        *) menu_title=''; menu_page_main ;;
+        main) menu_title=''; menu_page_main ;;
+        *) "menu_page_$page" ;;
     esac
 }
 
@@ -3948,10 +3951,23 @@ tui_main() (
             page:*) page=${action#page:} choice=0 ;;
             monitor) (tui_inherited=yes; monitor_main) ;;
             view_tune_one:*) tui_report view_tune_one "${action#*:}" ;;
+            run:*) tui_direct "${action#run:}" ;;
             *) tui_report "$action" ;;
         esac
     done
 )
+
+# For actions that ask questions: no pager in the way, and a visible cursor.
+tui_direct() {
+    printf '\033[H\033[J\033[?25h' >&9
+    local -a words
+    read -r -a words <<< "$1"
+    "${words[@]}" >&9 2>&1
+    printf '\nPress Enter for the menu.\n' >&9
+    IFS= read -r -u 9 || :
+    printf '\033[?25l\033[H\033[J' >&9
+    tui_rescan
+}
 
 tui_report() {
     local charset=ascii

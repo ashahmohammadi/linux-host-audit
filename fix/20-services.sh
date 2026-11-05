@@ -35,7 +35,7 @@ dx_service_failed() {
     fi
     case $(tr 'A-Z' 'a-z' <<< "$log") in
         *'address already in use'*)
-            port=$(grep -io 'address already in use' -B0 <<< "$log" >/dev/null; grep -oE ':[0-9]{2,5}' <<< "$log" | tail -n 1 | tr -d :)
+            port=$(grep -i 'already in use' <<< "$log" | grep -oE ':[0-9]{2,5}' | tail -n 1 | tr -d :)
             owner=$(awk -v p="$port" '$2 == p { print $5; exit }' <<< "$NET_ROWS")
             FX_CAUSE="Port ${port:-unknown} is already taken${owner:+ by $owner}."
             FX_STEPS=('Stop the other program, or give one of them another port.' "ss -lntup | grep :$port")
