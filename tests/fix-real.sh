@@ -272,7 +272,6 @@ if has docker; then
 fi
 
 echo '=== trends: recording goes on and off, and keeps its data'
-export LHA_TREND_DIR=/var/lib/lha-trends
 fix=$here/../linux-host-fix.sh
 bash "$fix" --trends-on --yes=low </dev/null | tail -n 1
 check 'cron job installed' "[[ -f /etc/cron.d/linux-host-audit ]]"
@@ -285,7 +284,6 @@ check 'view reads it' "LHA_TREND_DIR=/var/lib/linux-host-audit/history bash \"\$
 bash "$fix" --trends-off --yes=low </dev/null | tail -n 1
 check 'cron job removed' "[[ ! -e /etc/cron.d/linux-host-audit ]]"
 check 'data kept' "ls /var/lib/linux-host-audit/history/*.csv"
-unset LHA_TREND_DIR
 
 echo '=== tuning: applied live, kept after a restart, undone cleanly'
 advice() { tune_done=yes TUNE_NOTES='' TUNE_BUDGET=''; TUNE_ROWS="$1"$'\n'; }
