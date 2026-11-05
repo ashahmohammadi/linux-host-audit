@@ -47,7 +47,7 @@ jobs:
                 bash /w/linux-host-audit.sh --overview
                 test $? = 3 || exit 1
                 if ! zypper -n -q install gawk || ! command -v awk >/dev/null; then
-                    echo 'Package mirror unavailable. The no-awk path above is what this job proved.'
+                    echo "Package mirror unavailable. The no-awk path above is what this job proved."
                     exit 0
                 fi
             fi
