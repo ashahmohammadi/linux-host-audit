@@ -39,12 +39,42 @@ Server with no internet: run `bash make-paste.sh`, then paste the whole of
 `paste-to-server.txt` into the server's terminal. Replace `| bash` on its first line
 with `| sudo bash` if you are not root.
 
+## Fix and tune
+
+The audit above only reads. `linux-host-fix.sh` is a separate file that can also change things:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ashahmohammadi/linux-host-audit/main/linux-host-fix.sh | sudo bash -s -- --list
+```
+
+Save it first for the menus, because they need the terminal:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/ashahmohammadi/linux-host-audit/main/linux-host-fix.sh && sudo bash linux-host-fix.sh
+```
+
+Every fix shows the exact cause, the plan and the risk, and asks first. It backs up what it changes,
+tests the result, and rolls back if the problem stays or anything else stopped running. Changes that
+could lock you out undo themselves unless you confirm from a new session. `--undo RUN` reverses any fix.
+
+It never reboots, never deletes sites, uploads or databases, never reruns one-shot jobs, never starts a
+service that is switched off, and never edits an app config by guessing. Failing disks, signs of a
+break-in and major upgrades get exact steps instead of an automatic change.
+
+`--tune` shows how full every limit is and what real load asks for. `--tune-apply N` applies one piece
+of advice. A service running for less than a day gets numbers, but no advice.
+
 ## What it covers
 
 Overview, problems with fixes, applications (found by port, service and process, so unknown apps
 appear too), ports and firewall, Docker, Podman, LXD, Incus, Proxmox, libvirt, Kubernetes (k8s, k3s,
 k0s, RKE2, MicroK8s, OpenShift), websites, domains and SSL, databases and caches, security, logs,
 scheduled jobs, backups, a live monitor, and a guided tour.
+
+Tuning has its own rules for MySQL, MariaDB, PostgreSQL, Redis, Valkey, Memcached, MongoDB,
+Elasticsearch, OpenSearch, Nginx, Apache, LiteSpeed, HAProxy, Varnish, PHP-FPM, Tomcat, containers,
+Kubernetes and the Linux kernel. Any other program with an open port still gets its open file, thread
+and memory numbers.
 
 `--help` lists every view. `--check` prints one status line and exits 0, 1 or 2 for cron or monitoring.
 
@@ -67,3 +97,5 @@ contract: other tools can act on them without reading the English text, so never
 ## Tests
 
 `bash tests/run.sh` runs simulated servers with fake `docker`, `kubectl`, `ss` and other tools.
+`tests/fix-real.sh` breaks a throwaway machine on purpose and fixes it. Never run it on a real server.
+CI runs both, plus old and new distros, and real databases and web servers across versions.

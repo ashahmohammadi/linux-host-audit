@@ -81,7 +81,7 @@ jobs:
           - { image: 'redis:7', env: 'X=1', expect: 'Redis 7', value: 'maxclients' }
           - { image: 'valkey/valkey:8', env: 'X=1', expect: 'Valkey 8', value: 'maxclients' }
           - { image: 'mongo:6', env: 'X=1', expect: 'MongoDB 6', value: 'wiredTigerCacheSizeGB' }
-          - { image: 'mongo:8', env: 'X=1', expect: 'MongoDB 8', value: 'maxIncomingConnections' }
+          - { image: 'mongo:7', env: 'X=1', expect: 'MongoDB 7', value: 'maxIncomingConnections' }
           - { image: 'nginx:1.27', env: 'X=1', expect: 'Nginx 1.27', value: 'worker_connections' }
           - { image: 'httpd:2.4', env: 'X=1', expect: 'Apache 2.4', value: 'MaxRequestWorkers' }
           - { image: 'php:8.3-fpm', env: 'X=1', expect: 'PHP-FPM pools', value: 'www (dynamic)' }

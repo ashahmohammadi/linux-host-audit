@@ -83,6 +83,8 @@ EOF
 systemctl daemon-reload
 systemctl enable lha-flaky 2>/dev/null
 systemctl start lha-flaky 2>/dev/null
+# start returns before the service runs, so let it really fail before making it fixable.
+sleep 2
 touch /run/lha-ok
 fresh
 check 'failure is detected' "fix_find service-failed:lha-flaky.service"
@@ -133,6 +135,7 @@ ExecStart=/bin/sh -c 'test -f /run/lha-off-ok && exec sleep 600'
 EOF
 systemctl daemon-reload
 systemctl start lha-off 2>/dev/null
+sleep 2
 touch /run/lha-off-ok
 fresh
 out=$(fx_transaction service-failed lha-off.service 2>&1); status=$?
