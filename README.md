@@ -102,6 +102,11 @@ contract: other tools can act on them without reading the English text, so never
 - Without root, some sections are partial, and the report says so.
 - Pending updates are not checked on dnf and yum, because those tools write to their logs.
 - Database details need passwordless local access. It never asks for a password.
+- `--errors` hides values next to words such as `password`, but a secret with no such word can still
+  print, so read that view before you share it.
+- It only talks to services on this machine. For MongoDB it runs `mongosh` with `DO_NOT_TRACK=1`, but
+  that this stops all of its telemetry is not proven, so block its outbound traffic if that matters.
+- Reading a local metrics page can show up in that service's own access log.
 - `kubectl` keeps its own small cache in `~/.kube`, which is the one write this tool can cause.
 - Some tools are left out on purpose, because they write or log something: `rabbitmqctl`, `nodetool`,
   `gluster` and `ceph`. Those services show what their own metrics page or state files say.

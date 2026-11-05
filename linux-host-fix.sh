@@ -3785,7 +3785,7 @@ tune_tomcat() {
     if [[ -n $pid ]]; then
         busy=$(awk '/^Threads:/ { print $2 }' "/proc/$pid/status" 2>/dev/null)
         # Only the heap flag is taken from the command line. Arguments can hold passwords.
-        heap=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep '^-Xmx' | head -n 1)
+        heap=$(proc_heap "$pid")
     fi
     tune_row "$group" maxThreads "$threads" "${busy:-0} JVM threads in all" 0 '' ''
     tune_row "$group" 'JVM heap' "${heap:-default}" 'set with -Xmx' 0 '' ''
@@ -3938,24 +3938,10 @@ tune_keepalived() {
     tune_note "$group" "This node holds $held of its $total virtual addresses now. Keepalived has no capacity limit to read."
 }
 
+# Asking Squid's manager page writes a line to its own access log, so this tool does not ask.
 tune_squid() {
-    local out port max now up group=Squid version rec='' why='' mem
     [[ -n $(sig_list RUNNING '^Squid') ]] || return 0
-    port=$(port_of squid)
-    if has curl; then out=$(tune_fetch "http://127.0.0.1:${port:-3128}/squid-internal-mgr/info"); fi
-    if [[ -z ${out:-} ]]; then tune_note "$group" 'Its manager page did not answer from this machine, so limits were not read.'; return 0; fi
-    version=$(sed -n 's/.*Squid Object Cache: Version \([0-9.]*\).*/\1/p' <<< "$out" | head -n 1)
-    [[ -z $version ]] || group="Squid $version"
-    max=$(awk -F ':' '/Maximum number of file descriptors/ { gsub(/[^0-9]/, "", $2); print $2; exit }' <<< "$out")
-    now=$(awk -F ':' '/Number of file desc currently in use/ { gsub(/[^0-9]/, "", $2); print $2; exit }' <<< "$out")
-    up=$(awk -F ':' '/UP Time/ { sub(/\..*/, "", $2); gsub(/[^0-9]/, "", $2); print $2; exit }' <<< "$out")
-    tune_too_young "$group" "${up:-0}"
-    if [[ $max =~ ^[1-9][0-9]*$ && $now =~ ^[0-9]+$ ]]; then
-        if ((${up:-0} >= TUNE_MATURE && now * 100 / max >= 70)); then rec=$((max * 2)) why="$now of $max file handles are in use."; fi
-        tune_row "$group" max_filedescriptors "$max" "$now open" "$(tune_pct "$now" "$max")" "$rec" "$why" 'restart'
-    fi
-    mem=$(awk -F ':' '/Storage Mem capacity/ { sub(/%.*/, "", $2); gsub(/[^0-9.]/, "", $2); printf "%d", $2; exit }' <<< "$out")
-    if [[ $mem =~ ^[0-9]+$ ]]; then tune_row "$group" cache_mem 'config' "$mem% used" "$mem" '' ''; fi
+    tune_note Squid 'Its manager page would write to its own log, so it is not read. See its open files in the list of programs below.'
 }
 
 # Caddy and Traefik: Go programs with their numbers on a metrics page, if that page is on.
@@ -4027,6 +4013,13 @@ tune_workers() {
 }
 
 # One flag of a process, without reading the rest: arguments can hold passwords.
+# The -Xmx value, if it really is a size. Command lines are untrusted, and can hold secrets.
+proc_heap() {
+    local value
+    value=$(proc_flag "/proc/$1/cmdline" -Xmx)
+    if [[ $value =~ ^[0-9]+[kKmMgGtT]?$ ]]; then printf '%s' "$value"; fi
+}
+
 proc_flag() {
     local arg found=''
     while IFS= read -r -d '' arg; do
@@ -4057,7 +4050,7 @@ tune_jvm() {
         ((shown += 1))
         runtime_role "/proc/$pid/cmdline"
         name=${REPLY:-java}
-        heap=$(proc_flag "/proc/$pid/cmdline" -Xmx)
+        heap=$(proc_heap "$pid")
         bytes=$(size_bytes "$heap")
         tune_row 'JVM services' "$name (pid $pid) heap" "${heap:-JVM default}" "$(human_kb "$rss") in RAM" "$(tune_pct "$((rss * 1024))" "$bytes")" '' ''
         case $name in
