@@ -125,7 +125,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Simulated servers, panels and version rules
-        run: bash tests/run.sh
+        run: docker run --rm -v "$PWD:/w" -w /w debian:12 bash tests/run.sh
 
   version-rules:
     runs-on: ubuntu-latest

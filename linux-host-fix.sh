@@ -3222,7 +3222,7 @@ panel_backup_state() {
     local R=$LHA_ROOT
     case $PANEL in
         cpanel)
-            if grep -qE "^BACKUPENABLE:[[:space:]]*['\"]?yes" "$R/var/cpanel/backups/config" 2>/dev/null; then printf on
+            if grep -qE "^BACKUPENABLE: *['\"]?yes" "$R/var/cpanel/backups/config" 2>/dev/null; then printf on
             elif [[ -r $R/var/cpanel/backups/config ]]; then printf off
             else printf none
             fi ;;
