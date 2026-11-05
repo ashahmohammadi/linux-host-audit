@@ -12,6 +12,9 @@ Linux Host Fix: finds the exact cause of each problem, and fixes what is safe to
   bash linux-host-fix.sh --fix-all         Offer every automatic fix, one by one
   bash linux-host-fix.sh --tune            Tuning advice from real load, numbered
   bash linux-host-fix.sh --tune-apply N    Apply one piece of advice, after asking you
+  bash linux-host-fix.sh --trends-on       Start recording history, a light sample every 5 minutes
+  bash linux-host-fix.sh --trends-off      Stop recording, and keep the data
+  bash linux-host-fix.sh --trends [week]   Show history: day, week or month
   bash linux-host-fix.sh --undo RUN        Reverse a past fix
   bash linux-host-fix.sh --history         List past fixes
 
@@ -114,6 +117,10 @@ fix_main() {
             else fix_usage
             fi ;;
         --help|-h) fix_usage ;;
+        --record) trend_record ;;
+        --trends) view_trends "${value:-week}" ;;
+        --trends-on) run_checks; FX_SELF=$(readlink -f "$0" 2>/dev/null); fx_transaction trends-on '' ;;
+        --trends-off) run_checks; fx_transaction trends-off '' ;;
         --tune) tune_list ;;
         --tune-apply) run_checks; fx_transaction tune-apply "$value" ;;
         --list) fix_list ;;

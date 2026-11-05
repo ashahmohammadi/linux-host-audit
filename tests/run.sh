@@ -121,6 +121,23 @@ has_text "$out" 'limited user: run with sudo'
 has_text "$out" 'Firewall: unknown (needs root)'
 uid=0
 
+# Trends: ten days of made-up history with a known answer. Disk grows 1% a day, from 50 to 60.
+trend=$fake/history
+mkdir -p "$trend"
+now=$(date +%s)
+for ((d = 10; d >= 0; d--)); do
+    for h in 0 6 12 18; do
+        t=$((now - d * 86400 + h * 3600 - 86400))
+        printf '%s,%s,0.5,40,0,%s,12,3,4,0\n' "$t" "$((h == 12 && d == 3 ? 90 : 10))" "$((60 - d))"
+    done
+done > "$trend/2026-01.csv"
+out=$(LHA_TREND_DIR=$trend SCENARIO=clean LHA_TEST_PATH=$fake NO_COLOR=1 bash "$script" --trends month 2>&1)
+has_text "$out" 'Trends: last 30 days'
+has_text "$out" 'peak 90%'
+has_text "$out" 'fills in about 40 days'
+out=$(LHA_TREND_DIR=$fake/empty SCENARIO=clean LHA_TEST_PATH=$fake NO_COLOR=1 bash "$script" --trends 2>&1)
+has_text "$out" 'Nothing has been recorded yet'
+
 scenario=bare kcfg=
 out=$(audit --report)
 has_text "$out" 'No container engine or VM platform found'

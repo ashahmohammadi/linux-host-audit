@@ -4,7 +4,7 @@
 # Never prints passwords, process arguments, container environments or Kubernetes secrets.
 # Bash 3.2+ on any Linux. Missing tools only hide the part of the report that needs them.
 
-LHA_VERSION=3.4.0
+LHA_VERSION=3.5.0
 
 section() { title "$1"; }
 has() { type -P "$1" >/dev/null 2>&1; }
@@ -3676,6 +3676,96 @@ view_tune() {
     tip 'nginx -T' 'the full nginx config as loaded'
 }
 
+# ---------------------------------------------------------------------------
+# Trends: what the fixer recorded over time. This part only reads those files.
+# Columns: time, cpu, load, ram, swap, fullest disk, connections, php workers, db connections, oom kills
+# ---------------------------------------------------------------------------
+TREND_DIR=${LHA_TREND_DIR:-/var/lib/linux-host-audit/history}
+
+trend_read() { cat "$TREND_DIR"/*.csv 2>/dev/null | awk -F ',' -v from="$1" 'NF == 10 && $1 >= from'; }
+
+# One metric: sparkline, then now, average, peak. Prints nothing if the column never had a value.
+trend_line() {
+    local label=$1 column=$2 unit=$3 limit=$4 data=$5 stats peak_at text
+    local width=44
+    stats=$(awk -F ',' -v c="$column" -v w="$width" -v limit="$limit" -v glyphs="${blocks[1]} ${blocks[2]} ${blocks[3]} ${blocks[4]} ${blocks[5]} ${blocks[6]} ${blocks[7]} ${blocks[8]}" '
+        BEGIN { split(glyphs, g, " ") }
+        { v[NR] = $c + 0; t[NR] = $1; s += $c; if (NR == 1 || $c + 0 > p) { p = $c + 0; pt = $1 } }
+        END {
+            if (NR == 0 || p == 0) exit
+            top = (limit > 0 ? limit : p)
+            n = (NR < w ? NR : w)
+            line = ""
+            for (i = 1; i <= n; i++) {
+                a = int((i - 1) * NR / n) + 1; b = int(i * NR / n); sum = 0
+                for (j = a; j <= b; j++) sum += v[j]
+                level = int(sum / (b - a + 1) * 8 / top + 0.999)
+                if (level < 1) level = 1
+                if (level > 8) level = 8
+                line = line g[level]
+            }
+            printf "%s\t%g\t%.1f\t%g\t%d\n", line, v[NR], s / NR, p, pt
+        }' <<< "$data")
+    [[ -n $stats ]] || return 0
+    IFS=$'\t' read -r text now avg peak peak_at <<< "$stats"
+    printf '  %-12s %s%s%s\n' "$label" "$c_cyan" "$text" "$c_off"
+    printf '  %-12s %snow %s%s  average %s%s  peak %s%s at %s%s\n' '' "$c_dim" "$now" "$unit" "$avg" "$unit" "$peak" "$unit" \
+        "$(date -d "@$peak_at" '+%b %d %H:%M' 2>/dev/null || printf '%s' "$peak_at")" "$c_off"
+}
+
+view_trends() {
+    local window=${1:-week} seconds label data count first last days fill oom hour offset
+    case $window in
+        day) seconds=86400 label='last 24 hours' ;;
+        month) seconds=2592000 label='last 30 days' ;;
+        *) seconds=604800 label='last 7 days' ;;
+    esac
+    title "Trends: $label" 'Recorded here every few minutes, so this shows peaks a single look would miss.'
+    data=$(trend_read "$(($(date +%s) - seconds))")
+    count=$(awk 'END { print NR }' <<< "$data")
+    if [[ -z $data ]]; then
+        printf '  Nothing has been recorded yet. Recording is off until you turn it on:\n'
+        tip 'sudo bash linux-host-fix.sh --trends-on' 'one light sample every 5 minutes'
+        return 0
+    fi
+    first=$(head -n 1 <<< "$data" | cut -d, -f1)
+    last=$(tail -n 1 <<< "$data" | cut -d, -f1)
+    kv Samples "$count, over $(human_age "$((last - first))")"
+    printf '\n'
+    trend_line CPU 2 % 100 "$data"
+    trend_line 'Load' 3 '' 0 "$data"
+    trend_line RAM 4 % 100 "$data"
+    trend_line Swap 5 % 100 "$data"
+    trend_line 'Fullest disk' 6 % 100 "$data"
+    trend_line Connections 7 '' 0 "$data"
+    trend_line 'PHP workers' 8 '' 0 "$data"
+    trend_line 'DB clients' 9 '' 0 "$data"
+
+    sub 'What the history says'
+    # A straight line through disk use. Needs two days, or a burst would look like a trend.
+    if ((last - first >= 172800)); then
+        days=$(awk -F ',' '{ x = ($1 - f) / 86400; if (NR == 1) { f = $1; x = 0 } sx += x; sy += $6; sxx += x * x; sxy += x * $6; y = $6 }
+            END { d = NR * sxx - sx * sx; if (d <= 0) exit; m = (NR * sxy - sx * sy) / d
+                  if (m < 0.05) print "flat"; else printf "%.0f %.2f\n", (100 - y) / m, m }' <<< "$data")
+        if [[ $days == flat ]]; then
+            printf '  Disk use is steady.\n'
+        elif [[ -n $days ]]; then
+            read -r fill days <<< "$days"
+            printf '  %s%s At this rate the fullest disk fills in about %s days (%s%% a day).%s\n' "$c_yel" "$g_warn" "$fill" "$days" "$c_off"
+        fi
+    else
+        printf '  Two days of samples are needed before forecasting disk use.\n'
+    fi
+    oom=$(awk -F ',' 'NR > 1 && $10 > p { n += $10 - p } { p = $10 } END { print n + 0 }' <<< "$data")
+    if ((oom > 0)); then printf '  %s%s The kernel killed %s processes for memory in this period.%s\n' "$c_red" "$g_crit" "$oom" "$c_off"; fi
+    # Hours in local time, so the busy hour matches the clock on the wall.
+    offset=$(date +%z)
+    offset=$(((10#${offset:1:2} * 3600 + 10#${offset:3:2} * 60) * (${offset:0:1}1)))
+    hour=$(awk -F ',' -v o="$offset" '{ h = int((($1 + o) % 86400) / 3600); s[h] += $2; n[h]++ }
+        END { for (h in s) if (s[h] / n[h] > b) { b = s[h] / n[h]; w = h } if (b > 0) printf "%02d:00, CPU averaging %.0f%%", w, b }' <<< "$data")
+    [[ -z $hour ]] || printf '  Busiest hour: %s.\n' "$hour"
+}
+
 view_resources_full() {
     view_resources
     metric_inventory
@@ -3772,6 +3862,9 @@ menu_page_monitor() {
     local i text
     menu_add tool 'Overview' 'what this server is, and its health' 'THE SERVER' view_overview
     menu_add tool 'Live monitor' 'CPU, RAM, disk, network charts' '' monitor
+    menu_add tool 'Trends: last 24 hours' 'peaks and history' '' view_trends:day
+    menu_add tool 'Trends: last 7 days' 'with a disk forecast' '' view_trends:week
+    menu_add tool 'Trends: last 30 days' '' '' view_trends:month
     menu_state 'resources|disk'
     menu_add "$REPLY" 'CPU, RAM and disk' "CPU $R_CPU%, RAM $R_MEM_PCT%" '' view_resources_full
 
@@ -3953,6 +4046,7 @@ tui_main() (
             page:*) page=${action#page:} choice=0 ;;
             monitor) (tui_inherited=yes; monitor_main) ;;
             view_tune_one:*) tui_report view_tune_one "${action#*:}" ;;
+            view_trends:*) tui_report view_trends "${action#*:}" ;;
             run:*) tui_direct "${action#run:}" ;;
             *) tui_report "$action" ;;
         esac
@@ -4273,6 +4367,7 @@ Views (each prints and exits):
   --jobs         Cron, timers, backups, monitoring
   --resources    CPU, RAM, disk, top processes
   --tune         How full each database and web server limit is, with advice from real load
+  --trends [day|week|month]  Recorded history, peaks and a disk forecast
   --learn        Guided tour and glossary
   --report       All of the above
   --json         Findings and server facts for scripts, with stable finding ids
@@ -4331,6 +4426,7 @@ main() {
     fi
     need_awk || return 3
     case ${1:-} in
+        --trends) ;;
         --menu|--monitor|--metrics|--overview|--problems|--apps|--network|--containers|--docker|--k8s|\
         --web|--db|--security|--logs|--jobs|--resources|--tune|--learn|--report|--check|--json)
             if (($# != 1)); then printf 'Unexpected arguments for %s\n' "$1" >&2; return 2; fi ;;
@@ -4352,6 +4448,7 @@ main() {
         --jobs) one_view view_jobs ;;
         --resources) one_view view_resources ;;
         --tune) one_view view_tune ;;
+        --trends) ui_colors; view_trends "${2:-week}" ;;
         --learn) one_view view_learn ;;
         --report) one_view view_report ;;
         --json) NO_COLOR=1 one_view view_json ;;
