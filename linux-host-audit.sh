@@ -4,7 +4,7 @@
 # Never prints passwords, process arguments, container environments or Kubernetes secrets.
 # Bash 3.2+ on any Linux. Missing tools only hide the part of the report that needs them.
 
-LHA_VERSION=3.0.0
+LHA_VERSION=3.1.0
 
 section() { title "$1"; }
 has() { type -P "$1" >/dev/null 2>&1; }
@@ -1057,6 +1057,11 @@ ui_colors() {
         c_red=$'\033[91m' c_yel=$'\033[93m' c_grn=$'\033[92m' c_dim=$'\033[90m'
         c_bold=$'\033[1m' c_cyan=$'\033[96m' c_off=$'\033[0m'
     fi
+    if [[ -z ${glyph_mode:-} ]]; then
+        glyph_mode=ascii
+        if [[ -t 1 && ${LHA_LOCALE:-} == *[Uu][Tt][Ff]* ]]; then glyph_mode=utf8; fi
+    fi
+    glyph_set
 }
 
 # Container, log and event text is attacker-influenced: strip terminal control bytes.
@@ -1070,11 +1075,18 @@ run_t() {
 }
 
 title() {
-    printf '\n%s== %s ==%s\n' "$c_bold$c_cyan" "$1" "$c_off"
+    local rule=$((72 - ${#1}))
+    if [[ $glyph_mode == utf8 ]]; then
+        ((rule > 0)) || rule=1
+        printf -v rule '%*s' "$rule" ''
+        printf '\n%s%s%s %s %s%s%s\n' "$c_dim" "$g_h$g_h" "$c_off$c_bold$c_cyan" "$1" "$c_off$c_dim" "${rule// /$g_h}" "$c_off"
+    else
+        printf '\n%s== %s ==%s\n' "$c_bold$c_cyan" "$1" "$c_off"
+    fi
     [[ -z ${2:-} ]] || printf '%s%s%s\n' "$c_dim" "$2" "$c_off"
 }
 sub() { printf '\n%s%s%s\n' "$c_bold" "$1" "$c_off"; }
-kv() { printf '  %-14s %s\n' "$1" "$2"; }
+kv() { printf '  %s%-14s%s %s\n' "$c_dim" "$1" "$c_off" "$2"; }
 indent() { sed 's/^/  /'; }
 tips_begin() { printf '\n%sLearn it: run these yourself (read-only)%s\n' "$c_bold" "$c_off"; }
 tip() { printf '  %s$ %s%s  %s# %s%s\n' "$c_grn" "$1" "$c_off" "$c_dim" "$2" "$c_off"; }
@@ -1108,6 +1120,15 @@ finding() {
 }
 
 badge() {
+    if [[ $glyph_mode == utf8 ]]; then
+        case $1 in
+            CRIT) printf '%s%s CRIT%s' "$c_red$c_bold" "$g_crit" "$c_off" ;;
+            WARN) printf '%s%s WARN%s' "$c_yel$c_bold" "$g_warn" "$c_off" ;;
+            OK) printf '%s%s OK%s  ' "$c_grn$c_bold" "$g_ok" "$c_off" ;;
+            *) printf '%s%s INFO%s' "$c_cyan" "$g_tool" "$c_off" ;;
+        esac
+        return 0
+    fi
     case $1 in
         CRIT) printf '%s[CRIT]%s' "$c_red$c_bold" "$c_off" ;;
         WARN) printf '%s[WARN]%s' "$c_yel$c_bold" "$c_off" ;;
@@ -1226,6 +1247,7 @@ check_host() {
     if has timedatectl; then
         H_NTP=$(run_t 3 timedatectl show -p NTPSynchronized --value 2>/dev/null) || H_NTP=
     fi
+    check_eol
     if [[ $H_NTP == no ]]; then
         finding WARN host 'Server clock is not synchronized' \
             'TLS, logins, logs and clusters all break in odd ways when clocks drift.' 'timedatectl status'
@@ -1233,6 +1255,43 @@ check_host() {
     if ((LHA_UID != 0)); then
         finding INFO host 'Running without root, so this report is partial' \
             'Process owners, firewall rules, certificates and some logs stay hidden.' 'sudo bash linux-host-audit.sh'
+    fi
+}
+
+# Last month of free security updates. Newer or unlisted systems simply show nothing.
+check_eol() {
+    local id='' version='' line
+    H_EOL=
+    [[ -r /etc/os-release ]] || return 0
+    while IFS= read -r line; do
+        case $line in
+            ID=*) id=${line#ID=} id=${id//\"/} ;;
+            VERSION_ID=*) version=${line#VERSION_ID=} version=${version//\"/} ;;
+        esac
+    done < /etc/os-release
+    case $id:${version%%.*} in
+        almalinux:8|rocky:8|ol:8|rhel:8|cloudlinux:8) H_EOL=2029-03 ;;
+        almalinux:9|rocky:9|ol:9|rhel:9|cloudlinux:9) H_EOL=2032-05 ;;
+        centos:6) H_EOL=2020-11 ;;
+        centos:7|rhel:7|cloudlinux:7) H_EOL=2024-06 ;;
+        centos:8) H_EOL=2021-12 ;;
+        debian:8) H_EOL=2020-06 ;;
+        debian:9) H_EOL=2022-06 ;;
+        debian:10) H_EOL=2024-06 ;;
+        debian:11) H_EOL=2026-08 ;;
+        debian:12) H_EOL=2028-06 ;;
+    esac
+    case $id:$version in
+        ubuntu:14.04*) H_EOL=2019-04 ;;
+        ubuntu:16.04*) H_EOL=2021-04 ;;
+        ubuntu:18.04*) H_EOL=2023-05 ;;
+        ubuntu:20.04*) H_EOL=2025-05 ;;
+        ubuntu:22.04*) H_EOL=2027-04 ;;
+        ubuntu:24.04*) H_EOL=2029-04 ;;
+    esac
+    if [[ -n $H_EOL && $H_EOL < $(date +%Y-%m) ]]; then
+        finding WARN security "$H_OS no longer gets free security updates" \
+            "Standard support ended in $H_EOL, so new holes stay open. Plan an upgrade." 'cat /etc/os-release'
     fi
 }
 
@@ -1341,9 +1400,16 @@ check_resources() {
     fi
 
     R_OOM=$(awk '$1 == "oom_kill" { print $2 }' /proc/vmstat 2>/dev/null)
-    if [[ ${R_OOM:-0} =~ ^[1-9] ]]; then
-        finding WARN resources "The kernel killed processes $R_OOM times for lack of memory since boot" \
-            'A service may have died silently. Look for which one.' 'journalctl -k | grep -i "out of memory"'
+    # smartctl -H only asks the drive for its verdict.
+    if has smartctl && ((LHA_UID == 0)) && [[ -z $H_CONTAINER ]]; then
+        for mnt in /dev/sd[a-z] /dev/nvme[0-9]n1; do
+            [[ -b $mnt ]] || continue
+            line=$(run_t 8 smartctl -H "$mnt" 2>/dev/null)
+            if [[ $line == *FAILED* ]]; then
+                finding CRIT disk "Drive $mnt reports that it is failing" \
+                    'SMART predicts failure. Copy your data off and replace the drive.' "smartctl -a $mnt"
+            fi
+        done
     fi
     if [[ -r /proc/sys/fs/file-nr ]]; then
         read -r key rest value < /proc/sys/fs/file-nr
@@ -1386,6 +1452,10 @@ view_resources() {
         ps -eo pcpu=,pmem=,user=,comm= --sort=-pcpu 2>/dev/null | head -n 8 | clean | indent
         sub 'Top processes by memory'
         ps -eo pmem=,pcpu=,user=,comm= --sort=-pmem 2>/dev/null | head -n 8 | clean | indent
+    fi
+    if [[ -d /var/log ]]; then
+        sub 'Biggest log files'
+        ls -lS /var/log 2>/dev/null | clean | awk '$1 ~ /^-/ && n++ < 5 { printf "  %10.1f MiB  %s\n", $5 / 1048576, $NF }'
     fi
     sub 'Problems found here'
     show_findings 'resources|disk'
@@ -1535,11 +1605,18 @@ check_network() {
     net_collect
     firewall_state
     NET_PUBLIC=0 NET_TOTAL=0
+    local unknown=0
     while read -r proto port scope addr proc pid; do
         [[ -n $proto ]] || continue
         ((NET_TOTAL += 1))
         [[ $scope == public ]] || continue
         ((NET_PUBLIC += 1))
+        port_name "$port"
+        if [[ -z $REPLY ]] && ((port < 32768)) && ((unknown < 5)); then
+            ((unknown += 1))
+            finding INFO network "Port $port/$proto is open to the world: $proc" \
+                'This tool does not recognize it. Make sure you know why it is open.' "ss -lntup | grep :$port"
+        fi
         case $port in
             2375)
                 finding CRIT security 'Docker API is open without encryption on port 2375' \
@@ -1606,7 +1683,7 @@ view_network() {
 # Services and applications
 # ---------------------------------------------------------------------------
 check_services() {
-    local unit severity
+    local unit severity reason
     SVC_FAILED= SVC_APPS=
     if [[ $systemd_visible == yes ]]; then
         SVC_FAILED=$(awk '$3 == "failed" { print $1 }' <<< "$active_units")
@@ -1625,9 +1702,45 @@ check_services() {
         case $unit in nginx*|apache2*|httpd*|sshd*|ssh.service|mysql*|mariadb*|postgresql*|docker*|kubelet*|k3s*)
             severity=CRIT ;;
         esac
+        reason=$(run_t 3 systemctl --system show -p Result -p ExecMainStatus -- "$unit" 2>/dev/null | clean | awk -F= '
+            $1 == "Result" { r = $2 }
+            $1 == "ExecMainStatus" { s = $2 }
+            END { if (r != "") { printf "%s", r; if (s + 0 != 0) printf ", exit status %s", s } }')
         finding "$severity" services "Service $unit has failed" \
-            'It crashed or could not start, and is not running now.' "journalctl -u $unit -n 50 --no-pager"
+            "It is not running. Last result: ${reason:-unknown}." "journalctl -u $unit -n 50 --no-pager"
     done <<< "$SVC_FAILED"
+}
+
+app_versions() {
+    local tool text
+    for tool in nginx httpd apache2 php mariadb mysql psql redis-server node python3 docker; do
+        has "$tool" || continue
+        # On MariaDB servers the mysql command is the same client.
+        if [[ $tool == mysql ]] && has mariadb; then continue; fi
+        case $tool in
+            nginx|httpd|apache2) text=$(run_t 3 "$tool" -v 2>&1 | head -n 1) ;;
+            php) text=$(run_t 4 php -v 2>/dev/null | head -n 1) ;;
+            *) text=$(run_t 3 "$tool" --version 2>&1 | head -n 1) ;;
+        esac
+        [[ -n $text ]] && printf '%-14s %s\n' "$tool" "$text" | clean | cut -c1-76
+    done
+}
+
+check_mail() {
+    local text
+    MAIL_QUEUE=
+    if [[ -n $(sig_list RUNNING '^Exim') ]]; then
+        if has exim; then text=exim; else text=exim4; fi
+        has "$text" && MAIL_QUEUE=$(run_t 8 "$text" -bpc 2>/dev/null | clean)
+    elif [[ -n $(sig_list RUNNING '^Postfix') ]] && has postqueue; then
+        MAIL_QUEUE=$(run_t 8 postqueue -p 2>/dev/null | awk '/^[0-9A-F]{6,}/ { n++ } END { print n + 0 }')
+    fi
+    [[ $MAIL_QUEUE =~ ^[0-9]+$ ]] || MAIL_QUEUE=
+    if [[ -n $MAIL_QUEUE ]] && ((MAIL_QUEUE >= 1000)); then
+        finding WARN services "$MAIL_QUEUE emails are stuck in the mail queue" \
+            'Mail is not leaving, or a hacked site is sending spam.' 'exim -bp | head'
+    fi
+    return 0
 }
 
 view_apps() {
@@ -1641,6 +1754,12 @@ view_apps() {
     done <<< "$sig_groups"
     list=$(sig_list 'PRESENT|TRACE' .)
     [[ -z $list ]] || { sub 'Installed but not running'; printf '  %s\n' "$list" | fold -s -w 76; }
+    line=$(app_versions)
+    [[ -z $line ]] || { sub 'Versions'; printf '%s\n' "$line" | indent; }
+    if [[ -n $MAIL_QUEUE ]]; then
+        sub 'Mail'
+        kv Queue "$MAIL_QUEUE messages waiting to be sent"
+    fi
     if [[ -n $SVC_APPS ]]; then
         sub 'All application services (system plumbing hidden)'
         printf '%s\n' "$SVC_APPS" | head -n 60 | indent
@@ -1771,6 +1890,14 @@ check_containers() {
             ((CT_N += 1))
             ((CT_TOTAL_RUN += line))
         fi
+    fi
+    if ((CT_N > 0 && LHA_UID == 0)); then
+        while read -r line; do
+            [[ -n $line ]] || continue
+            finding WARN containers "A container log has grown to $line GiB" \
+                'Without log rotation, these files quietly fill the disk.' \
+                'du -sh /var/lib/docker/containers/* | sort -h | tail'
+        done <<< "$(ls -lS /var/lib/docker/containers/*/*-json.log 2>/dev/null | awk 'n++ < 3 && $5 >= 1073741824 { printf "%.1f\n", $5 / 1073741824 }')"
     fi
     # Only ask running daemons: these clients can start a service or write first-run files.
     [[ $processes != *$'\n'lxd$'\n'* ]] || CT_PLATFORMS+=' LXD'
@@ -2298,6 +2425,13 @@ check_security() {
             for (i = 1; i <= NF; i++) if ($i == "->") n = split($(i - 1), p, "/")
             print p[3], link
         }')"
+    if [[ -z $H_CONTAINER ]]; then
+        value=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | grep -v 'rescue\|debug' | sort -V 2>/dev/null | tail -n 1)
+        if [[ -n $value && $value != "$H_KERNEL" ]]; then
+            finding WARN security "A newer kernel is installed: $value" \
+                "The server still runs $H_KERNEL, so its fixes are not active until a reboot." 'uname -r'
+        fi
+    fi
     if [[ -f /var/run/reboot-required ]]; then
         finding WARN security 'A reboot is required' 'Installed security fixes are not active until a reboot.' 'cat /var/run/reboot-required.pkgs'
     fi
@@ -2378,6 +2512,14 @@ check_logs() {
     local log count
     log=$(kernel_log | clean)
     L_OOM=$(grep -i 'out of memory\|oom-kill\|oom_reaper' <<< "$log" | tail -n 8 | cut -c1-120)
+    local victims
+    victims=$(grep -io 'killed process [0-9]* ([^)]*)' <<< "$log" | sed 's/.*(//; s/)//' | sort | uniq -c | sort -rn |
+        head -n 4 | awk '{ printf "%s%s x%s", (NR > 1 ? ", " : ""), $2, $1 }')
+    if [[ ${R_OOM:-0} =~ ^[1-9] || -n $victims ]]; then
+        finding WARN resources "The kernel killed ${R_OOM:-some} processes for lack of memory since boot" \
+            "${victims:+Killed in the last 7 days: $victims. }A service may have died silently. Add RAM or lower its memory settings." \
+            'journalctl -k | grep -i "out of memory"'
+    fi
     # Virtual floppy, CD and loop devices log I/O errors on healthy VMs, and the kernel's
     # boot command line can hold options such as nvme_core.io_timeout.
     count=$(grep -iE 'i/o error|ext4-fs error|xfs.*(corruption|error)|nvme.*(timeout|reset)|ata[0-9]+.*failed|blk_update_request' <<< "$log" |
@@ -2439,7 +2581,8 @@ view_logs() {
 # Scheduled jobs, backups and monitoring agents
 # ---------------------------------------------------------------------------
 check_jobs() {
-    local cron=''
+    local cron='' f newest age
+    J_BACKUP_AGE=
     J_BACKUP=$(sig_list 'RUNNING|PRESENT' '^(JetBackup|Acronis|Restic|BorgBackup|Duplicity|rclone|Veeam|Bacula|Proxmox Backup)')
     J_MONITOR=$(sig_list 'RUNNING' '^(Prometheus|Grafana|Netdata|Zabbix|Datadog|Telegraf|New Relic|Elastic Agent|Uptime Kuma|Glances|Nagios|Sysdig|Dynatrace)')
     J_TIMERS=
@@ -2450,6 +2593,20 @@ check_jobs() {
     # Read the spool directly: "crontab -l" writes a line to the cron log.
     cron=$(cat "/var/spool/cron/crontabs/${USER:-root}" "/var/spool/cron/${USER:-root}" 2>/dev/null | clean | awk '!/^[ \t]*(#|$)/')
     J_USER_CRON=$cron
+    for f in /backup /backups; do
+        [[ -d $f ]] || continue
+        newest=$(ls -td "$f"/* 2>/dev/null | head -n 1)
+        [[ -n $newest ]] || continue
+        age=$(stat -c %Y "$newest" 2>/dev/null)
+        [[ $age =~ ^[0-9]+$ ]] || continue
+        age=$((($(date +%s) - age) / 86400))
+        J_BACKUP_AGE="newest in $f is $age days old"
+        if ((age > 8)); then
+            finding WARN jobs "The newest backup in $f is $age days old" \
+                'Backups may have stopped. An old backup means lost work.' "ls -lt $f | head"
+        fi
+        break
+    done
     if [[ -z $J_BACKUP ]] &&
         grep -qiE 'backup|restic|borg|mysqldump|mariadb-dump|pg_dump|rsync|velero' <<< "$J_CRON"$'\n'"$cron"$'\n'"$J_TIMERS"; then
         J_BACKUP='a scheduled job mentions backups; confirm it works'
@@ -2468,6 +2625,7 @@ check_jobs() {
 view_jobs() {
     title 'Scheduled jobs, backups and monitoring' 'What runs by itself, and what protects you when things break.'
     kv Backups "${J_BACKUP:-no backup tool seen}"
+    [[ -z $J_BACKUP_AGE ]] || kv 'Backup age' "$J_BACKUP_AGE"
     kv Monitoring "${J_MONITOR:-no agent running}"
     if [[ -n $J_USER_CRON ]]; then sub 'Cron jobs of this user'; printf '%s\n' "$J_USER_CRON" | cut -c1-100 | head -n 20 | indent; fi
     if [[ -n $J_CRON ]]; then sub 'System cron jobs'; printf '%s\n' "$J_CRON" | cut -c1-100 | head -n 25 | indent; fi
@@ -2540,6 +2698,7 @@ run_checks() {
     check_resources
     progress 'services'
     check_services
+    check_mail
     progress 'ports and firewall'
     check_network
     progress 'containers'
@@ -2570,14 +2729,39 @@ verdict() {
 }
 
 meter() {
-    local value=$1 width=20 fill color=$c_grn bar
-    if ((value < 0)); then printf '%20s  --' ''; return 0; fi
+    local value=$1 width=24 fill color=$c_grn bar rest
+    if ((value < 0)); then printf '%24s  --' ''; return 0; fi
     ((value <= 100)) || value=100
     fill=$((value * width / 100))
     if ((value >= 90)); then color=$c_red; elif ((value >= 75)); then color=$c_yel; fi
     printf -v bar '%*s' "$fill" ''
-    bar=${bar// /#}
-    printf '%s%-20s%s %3d%%' "$color" "$bar" "$c_off" "$value"
+    printf -v rest '%*s' "$((width - fill))" ''
+    printf '%s%s%s%s%s%s %3d%%' "$color" "${bar// /$g_full}" "$c_off" "$c_dim" "${rest// /$g_empty}" "$c_off" "$value"
+}
+
+# One glance at every area: icon, then name.
+scorecard() {
+    local item area name count=0 icon color
+    for item in 'resources:CPU and RAM' 'disk:Disks' 'services:Services' 'network:Network' 'security:Security' \
+        'containers:Containers' 'kubernetes:Kubernetes' 'web:Websites' 'data:Databases' 'jobs:Backups, jobs'; do
+        area=${item%%:*} name=${item#*:}
+        case $area in
+            containers) ((CT_N > 0)) || continue ;;
+            kubernetes) [[ $K_ON == yes ]] || continue ;;
+            web) [[ -n $W_DOMAINS || -n $W_CERTS ]] || continue ;;
+            data) [[ -n $DB_ROWS ]] || continue ;;
+        esac
+        menu_state "$area"
+        case $REPLY in
+            crit) icon=$g_crit color=$c_red ;;
+            warn) icon=$g_warn color=$c_yel ;;
+            *) icon=$g_ok color=$c_grn ;;
+        esac
+        printf '  %s%s%s %-13s' "$color" "$icon" "$c_off" "$name"
+        ((count += 1))
+        ((count % 4)) || printf '\n'
+    done
+    ((count % 4 == 0)) || printf '\n'
 }
 
 role_guess() {
@@ -2599,12 +2783,12 @@ role_guess() {
 
 view_overview() {
     local mnt use size free group list i line place proto port scope addr proc pid
-    printf '%sLINUX SERVER OVERVIEW%s  %s  %s\n' "$c_bold$c_cyan" "$c_off" "${H_NAME:-unknown}" "${H_TIME:-}"
+    printf '%sLINUX SERVER OVERVIEW%s  %s  %s%s%s\n' "$c_bold$c_cyan" "$c_off" "${H_NAME:-unknown}" "$c_dim" "${H_TIME:-}" "$c_off"
     title 'What this server is'
     place=$H_VIRT
     [[ -z $H_PLACE ]] || place+=", $H_PLACE"
     [[ -z $H_CONTAINER ]] || place="inside a $H_CONTAINER container"
-    kv System "$H_OS"
+    kv System "$H_OS${H_EOL:+, security updates until $H_EOL}"
     kv Kernel "$H_KERNEL ($H_ARCH), started by $H_INIT"
     kv Machine "$place"
     kv Hardware "$H_CPUS CPU cores${H_MODEL:+ ($H_MODEL)}, $(human_kb "$R_MEM_TOTAL") RAM"
@@ -2615,6 +2799,8 @@ view_overview() {
 
     title 'Health right now'
     printf '  %s\n\n' "$(verdict)"
+    scorecard
+    printf '\n'
     printf '  %-14s %s  %s\n' CPU "$(meter "$R_CPU")" "load $R_LOAD1"
     printf '  %-14s %s  %s\n' RAM "$(meter "$R_MEM_PCT")" "$(human_kb "$R_MEM_AVAIL") available"
     if ((R_SWAP_TOTAL > 0)); then
@@ -2915,9 +3101,12 @@ tui_main() (
 )
 
 tui_report() {
+    local charset=ascii
+    # With LC_ALL=C, less would show Unicode as <E2><96> unless told otherwise.
+    [[ $glyph_mode != utf8 ]] || charset=utf-8
     printf '\033[H\033[J' >&9
     if has less; then
-        ( "$@" ) 2>&1 | LESS= less -FRX '-PsSpace = next page, q = back to the menu' >&9
+        ( "$@" ) 2>&1 | LESSCHARSET=$charset LESS= less -FRX '-PsSpace = next page, q = back to the menu' >&9
     else
         ( "$@" ) >&9 2>&1
     fi
@@ -2962,7 +3151,12 @@ tui_glyphs() {
         else glyph_mode=ascii
         fi
     fi
+    glyph_set
+}
+
+glyph_set() {
     if [[ $glyph_mode == utf8 ]]; then
+        g_full=$'\xe2\x96\x88' g_empty=$'\xe2\x96\x91'
         g_h=$'\xe2\x94\x80' g_v=$'\xe2\x94\x82' g_tl=$'\xe2\x95\xad' g_tr=$'\xe2\x95\xae'
         g_bl=$'\xe2\x95\xb0' g_br=$'\xe2\x95\xaf'
         g_ok=$'\xe2\x97\x8f' g_warn=$'\xe2\x96\xb2' g_crit=$'\xe2\x96\xa0'
@@ -2970,6 +3164,7 @@ tui_glyphs() {
         blocks=(' ' $'\xe2\x96\x81' $'\xe2\x96\x82' $'\xe2\x96\x83' $'\xe2\x96\x84'
             $'\xe2\x96\x85' $'\xe2\x96\x86' $'\xe2\x96\x87' $'\xe2\x96\x88')
     else
+        g_full='#' g_empty=' '
         g_h=- g_v='|' g_tl=+ g_tr=+ g_bl=+ g_br=+
         g_ok='*' g_warn='!' g_crit=X g_none=- g_tool='>'
         blocks=(' ' . . : : '=' '=' '#' '#')
@@ -3111,15 +3306,16 @@ chart_pair() {
 }
 
 monitor_frame() {
-    local term_rows term_cols width pane_width chart_height pane line text
+    local term_rows term_cols width pane_width chart_height pane line text procs=0
     local -a chart_rows
     tui_size
+    ((term_rows < 36)) || procs=7
     width=$term_cols
     ((width <= 170)) || width=170
     printf ' %s%s%s  %s%s%s\n' "$bold$accent" 'LIVE SERVER MONITOR' "$reset" "$dim" "${H_NAME:-}  $activity" "$reset"
     if ((term_cols >= 60 && term_rows >= 14)); then
         pane_width=$(((width - 3) / 2))
-        chart_height=$(((term_rows - 8) / 2))
+        chart_height=$(((term_rows - 8 - procs) / 2))
         ((chart_height <= 16)) || chart_height=16
         chart_pair cpu ram
         chart_pair disk net
@@ -3133,6 +3329,10 @@ monitor_frame() {
     else
         printf ' CPU %s%%  RAM %s%%\n Make the window larger to see charts.\n' "$cpu_pct" "$ram_pct"
     fi
+    if ((procs > 0)) && [[ -n $top_list ]]; then
+        printf ' %s%6s %6s  %-12s %s%s\n' "$bold" 'CPU%' 'MEM%' USER PROCESS "$reset"
+        printf '%s\n' "$top_list" | awk -v w="$((width - 1))" '{ printf " %6s %6s  %-12.12s %s\n", $1, $2, $3, $4 }'
+    fi
     text="Load $load_now   Busiest: ${top_now:-unknown}"
     printf ' %.*s\n' "$((width - 1))" "$text"
     text="Disk: ${metrics_disk_scope:-unknown}   Network: ${metrics_net_scope:-unknown}"
@@ -3143,7 +3343,7 @@ monitor_frame() {
 monitor_main() (
     local key activity=LIVE paused=no rc frame accent secondary dim bold reset selected
     local cpu_pct=-1 ram_pct=-1 disk_read=-1 disk_write=-1 net_rx=-1 net_tx=-1
-    local metrics_disk_scope metrics_net_scope load_now top_now
+    local metrics_disk_scope metrics_net_scope load_now top_now top_list
     local -a cpu_history=() ram_history=() disk_r_history=() disk_w_history=() net_r_history=() net_t_history=()
     tui_open || return 1
     tui_style
@@ -3152,7 +3352,8 @@ monitor_main() (
         if [[ $paused == no ]]; then
             metrics_snapshot
             load_now=$(cut -d ' ' -f 1-3 /proc/loadavg 2>/dev/null)
-            top_now=$(ps -eo comm=,pcpu= --sort=-pcpu 2>/dev/null | head -n 1 | clean | awk '{ print $1, $2 "%" }')
+            top_list=$(ps -eo pcpu=,pmem=,user=,comm= --sort=-pcpu 2>/dev/null | head -n 5 | clean)
+            top_now=$(awk 'NR == 1 { print $4, $1 "%" }' <<< "$top_list")
             if (( ${#cpu_history[@]} >= 180 )); then
                 cpu_history=("${cpu_history[@]:1}"); ram_history=("${ram_history[@]:1}")
                 disk_r_history=("${disk_r_history[@]:1}"); disk_w_history=("${disk_w_history[@]:1}")
