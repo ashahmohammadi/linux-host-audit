@@ -4,7 +4,7 @@
 # Never prints passwords, process arguments, container environments or Kubernetes secrets.
 # Bash 3.2+ on any Linux. Missing tools only hide the part of the report that needs them.
 
-LHA_VERSION=3.2.0
+LHA_VERSION=3.3.0
 
 section() { title "$1"; }
 has() { type -P "$1" >/dev/null 2>&1; }
@@ -2877,6 +2877,7 @@ view_report() {
     view_kube
     view_web
     view_data
+    view_tune
     view_security
     view_jobs
     view_logs
@@ -3014,6 +3015,666 @@ view_json() {
     printf ']}\n'
 }
 
+# ---------------------------------------------------------------------------
+# Tuning and capacity: what each limit is, how full it is, and what real load asks for.
+# Read-only. Recommendations come from the service's own counters, never from a size table,
+# and a young service gets none: a restart leaves its counters too thin to judge.
+# ---------------------------------------------------------------------------
+TUNE_MATURE=${LHA_TUNE_MATURE:-86400}
+
+# group|setting|now|used|percent full|recommended|why|how to apply
+tune_row() { TUNE_ROWS+="$1|$2|$3|$4|$5|$6|$7|${8:-}"$'\n'; }
+tune_note() { TUNE_NOTES+="$1|$2"$'\n'; }
+tune_budget() { TUNE_BUDGET+="$1|$2"$'\n'; }
+tune_get() { awk -F '\t' -v k="$2" '$1 == k { print $2; found = 1; exit } END { if (!found) print 0 }' <<< "$1"; }
+tune_size() { human_kb "$((${1:-0} / 1024))"; }
+tune_pct() { if ((${2:-0} > 0)); then printf '%d' "$((${1:-0} * 100 / $2))"; else printf 0; fi; }
+
+# Real memory of a few processes, in KiB. RSS counts shared pages once per process, which
+# overstates forked workers badly, so use PSS and fall back to RSS on old kernels.
+tune_real_kb() {
+    local pid sum=0 count=0 value
+    for pid in "$@"; do
+        value=$(awk '/^Pss:/ { print $2; exit }' "/proc/$pid/smaps_rollup" 2>/dev/null)
+        [[ -n $value ]] || value=$(awk '/^VmRSS:/ { print $2; exit }' "/proc/$pid/status" 2>/dev/null)
+        [[ $value =~ ^[0-9]+$ ]] || continue
+        ((sum += value))
+        ((count += 1))
+    done
+    if ((count > 0)); then printf '%d' "$((sum / count))"; else printf 0; fi
+}
+tune_round() { local unit=134217728; printf '%d' "$((($1 + unit - 1) / unit * unit))"; }
+
+tune_mysql() {
+    local client=mysql vars status label version group mature=no
+    local max used pool total free fill reads reqs hit up rate data rec why eff tmp disk size files opened now conn created
+    [[ -n $(sig_list RUNNING '^(MariaDB server|MySQL-compatible)') ]] || return 0
+    has mysql || client=mariadb
+    has "$client" || return 0
+    vars=$(run_t 8 "$client" --connect-timeout=3 -NBe 'SHOW GLOBAL VARIABLES' 2>/dev/null)
+    status=$(run_t 8 "$client" --connect-timeout=3 -NBe 'SHOW GLOBAL STATUS' 2>/dev/null)
+    if [[ -z $vars || -z $status ]]; then
+        tune_note MySQL 'It needs a password here, so its limits could not be read.'
+        return 0
+    fi
+    version=$(tune_get "$vars" version)
+    label=MySQL
+    [[ $version != *MariaDB* ]] || label=MariaDB
+    group="$label ${version%%-*}"
+    up=$(tune_get "$status" Uptime)
+    ((up < TUNE_MATURE)) || mature=yes
+    [[ $mature == yes ]] || tune_note "$group" "Running for only $(human_age "$up"). Numbers are shown, but no advice until it has a full day of traffic."
+
+    max=$(tune_get "$vars" max_connections)
+    used=$(tune_get "$status" Max_used_connections)
+    now=$(tune_get "$status" Threads_connected)
+    rec='' why=''
+    if [[ $mature == yes ]] && ((max > 0)); then
+        if (($(tune_get "$status" Connection_errors_max_connections) > 0)) || ((used * 100 / max >= 85)); then
+            rec=$((used * 130 / 100 + 10)) why="Peak was $used of $max, so clients are close to being refused."
+        elif ((max > 200 && used * 100 / max <= 20)); then
+            rec=$((used * 2 > 100 ? used * 2 : 100)) why="Peak was only $used. A high limit reserves no memory, but allows a memory spike."
+        fi
+    fi
+    tune_row "$group" max_connections "$max" "$now now, peak $used" "$(tune_pct "$used" "$max")" "$rec" "$why" 'live'
+
+    pool=$(tune_get "$vars" innodb_buffer_pool_size)
+    total=$(tune_get "$status" Innodb_buffer_pool_pages_total)
+    free=$(tune_get "$status" Innodb_buffer_pool_pages_free)
+    reads=$(tune_get "$status" Innodb_buffer_pool_reads)
+    reqs=$(tune_get "$status" Innodb_buffer_pool_read_requests)
+    fill=$(tune_pct "$((total - free))" "$total")
+    hit=$(awk -v r="$reads" -v q="$reqs" 'BEGIN { if (q > 0) printf "%.2f", 100 - 100 * r / q; else print "0" }')
+    rec='' why=''
+    if [[ $mature == yes ]] && ((total > 0)); then
+        if ((fill >= 95)) && [[ $(awk -v h="$hit" 'BEGIN { print (h < 99) }') == 1 ]]; then
+            rec=$((pool * 3 / 2))
+            ((rec <= R_MEM_TOTAL * 512)) || rec=$((R_MEM_TOTAL * 512))
+            rec=$(tune_round "$rec")
+            if ((rec > pool)); then why="Pool is full and only $hit% of reads come from memory."; else rec=''; fi
+        elif ((fill <= 50 && pool > 1073741824)); then
+            rec=$(tune_round "$(((total - free) * pool / total * 13 / 10))")
+            why="Only $fill% is used after $(human_age "$up"). The rest could serve other programs."
+        fi
+    fi
+    tune_row "$group" innodb_buffer_pool_size "$(tune_size "$pool")" "$fill% full, $hit% read hits" "$fill" "${rec:+$(tune_size "$rec")}" "$why" 'live'
+    [[ -z $rec ]] || TUNE_APPLY+="mysql innodb_buffer_pool_size $rec"$'\n'
+
+    tmp=$(tune_get "$status" Created_tmp_tables)
+    disk=$(tune_get "$status" Created_tmp_disk_tables)
+    eff=$(tune_get "$vars" tmp_table_size)
+    size=$(tune_get "$vars" max_heap_table_size)
+    ((size >= eff)) || eff=$size
+    rec='' why=''
+    if [[ $mature == yes ]] && ((tmp > 1000 && disk * 100 / tmp >= 25 && eff < 268435456)); then
+        rec=$((eff * 2 > 268435456 ? 268435456 : eff * 2))
+        why="$(tune_pct "$disk" "$tmp")% of temporary tables spill to disk. Also check missing indexes. Set max_heap_table_size to match."
+    fi
+    tune_row "$group" tmp_table_size "$(tune_size "$eff")" "$(tune_pct "$disk" "$tmp")% went to disk" "$(tune_pct "$disk" "$tmp")" "${rec:+$(tune_size "$rec")}" "$why" 'live'
+
+    size=$(tune_get "$vars" table_open_cache)
+    now=$(tune_get "$status" Open_tables)
+    opened=$(tune_get "$status" Opened_tables)
+    rec='' why=''
+    if [[ $mature == yes ]] && ((up > 0 && size > 0 && now * 100 / size >= 95 && opened / up >= 1)); then
+        rec=$((size * 3 / 2)) why="Cache is full, and tables are reopened $((opened / up)) times a second."
+    fi
+    tune_row "$group" table_open_cache "$size" "$now open" "$(tune_pct "$now" "$size")" "$rec" "$why" 'live'
+
+    size=$(tune_get "$vars" thread_cache_size)
+    created=$(tune_get "$status" Threads_created)
+    conn=$(tune_get "$status" Connections)
+    rec='' why=''
+    if [[ $mature == yes ]] && ((conn > 1000 && created * 100 / conn >= 10)); then
+        rec=$((size * 2 > 16 ? size * 2 : 16)) ; ((rec <= 100)) || rec=100
+        why="$(tune_pct "$created" "$conn")% of connections had to create a new thread."
+    fi
+    tune_row "$group" thread_cache_size "$size" "$created created" "$(tune_pct "$created" "$conn")" "$rec" "$why" 'live'
+
+    if [[ $(tune_get "$vars" query_cache_type) == ON ]] && (($(tune_get "$vars" query_cache_size) > 0)); then
+        tune_row "$group" query_cache_type ON 'in use' 0 OFF 'It takes a global lock on every write, and slows busy servers. Vendors advise against it.' 'live'
+    fi
+
+    size=$(tune_get "$vars" innodb_log_file_size)
+    files=$(tune_get "$vars" innodb_log_files_in_group)
+    ((files > 0)) || files=1
+    local log_name=innodb_log_file_size capacity
+    capacity=$(tune_get "$vars" innodb_redo_log_capacity)
+    if ((capacity > 0)); then log_name=innodb_redo_log_capacity size=$capacity files=1; fi
+    rate=0
+    ((up == 0)) || rate=$(($(tune_get "$status" Innodb_os_log_written) * 3600 / up))
+    rec='' why=''
+    if [[ $mature == yes ]] && ((rate > size * files)); then
+        rec=$(tune_round "$((rate > 4294967296 ? 4294967296 : rate))")
+        why="$(tune_size "$rate") of redo log is written each hour. Too small a log causes write stalls."
+    fi
+    if ((size > 0)); then
+        tune_row "$group" "$log_name" "$(tune_size "$((size * files))")" "$(tune_size "$rate") per hour" "$(tune_pct "$rate" "$((size * files))")" "${rec:+$(tune_size "$rec")}" "$why" 'restart'
+    fi
+
+    now=$(tune_get "$status" Slow_queries)
+    if ((up > 0)); then
+        tune_note "$group" "$(($(tune_get "$status" Questions) / up)) queries a second on average, $now slow queries in $(human_age "$up")."
+    fi
+    tune_budget "$label" "$((pool + $(tune_get "$vars" key_buffer_size) + max * ($(tune_get "$vars" sort_buffer_size) + $(tune_get "$vars" join_buffer_size) + $(tune_get "$vars" read_buffer_size) + $(tune_get "$vars" read_rnd_buffer_size) + $(tune_get "$vars" thread_stack))))"
+}
+
+tune_postgres() {
+    local out group max now shared hit rec why ram=$((R_MEM_TOTAL * 1024)) temp work
+    [[ -n $(sig_list RUNNING '^PostgreSQL server') ]] || return 0
+    # setpriv changes user with no login session, so nothing lands in the auth log.
+    if ((LHA_UID != 0)) || ! has setpriv || ! has psql; then
+        tune_note PostgreSQL 'Details need root and the setpriv tool.'
+        return 0
+    fi
+    out=$(run_t 8 setpriv --reuid=postgres --regid=postgres --clear-groups psql -w -AtF $'\t' -c "
+        select name, setting from pg_settings where name in ('max_connections','shared_buffers','effective_cache_size','work_mem','server_version_num','block_size')
+        union all select 'backends', sum(numbackends)::text from pg_stat_database
+        union all select 'hit', round(100.0 * sum(blks_hit) / nullif(sum(blks_hit + blks_read), 0), 2)::text from pg_stat_database
+        union all select 'temp_files', sum(temp_files)::text from pg_stat_database
+        union all select 'uptime', extract(epoch from now() - pg_postmaster_start_time())::bigint::text" 2>/dev/null)
+    if [[ -z $out ]]; then tune_note PostgreSQL 'Its limits could not be read.'; return 0; fi
+    group="PostgreSQL $(($(tune_get "$out" server_version_num) / 10000))"
+    max=$(tune_get "$out" max_connections)
+    now=$(tune_get "$out" backends)
+    shared=$(($(tune_get "$out" shared_buffers) * $(tune_get "$out" block_size)))
+    hit=$(tune_get "$out" hit)
+    rec='' why=''
+    if (($(tune_get "$out" uptime) >= TUNE_MATURE)); then
+        if ((now * 100 / max >= 85)); then rec=$((max * 3 / 2)) why='Near the limit. A pooler such as PgBouncer is usually better than a higher number.'; fi
+    else
+        tune_note "$group" 'Running for less than a day, so no advice yet.'
+    fi
+    tune_row "$group" max_connections "$max" "$now now" "$(tune_pct "$now" "$max")" "$rec" "$why" 'restart'
+    rec='' why=''
+    if (($(tune_get "$out" uptime) >= TUNE_MATURE)) && [[ $(awk -v h="$hit" 'BEGIN { print (h + 0 < 99) }') == 1 ]] && ((shared < ram / 4)); then
+        rec=$(tune_round "$((ram / 4))") why="Only $hit% of reads come from memory, and the buffer is under a quarter of RAM."
+    fi
+    tune_row "$group" shared_buffers "$(tune_size "$shared")" "$hit% read hits" "$(tune_pct "$shared" "$ram")" "${rec:+$(tune_size "$rec")}" "$why" 'restart'
+    work=$(($(tune_get "$out" work_mem) * 1024))
+    temp=$(tune_get "$out" temp_files)
+    tune_row "$group" work_mem "$(tune_size "$work")" "$temp temp files so far" 0 '' ''
+    tune_budget PostgreSQL "$((shared + max * work))"
+}
+
+tune_redis() {
+    local name=$1 cli=$2 info conf max used clients limit evicted hits misses frag rec why group
+    has "$cli" || return 0
+    info=$(run_t 5 "$cli" -h 127.0.0.1 info 2>/dev/null | tr -d '\r' | tr ':' '\t')
+    if [[ -z $info || $info == *NOAUTH* ]]; then tune_note "$name" 'It needs a password, so its limits could not be read.'; return 0; fi
+    group="$name $(tune_get "$info" redis_version)"
+    max=$(tune_get "$info" maxmemory)
+    used=$(tune_get "$info" used_memory)
+    evicted=$(tune_get "$info" evicted_keys)
+    hits=$(tune_get "$info" keyspace_hits)
+    misses=$(tune_get "$info" keyspace_misses)
+    frag=$(tune_get "$info" mem_fragmentation_ratio)
+    rec='' why=''
+    if ((max == 0)); then
+        rec=$(tune_round "$((used * 2))")
+        why='No limit is set, so it can grow until the kernel kills something. Also pick a maxmemory-policy.'
+    elif ((used * 100 / max >= 90 && evicted > 0)); then
+        rec=$(tune_round "$((max * 3 / 2))") why="It is full, and has evicted $evicted keys."
+    fi
+    tune_row "$group" maxmemory "$( ((max == 0)) && printf unlimited || tune_size "$max")" "$(tune_size "$used") used" "$(tune_pct "$used" "$max")" "${rec:+$(tune_size "$rec")}" "$why" 'live'
+    conf=$(run_t 5 "$cli" -h 127.0.0.1 config get maxclients 2>/dev/null | tail -n 1 | tr -d '\r')
+    clients=$(tune_get "$info" connected_clients)
+    if [[ $conf =~ ^[0-9]+$ ]]; then tune_row "$group" maxclients "$conf" "$clients now" "$(tune_pct "$clients" "$conf")" '' ''; fi
+    tune_note "$group" "$(tune_pct "$hits" "$((hits + misses))")% cache hit rate, $evicted keys evicted, memory fragmentation $frag."
+    if ((max > 0)); then tune_budget "$name" "$max"; else tune_budget "$name" "$used"; fi
+}
+
+tune_memcached() {
+    local stats max used conn
+    [[ -n $(sig_list RUNNING '^Memcached') ]] && has nc || return 0
+    stats=$(printf 'stats\r\nquit\r\n' | timeout 3 nc -w 2 127.0.0.1 11211 2>/dev/null | tr -d '\r' | awk '{ print $2 "\t" $3 }')
+    [[ -n $stats ]] || return 0
+    max=$(tune_get "$stats" limit_maxbytes)
+    used=$(tune_get "$stats" bytes)
+    conn=$(tune_get "$stats" curr_connections)
+    tune_row "Memcached $(tune_get "$stats" version)" memory "$(tune_size "$max")" "$(tune_size "$used") used, $(tune_get "$stats" evictions) evicted" "$(tune_pct "$used" "$max")" '' ''
+    tune_row "Memcached $(tune_get "$stats" version)" connections "$(tune_get "$stats" max_connections)" "$conn now" "$(tune_pct "$conn" "$(tune_get "$stats" max_connections)")" '' ''
+    tune_budget Memcached "$max"
+}
+
+# Established clients on a port list, using only the kernel's own table.
+tune_connections() { run_t 5 ss -Htn state established "$1" 2>/dev/null | wc -l | tr -d ' '; }
+
+tune_nginx() {
+    local conf=/etc/nginx/nginx.conf procs conns cap wp wc rec why group nofile pid busy
+    [[ -n $(sig_list RUNNING '^(Nginx|OpenResty|Tengine)') ]] && has nginx || return 0
+    [[ -r $conf ]] || conf=/usr/local/nginx/conf/nginx.conf
+    [[ -r $conf ]] || return 0
+    group="Nginx $(run_t 3 nginx -v 2>&1 | sed 's/.*nginx\///; s/ .*//')"
+    wp=$(awk '!/^[ \t]*#/ && $1 == "worker_processes" { gsub(/;/, "", $2); print $2; exit }' "$conf")
+    wc=$(awk '!/^[ \t]*#/ && $1 == "worker_connections" { gsub(/;/, "", $2); print $2; exit }' "$conf")
+    wc=${wc:-512}
+    procs=$(ps -eo args= 2>/dev/null | grep -c '^nginx: worker process')
+    rec='' why=''
+    busy=$(ps -eo pcpu=,args= 2>/dev/null | awk '$2 == "nginx:" && $3 == "worker" { s += $1 } END { printf "%d", s }')
+    # More workers only help if the ones it has are really busy.
+    if [[ $wp =~ ^[0-9]+$ ]] && ((wp < H_CPUS && procs > 0 && busy / procs >= 50)); then
+        rec=auto why="Workers average $((busy / procs))% CPU, and there are $H_CPUS cores."
+    fi
+    tune_row "$group" worker_processes "${wp:-1}" "$procs running" "$(tune_pct "$procs" "$H_CPUS")" "$rec" "$why" 'reload'
+    conns=$(tune_connections '( sport = :80 or sport = :443 )')
+    cap=$((procs * wc))
+    rec='' why=''
+    if ((cap > 0 && conns * 100 / cap >= 60)); then
+        rec=$((wc * 2)) why="$conns open connections of $cap possible. A proxied request uses two."
+    fi
+    tune_row "$group" worker_connections "$wc" "$conns connections now" "$(tune_pct "$conns" "$cap")" "$rec" "$why" 'reload'
+    # Workers carry worker_rlimit_nofile. The master keeps the limit it started with.
+    pid=$(ps -eo pid=,args= 2>/dev/null | awk '$2 == "nginx:" && $3 == "worker" { print $1; exit }')
+    if [[ $pid =~ ^[0-9]+$ ]]; then
+        nofile=$(awk '/^Max open files/ { print $4 }' "/proc/$pid/limits" 2>/dev/null)
+        if [[ $nofile =~ ^[0-9]+$ ]] && ((nofile < wc * 2)); then
+            tune_row "$group" worker_rlimit_nofile "$nofile" 'open file limit' 0 "$((wc * 2))" 'Each connection needs a file handle, and a proxied one needs two.' 'reload'
+        fi
+    fi
+}
+
+tune_apache() {
+    local bin mpm max threads procs conns reached file rec why group logs=0 real
+    [[ -n $(sig_list RUNNING '^Apache HTTP') ]] || return 0
+    if has httpd; then bin=httpd; else bin=apache2; fi
+    has "$bin" || return 0
+    group="Apache $(run_t 3 "$bin" -v 2>/dev/null | sed -n 's/.*Apache\/\([0-9.]*\).*/\1/p')"
+    mpm=$(run_t 3 "$bin" -V 2>/dev/null | awk -F ': *' '/Server MPM/ { print tolower($2) }')
+    max=$(cat /etc/apache2/conf/httpd.conf /etc/apache2/conf.d/*.conf /etc/httpd/conf/httpd.conf /etc/httpd/conf.modules.d/*.conf \
+        /etc/apache2/mods-enabled/mpm_*.conf 2>/dev/null | awk 'tolower($1) ~ /^(maxrequestworkers|maxclients)$/ { v = $2 } END { print v }')
+    threads=$(cat /etc/apache2/conf/httpd.conf /etc/httpd/conf/httpd.conf /etc/apache2/mods-enabled/mpm_*.conf 2>/dev/null |
+        awk 'tolower($1) == "threadsperchild" { v = $2 } END { print v }')
+    threads=${threads:-25}
+    if [[ -z $max ]]; then
+        if [[ $mpm == prefork ]]; then max=256; else max=400; fi
+        tune_note "$group" "MaxRequestWorkers is not set, so the $mpm default of $max applies."
+    fi
+    procs=$(ps -eo comm= 2>/dev/null | grep -cE '^(httpd|apache2)$')
+    for file in /var/log/apache2/error.log /var/log/httpd/error_log /etc/apache2/logs/error_log /usr/local/apache/logs/error_log; do
+        [[ -r $file ]] || continue
+        logs=1
+        reached=$(tail -n 50000 "$file" | grep -c 'reached MaxRequestWorkers\|reached MaxClients')
+        break
+    done
+    rec='' why=''
+    if ((${reached:-0} > 0)); then
+        rec=$((max * 3 / 2)) why="The error log shows the limit was hit $reached times, so visitors waited."
+    fi
+    if [[ $mpm == prefork ]]; then
+        tune_row "$group ($mpm)" MaxRequestWorkers "$max" "$((procs > 0 ? procs - 1 : 0)) workers now" "$(tune_pct "$((procs > 0 ? procs - 1 : 0))" "$max")" "$rec" "$why" 'reload'
+    else
+        tune_row "$group (${mpm:-unknown})" MaxRequestWorkers "$max" "$procs processes, $threads threads each" "$(tune_pct "$((procs * threads))" "$max")" "$rec" "$why" 'reload'
+    fi
+    ((logs == 1)) || tune_note "$group" 'Its error log was not found, so limit hits could not be counted.'
+    # shellcheck disable=SC2046 # pids are split on purpose
+    real=$(tune_real_kb $(ps -eo pid=,comm= 2>/dev/null | awk '$2 == "httpd" || $2 == "apache2" { print $1 }' | tail -n 5))
+    if [[ $mpm == prefork ]]; then tune_budget Apache "$((real * 1024 * max))"
+    else tune_budget Apache "$((real * 1024 * (max / threads + 1)))"
+    fi
+}
+
+# PHP-FPM is judged per pool, from each pool's file, its workers, and its own limit-hit lines.
+tune_phpfpm() {
+    local pools workers logs line pool pm max count rss reached rec why total_run=0 shown=0 avg file real budget=0 measured=' ' pids
+    [[ -n $(sig_list RUNNING '^PHP-FPM') ]] || return 0
+    workers=$(ps -eo pid=,rss=,args= 2>/dev/null | awk '$3 == "php-fpm:" && $4 == "pool" { print }')
+    pools=$(cat /etc/php-fpm.d/*.conf /etc/php/*/fpm/pool.d/*.conf /usr/local/etc/php-fpm.d/*.conf /opt/cpanel/ea-php*/root/etc/php-fpm.d/*.conf \
+        /opt/plesk/php/*/etc/php-fpm.d/*.conf /www/server/php/*/etc/php-fpm.conf 2>/dev/null | clean | awk '
+        function flush() { if (name != "" && name != "global") print name, (pm == "" ? "?" : pm), (max == "" ? 0 : max) }
+        /^[ \t]*\[.*\]/ { flush(); name = $0; gsub(/[][ \t]/, "", name); pm = ""; max = ""; next }
+        /^[ \t]*pm[ \t]*=/ { pm = $NF }
+        /^[ \t]*pm\.max_children[ \t]*=/ { max = $NF }
+        /^[ \t]*"?pm_max_children/ { max = $NF }
+        END { flush() }')
+    for file in /var/log/php-fpm/*.log /var/log/php*-fpm.log /opt/cpanel/ea-php*/root/usr/var/log/php-fpm.log; do
+        [[ -r $file ]] && logs+=$(tail -n 20000 "$file" | grep 'reached pm.max_children\|max_children setting')$'\n'
+    done
+    while read -r count rss pool; do
+        [[ -n $pool ]] || continue
+        line=$(awk -v p="$pool" '$1 == p { print $2, $3; exit }' <<< "$pools")
+        pm=${line%% *} max=${line##* }
+        [[ $max =~ ^[0-9]+$ ]] || max=0
+        pids=$(awk -v p="$pool" '$5 == p { print $1 }' <<< "$workers" | head -n 4)
+        # shellcheck disable=SC2086 # pids are split on purpose
+        real=$(tune_real_kb $pids)
+        ((real > 0)) || real=$rss
+        rss=$real
+        ((budget += max * rss * 1024))
+        ((total_run += count))
+        measured+="$pool "
+        ((shown < 8)) || continue
+        ((shown += 1))
+        reached=$(grep -cF "[pool $pool]" <<< "$logs")
+        rec='' why=''
+        if ((reached > 0 && max > 0)); then
+            rec=$((max * 3 / 2))
+            why="Its log shows the limit was hit $reached times. Each worker uses about $(human_kb "$rss")."
+        fi
+        tune_row 'PHP-FPM pools' "${pool:0:30} ($pm)" "$max" "$count workers, $(human_kb "$rss") each" "$(tune_pct "$count" "$max")" "$rec" "$why" 'reload'
+        if [[ -z $rec ]] && ((max > 0 && count * 100 / max >= 90)); then
+            tune_note 'PHP-FPM pools' "$pool is close to its limit, with no limit hits logged yet. Watch it at peak traffic."
+        fi
+    done <<< "$(awk '{ n[$5]++; m[$5] += $2 } END { for (p in n) print n[p], int(m[p] / n[p]), p }' <<< "$workers" | sort -rn)"
+    # Idle ondemand pools have no worker to measure, so they count at the average of the busy ones.
+    avg=0
+    ((total_run == 0)) || avg=$(awk '{ s += $2; n++ } END { if (n) printf "%d", s / n }' <<< "$workers")
+    while read -r pool pm max; do
+        [[ -n $pool && $max =~ ^[0-9]+$ && $measured != *" $pool "* ]] || continue
+        ((budget += max * avg * 1024))
+    done <<< "$pools"
+    ((budget == 0)) || tune_budget 'PHP-FPM' "$budget"
+    if [[ -z $pools ]] && ((total_run > 0)); then tune_note 'PHP-FPM pools' 'Pool limits were not found in the usual folders.'; fi
+}
+
+tune_elastic() {
+    local name=$1 row heap_pct heap_max ram_max disk rec why ver group
+    [[ -n $(sig_list RUNNING "^$name") ]] && has curl || return 0
+    ver=$(run_t 5 curl -s -m 3 http://127.0.0.1:9200/ 2>/dev/null | clean | sed -n 's/.*"number" *: *"\([0-9.]*\)".*/\1/p' | head -n 1)
+    if [[ -z $ver ]]; then tune_note "$name" 'It needs a password, so its limits could not be read.'; return 0; fi
+    group="$name $ver"
+    while read -r row heap_pct heap_max ram_max disk; do
+        [[ $heap_max =~ ^[0-9]+$ ]] || continue
+        rec='' why=''
+        if ((heap_max > 33285996544)); then rec=31g why='Above about 31 GiB, the JVM loses compressed pointers and gets less usable heap.'
+        elif ((heap_max * 2 > ram_max + ram_max / 10)); then rec=$(tune_size "$((ram_max / 2))") why='Heap should leave half of RAM to the file cache.'
+        elif ((heap_pct >= 85)); then rec=$(tune_size "$((heap_max * 3 / 2))") why="Heap is $heap_pct% full, so long garbage collection pauses are likely."
+        fi
+        tune_row "$group" "heap $row" "$(tune_size "$heap_max")" "$heap_pct% used" "$heap_pct" "$rec" "$why" 'restart'
+        tune_row "$group" "disk $row" "$disk%" 'watermark at 85%' "${disk%%.*}" '' ''
+        tune_budget "$name" "$heap_max"
+    done <<< "$(run_t 5 curl -s -m 3 'http://127.0.0.1:9200/_cat/nodes?h=name,heap.percent,heap.max,ram.max,disk.used_percent&bytes=b' 2>/dev/null | clean)"
+}
+
+tune_mongo() {
+    local client=mongosh out cache used conn avail ver group rec why
+    [[ -n $(sig_list RUNNING '^MongoDB') ]] || return 0
+    has mongosh || client=mongo
+    has "$client" || return 0
+    out=$(run_t 8 "$client" --quiet --eval 'var s = db.serverStatus(), c = s.wiredTiger.cache;
+        print("version\t" + s.version); print("cache\t" + c["maximum bytes configured"]);
+        print("used\t" + c["bytes currently in the cache"]); print("conn\t" + s.connections.current);
+        print("avail\t" + s.connections.available);' 2>/dev/null | clean)
+    if [[ -z $out || $out == *rror* ]]; then tune_note MongoDB 'It needs a login, so its limits could not be read.'; return 0; fi
+    group="MongoDB $(tune_get "$out" version)"
+    cache=$(tune_get "$out" cache)
+    used=$(tune_get "$out" used)
+    conn=$(tune_get "$out" conn)
+    avail=$(tune_get "$out" avail)
+    rec='' why=''
+    if ((cache > 0 && used * 100 / cache >= 95)); then rec=$(tune_round "$((cache * 3 / 2))") why='The WiredTiger cache is full. Check it stays within RAM.'; fi
+    tune_row "$group" wiredTigerCacheSizeGB "$(tune_size "$cache")" "$(tune_size "$used") used" "$(tune_pct "$used" "$cache")" "${rec:+$(tune_size "$rec")}" "$why" 'restart'
+    tune_row "$group" maxIncomingConnections "$((conn + avail))" "$conn now" "$(tune_pct "$conn" "$((conn + avail))")" '' ''
+    tune_budget MongoDB "$cache"
+}
+
+tune_haproxy() {
+    local sock out max now group rec why
+    [[ -n $(sig_list RUNNING '^HAProxy') ]] && has socat || return 0
+    for sock in /run/haproxy/admin.sock /var/run/haproxy.sock /var/lib/haproxy/stats /run/haproxy.sock; do
+        [[ -S $sock ]] || continue
+        out=$(printf 'show info\n' | timeout 3 socat - "UNIX-CONNECT:$sock" 2>/dev/null | tr -d '\r' | sed 's/: /\t/')
+        break
+    done
+    if [[ -z ${out:-} ]]; then tune_note HAProxy 'No stats socket was found, so live numbers are missing.'; return 0; fi
+    group="HAProxy $(tune_get "$out" Version)"
+    max=$(tune_get "$out" Maxconn)
+    now=$(tune_get "$out" CurrConns)
+    rec='' why=''
+    if ((max > 0 && now * 100 / max >= 80)); then rec=$((max * 3 / 2)) why="$now of $max connections are in use."; fi
+    tune_row "$group" maxconn "$max" "$now now" "$(tune_pct "$now" "$max")" "$rec" "$why" 'reload'
+}
+
+tune_varnish() {
+    local stats used free nuked hit miss group rec why
+    [[ -n $(sig_list RUNNING '^Varnish') ]] && has varnishstat || return 0
+    stats=$(run_t 5 varnishstat -1 2>/dev/null | awk '{ print $1 "\t" $2 }')
+    [[ -n $stats ]] || return 0
+    group="Varnish $(run_t 3 varnishd -V 2>&1 | sed -n 's/.*varnish-\([0-9.]*\).*/\1/p' | head -n 1)"
+    used=$(tune_get "$stats" SMA.s0.g_bytes)
+    free=$(tune_get "$stats" SMA.s0.g_space)
+    nuked=$(tune_get "$stats" MAIN.n_lru_nuked)
+    hit=$(tune_get "$stats" MAIN.cache_hit)
+    miss=$(tune_get "$stats" MAIN.cache_miss)
+    rec='' why=''
+    if ((nuked > 0)); then rec=$(tune_round "$(((used + free) * 3 / 2))") why="$nuked objects were pushed out for lack of room."; fi
+    tune_row "$group" 'malloc storage' "$(tune_size "$((used + free))")" "$(tune_size "$used") used" "$(tune_pct "$used" "$((used + free))")" "${rec:+$(tune_size "$rec")}" "$why" 'restart'
+    tune_note "$group" "$(tune_pct "$hit" "$((hit + miss))")% cache hit rate."
+    tune_budget Varnish "$((used + free))"
+}
+
+tune_litespeed() {
+    local report max now group
+    [[ -n $(sig_list RUNNING '^(LiteSpeed server|OpenLiteSpeed)') ]] || return 0
+    report=$(cat /tmp/lshttpd/.rtreport 2>/dev/null | clean)
+    if [[ -z $report ]]; then tune_note LiteSpeed 'Its live report was not found.'; return 0; fi
+    group="LiteSpeed $(sed -n 's/^VERSION: *LiteSpeed Web Server\/[A-Za-z]*\/\([0-9.]*\).*/\1/p' <<< "$report" | head -n 1)"
+    max=$(sed -n 's/.*MAXCONN: *\([0-9]*\).*/\1/p' <<< "$report" | head -n 1)
+    now=$(sed -n 's/.*PLAINCONN: *\([0-9]*\).*/\1/p' <<< "$report" | head -n 1)
+    [[ $max =~ ^[0-9]+$ ]] && tune_row "$group" maxConnections "$max" "${now:-0} now" "$(tune_pct "${now:-0}" "$max")" '' ''
+}
+
+tune_tomcat() {
+    local file threads pid busy heap group
+    [[ -n $(sig_list RUNNING '^Apache Tomcat') ]] || return 0
+    for file in /etc/tomcat*/server.xml /opt/tomcat/conf/server.xml /usr/local/tomcat/conf/server.xml; do
+        [[ -r $file ]] && break
+    done
+    [[ -r ${file:-} ]] || return 0
+    threads=$(grep -o 'maxThreads="[0-9]*"' "$file" | head -n 1 | tr -dc 0-9)
+    threads=${threads:-200}
+    pid=$(ps -eo pid=,args= 2>/dev/null | awk '/org\.apache\.catalina/ { print $1; exit }')
+    group=Tomcat
+    busy=0
+    if [[ -n $pid ]]; then
+        busy=$(awk '/^Threads:/ { print $2 }' "/proc/$pid/status" 2>/dev/null)
+        # Only the heap flag is taken from the command line. Arguments can hold passwords.
+        heap=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep '^-Xmx' | head -n 1)
+    fi
+    tune_row "$group" maxThreads "$threads" "${busy:-0} JVM threads in all" 0 '' ''
+    tune_row "$group" 'JVM heap' "${heap:-default}" 'set with -Xmx' 0 '' ''
+}
+
+tune_containers() {
+    local line name mem used limit pct engine count=0 unlimited=0
+    ((CT_N > 0)) || return 0
+    engine=${CT_ENGINE[0]}
+    [[ $engine != crictl ]] || return 0
+    while IFS='|' read -r name pct used limit; do
+        [[ -n $name ]] || continue
+        pct=${pct%%.*} pct=${pct%\%}
+        [[ $pct =~ ^[0-9]+$ ]] || pct=0
+        if [[ $limit == "$(tune_host_limit)" ]]; then ((unlimited += 1)); continue; fi
+        ((count < 8)) || continue
+        ((count += 1))
+        tune_row Containers "$name" "$limit" "$used used" "$pct" '' ''
+    done <<< "$(run_t 10 "$engine" stats --no-stream --format '{{.Name}}|{{.MemPerc}}|{{.MemUsage}}' 2>/dev/null | clean | sed 's| / |\||' | awk -F '|' '{ print $1 "|" $2 "|" $3 "|" $4 }')"
+    if ((unlimited > 0)); then tune_note Containers "$unlimited containers have no memory limit, so one of them can starve the rest."; fi
+}
+# docker stats shows host RAM as the limit of a container that has none.
+tune_host_limit() {
+    awk -v k="$R_MEM_TOTAL" 'BEGIN { printf "%.4gGiB", k / 1048576 }'
+}
+
+tune_kube() {
+    local name cpu cpct mem mpct
+    [[ ${K_API:-no} == yes ]] || return 0
+    while read -r name cpu cpct mem mpct; do
+        [[ -n $name ]] || continue
+        tune_row Kubernetes "node $name memory" "$mem" 'in use' "${mpct%\%}" '' ''
+        tune_row Kubernetes "node $name CPU" "$cpu" 'in use' "${cpct%\%}" '' ''
+    done <<< "$(ku top nodes --no-headers | clean | head -n 12)"
+    [[ -n $TUNE_ROWS && $TUNE_ROWS == *'Kubernetes|'* ]] || tune_note Kubernetes 'Live usage needs metrics-server.'
+}
+
+tune_kernel() {
+    local group='Linux kernel' value overflows tw low high range rec why thp netstat
+    netstat=$(awk 'NR % 2 == 1 { split($0, k) } NR % 2 == 0 { n = split($0, v); for (i = 2; i <= n; i++) print k[i] "\t" v[i] }' /proc/net/netstat 2>/dev/null)
+    value=$(cat /proc/sys/net/core/somaxconn 2>/dev/null)
+    overflows=$(tune_get "$netstat" ListenOverflows)
+    if [[ $value =~ ^[0-9]+$ ]]; then
+        rec='' why=''
+        if ((overflows > 0 && value < 65535)); then
+            rec=$((value * 2 > 4096 ? value * 2 : 4096))
+            why="Listen queues overflowed $overflows times since boot, and connections were dropped. Busy services also need a matching backlog of their own."
+        fi
+        tune_row "$group" net.core.somaxconn "$value" "$overflows overflows" 0 "$rec" "$why" 'live'
+    fi
+    read -r low high < /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null
+    if [[ $low =~ ^[0-9]+$ ]] && has ss; then
+        range=$((high - low))
+        tw=$(run_t 5 ss -Htan state time-wait 2>/dev/null | wc -l | tr -d ' ')
+        rec='' why=''
+        if ((tw * 100 / range >= 70)); then rec='1024 65535' why='Outgoing ports are running out, which fails new connections to databases and backends.'; fi
+        tune_row "$group" ip_local_port_range "$low-$high" "$tw in TIME-WAIT" "$(tune_pct "$tw" "$range")" "$rec" "$why" 'live'
+    fi
+    if [[ -r /proc/sys/fs/file-nr ]]; then
+        read -r value _ high < /proc/sys/fs/file-nr
+        tune_row "$group" fs.file-max "$high" "$value open" "$(tune_pct "$value" "$high")" '' ''
+    fi
+    if [[ -r /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+        read -r high < /proc/sys/net/netfilter/nf_conntrack_max
+        read -r value < /proc/sys/net/netfilter/nf_conntrack_count
+        tune_row "$group" nf_conntrack_max "$high" "$value tracked" "$(tune_pct "$value" "$high")" '' ''
+    fi
+    value=$(cat /proc/sys/vm/swappiness 2>/dev/null)
+    if [[ $value =~ ^[0-9]+$ ]] && ((value > 10 && R_SWAP_USED > 0)) && [[ -n $(sig_list RUNNING '^(MariaDB|MySQL|PostgreSQL|MongoDB|Redis)') ]]; then
+        tune_row "$group" vm.swappiness "$value" "$(human_kb "$R_SWAP_USED") in swap" 0 10 'A database in swap is very slow. This keeps it in RAM longer.' 'live'
+    fi
+    thp=$(sed -n 's/.*\[\(.*\)\].*/\1/p' /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null)
+    if [[ $thp == always ]] && [[ -n $(sig_list RUNNING '^(Redis|Valkey|MongoDB|MariaDB|MySQL)') ]]; then
+        tune_row "$group" transparent_hugepage always 'databases running' 0 madvise 'Redis, MongoDB and MariaDB advise against this mode. It causes latency spikes.' 'live'
+    fi
+}
+
+# The layer for everything without its own rules: any program with an open port.
+tune_any_program() {
+    local pid proc fds limit threads rss pct row='' done_pids=' ' rows=''
+    while read -r _ _ _ _ proc pid; do
+        [[ $pid =~ ^[0-9]+$ && $done_pids != *" $pid "* ]] || continue
+        done_pids+="$pid "
+        [[ -r /proc/$pid/limits ]] || continue
+        limit=$(awk '/^Max open files/ { print $4 }' "/proc/$pid/limits")
+        [[ $limit =~ ^[0-9]+$ ]] || continue
+        fds=$(ls "/proc/$pid/fd" 2>/dev/null | wc -l | tr -d ' ')
+        threads=$(awk '/^Threads:/ { print $2 }' "/proc/$pid/status" 2>/dev/null)
+        rss=$(tune_real_kb "$pid")
+        rows+="$(tune_pct "$fds" "$limit") $proc $limit $fds ${threads:-0} $rss"$'\n'
+    done <<< "$NET_ROWS"
+    while read -r pct proc limit fds threads rss; do
+        [[ -n $proc ]] || continue
+        if ((pct >= 70)); then
+            tune_row 'Every program with an open port' "$proc open files" "$limit" "$fds open, $threads threads, $(human_kb "$rss")" "$pct" "$((limit * 2))" \
+                'It is near its open file limit. Reaching it makes new connections fail.' 'restart'
+        else
+            tune_row 'Every program with an open port' "$proc open files" "$limit" "$fds open, $threads threads, $(human_kb "$rss")" "$pct" '' ''
+        fi
+    done <<< "$(sort -rn <<< "$rows" | head -n 12)"
+}
+
+tune_collect() {
+    [[ ${tune_done:-no} != yes ]] || return 0
+    tune_done=yes
+    TUNE_ROWS='' TUNE_NOTES='' TUNE_BUDGET='' TUNE_APPLY=''
+    tune_mysql
+    tune_postgres
+    [[ -z $(sig_list RUNNING '^Redis server') ]] || tune_redis Redis redis-cli
+    [[ -z $(sig_list RUNNING '^Valkey server') ]] || tune_redis Valkey valkey-cli
+    tune_memcached
+    tune_mongo
+    tune_elastic Elasticsearch
+    tune_elastic OpenSearch
+    tune_nginx
+    tune_apache
+    tune_litespeed
+    tune_haproxy
+    tune_varnish
+    tune_phpfpm
+    tune_tomcat
+    tune_containers
+    tune_kube
+    tune_kernel
+    tune_any_program
+}
+
+tune_print_group() {
+    local group=$1 setting now used pct rec why how color
+    sub "$group"
+    printf '  %-28s %-12s %-30s %5s  %s\n' SETTING NOW USED FULL ADVICE
+    while IFS='|' read -r _ setting now used pct rec why how; do
+        color=$c_grn
+        if ((pct >= 90)); then color=$c_red; elif ((pct >= 75)); then color=$c_yel; fi
+        if ((pct > 100)); then pct=100; fi
+        printf '  %-28.28s %-12.12s %-30.30s %s%4s%%%s  ' "$setting" "$now" "$used" "$color" "$pct" "$c_off"
+        if [[ -n $rec ]]; then printf '%s%s%s\n' "$c_bold" "$rec" "$c_off"; else printf '%sok%s\n' "$c_dim" "$c_off"; fi
+        if [[ -n $rec ]]; then
+            printf '    %sWhy: %s%s\n' "$c_dim" "$why" "$c_off"
+            case $how in
+                live) printf '    %sCan change while running.%s\n' "$c_dim" "$c_off" ;;
+                reload) printf '    %sNeeds a config test and a reload.%s\n' "$c_dim" "$c_off" ;;
+                restart) printf '    %sNeeds a planned restart.%s\n' "$c_dim" "$c_off" ;;
+            esac
+        fi
+    done <<< "$(awk -F '|' -v g="$group" '$1 == g' <<< "$TUNE_ROWS")"
+    while IFS='|' read -r _ text; do
+        [[ -z $text ]] || printf '  %s%s%s\n' "$c_dim" "$text" "$c_off"
+    done <<< "$(awk -F '|' -v g="$group" '$1 == g' <<< "$TUNE_NOTES")"
+}
+
+view_tune_one() {
+    title 'Tuning' "$1"
+    tune_print_group "$1"
+}
+
+view_budget() {
+    tune_collect
+    title 'Memory budget' 'What every service may use at once, compared with the RAM of this server.'
+    tune_print_budget
+}
+
+tune_print_budget() {
+    local name size total=0 ram=$((R_MEM_TOTAL * 1024))
+    [[ -n $TUNE_BUDGET ]] || { printf '  No service reported memory limits.\n'; return 0; }
+    while IFS='|' read -r name size; do
+        [[ -n $name ]] || continue
+        printf '  %-22s %12s\n' "$name" "$(tune_size "$size")"
+        ((total += size))
+    done <<< "$TUNE_BUDGET"
+    printf '  %-22s %12s of %s RAM (%d%%)\n' Total "$(tune_size "$total")" "$(tune_size "$ram")" "$(tune_pct "$total" "$ram")"
+    if ((total > ram)); then
+        printf '  %s%s The limits allow more memory than this server has. Under a traffic spike, the kernel kills something.%s\n' "$c_red" "$g_warn" "$c_off"
+        printf '  %sStart with the biggest: %s. Lower its limit toward the peak you really see.%s\n' "$c_dim" \
+            "$(awk -F '|' 'NF && $2 + 0 > m + 0 { m = $2; n = $1 } END { print n }' <<< "$TUNE_BUDGET")" "$c_off"
+    else
+        printf '  %s%s The limits fit in RAM.%s\n' "$c_grn" "$g_ok" "$c_off"
+    fi
+}
+
+tune_groups() { printf '%s%s' "$TUNE_ROWS" "$TUNE_NOTES" | awk -F '|' 'NF && !seen[$1]++ { print $1 }'; }
+
+view_tune() {
+    local group count
+    tune_collect
+    title 'Tuning and capacity' 'How full every limit is right now, and what the real load asks for.'
+    kv 'Server now' "CPU $R_CPU%, load $R_LOAD1 on $H_CPUS cores, RAM $R_MEM_PCT%"
+    if [[ -z $TUNE_ROWS$TUNE_NOTES ]]; then
+        printf '\n  No database, cache or web server was found running here.\n'
+        return 0
+    fi
+    while IFS= read -r group; do
+        [[ -z $group ]] || tune_print_group "$group"
+    done <<< "$(tune_groups)"
+    sub 'Memory if everything peaks at once (estimate)'
+    tune_print_budget
+    count=$(awk -F '|' 'NF && $6 != "" { n++ } END { print n + 0 }' <<< "$TUNE_ROWS")
+    printf '\n  %s changes are advised. Take them one at a time, and watch a day of traffic between them.\n' "$count"
+    tips_begin
+    tip 'mysqltuner' 'a second opinion for MySQL, if installed'
+    tip 'SHOW GLOBAL STATUS;' 'the MySQL counters used here'
+    tip 'redis-cli info' 'the Redis counters used here'
+    tip 'nginx -T' 'the full nginx config as loaded'
+}
+
 view_resources_full() {
     view_resources
     metric_inventory
@@ -3072,7 +3733,7 @@ tui_key() {
 }
 
 tui_rescan() {
-    F_N=0 F_CRIT=0 F_WARN=0 F_INFO=0 checks_done=no
+    F_N=0 F_CRIT=0 F_WARN=0 F_INFO=0 checks_done=no tune_done=no
     run_checks
 }
 
@@ -3089,64 +3750,107 @@ menu_state() {
     done
 }
 
-# menu_add STATE LABEL [BADGE] [HEADING]. HEADING starts a new group above this item.
+# menu_add STATE LABEL BADGE HEADING ACTION. HEADING starts a new group above this item.
 menu_add() {
-    menu_states[menu_n]=$1 menu_labels[menu_n]=$2 menu_badges[menu_n]=${3:-} menu_heads[menu_n]=${4:-}
+    menu_states[menu_n]=$1 menu_labels[menu_n]=$2 menu_badges[menu_n]=${3:-} menu_heads[menu_n]=${4:-} menu_actions[menu_n]=${5:-}
     ((menu_n += 1))
 }
 
-tui_menu_items() {
-    local i text failed
-    menu_n=0
-    menu_add tool 'Overview' 'what this server is' 'START HERE'
+# First screen: what do you want to do?
+menu_page_main() {
+    local count
     menu_state '.*'
-    menu_add "$REPLY" 'Problems and what to do' "$F_CRIT critical, $F_WARN warnings"
+    menu_add tool 'Monitor' 'see what this server is doing' 'WHAT DO YOU WANT TO DO?' page:monitor
+    menu_add "$REPLY" 'Troubleshoot and debug' "$F_CRIT critical, $F_WARN warnings" '' page:debug
+    menu_add tool 'Tune' 'how full each limit is, and advice' '' page:tune
+    menu_add tool 'Full report on one page' '' 'MORE' view_report
+    menu_add tool 'Learn: guided tour and glossary' '' '' view_learn
+}
 
-    failed=$(awk 'NF { n++ } END { print n + 0 }' <<< "$SVC_FAILED")
+menu_page_monitor() {
+    local i text
+    menu_add tool 'Overview' 'what this server is, and its health' 'THE SERVER' view_overview
+    menu_add tool 'Live monitor' 'CPU, RAM, disk, network charts' '' monitor
+    menu_state 'resources|disk'
+    menu_add "$REPLY" 'CPU, RAM and disk' "CPU $R_CPU%, RAM $R_MEM_PCT%" '' view_resources_full
+
     text="$(awk 'NF { n++ } END { print n + 0 }' <<< "$SVC_APPS") services"
-    ((failed == 0)) || text+=", $failed failed"
     menu_state services
-    menu_add "$REPLY" 'Applications and services' "$text" 'WHAT RUNS HERE'
-
+    menu_add "$REPLY" 'Applications and services' "$text" 'WHAT RUNS HERE' view_apps
     if ((CT_N > 0)) || [[ -n $CT_PLATFORMS ]]; then
         text=
         for ((i = 0; i < CT_N; i++)); do text+="${CT_ENGINE[i]} ${CT_STATE[i]%%,*}  "; done
         menu_state containers
-        menu_add "$REPLY" 'Docker and containers' "$text$CT_PLATFORMS"
+        menu_add "$REPLY" 'Docker and containers' "$text$CT_PLATFORMS" '' view_containers
     else
-        menu_add none 'Docker and containers' 'not on this server'
+        menu_add none 'Docker and containers' 'not on this server' '' view_containers
     fi
     if [[ $K_API == yes ]]; then
         menu_state kubernetes
-        menu_add "$REPLY" 'Kubernetes' "$K_READY/$K_NODES nodes, $K_BAD bad pods"
+        menu_add "$REPLY" 'Kubernetes' "$K_READY/$K_NODES nodes, $K_BAD bad pods" '' view_kube
     elif [[ $K_ON == yes ]]; then
         menu_state kubernetes
-        menu_add "$REPLY" 'Kubernetes' 'found, cluster not readable here'
+        menu_add "$REPLY" 'Kubernetes' 'found, cluster not readable here' '' view_kube
     else
-        menu_add none 'Kubernetes' 'not on this server'
+        menu_add none 'Kubernetes' 'not on this server' '' view_kube
     fi
     menu_state web
-    menu_add "$REPLY" 'Websites, domains and SSL' "$W_CERT_N certificates"
+    menu_add "$REPLY" 'Websites, domains and SSL' "$W_CERT_N certificates" '' view_web
     menu_state data
-    if [[ -n $DB_ROWS ]]; then menu_add "$REPLY" 'Databases and caches'
-    else menu_add none 'Databases and caches' 'none found'
+    if [[ -n $DB_ROWS ]]; then menu_add "$REPLY" 'Databases and caches' '' '' view_data
+    else menu_add none 'Databases and caches' 'none found' '' view_data
     fi
-
     menu_state network
-    menu_add "$REPLY" 'Ports, firewall and network' "$NET_PUBLIC public ports" 'NETWORK AND SAFETY'
-    menu_state security
-    menu_add "$REPLY" 'Security'
+    menu_add "$REPLY" 'Ports and network' "$NET_PUBLIC public ports" 'NETWORK' view_network
     menu_state jobs
-    menu_add "$REPLY" 'Scheduled jobs, backups, monitoring'
+    menu_add "$REPLY" 'Scheduled jobs, backups, monitoring' '' '' view_jobs
+}
 
-    menu_add tool 'Logs: why did something stop?' 'may show private data' 'WHEN SOMETHING IS WRONG'
+menu_page_debug() {
+    local failed
+    failed=$(awk 'NF { n++ } END { print n + 0 }' <<< "$SVC_FAILED")
+    menu_state '.*'
+    menu_add "$REPLY" 'Problems and what to do' "$F_CRIT critical, $F_WARN warnings" 'START HERE' view_problems
+    menu_add tool 'Logs: why did something stop?' 'may show private data' '' view_logs
+    menu_state services
+    menu_add "$REPLY" 'Failed services' "$failed failed" 'LOOK CLOSER' view_apps
     menu_state 'resources|disk'
-    menu_add "$REPLY" 'CPU, RAM and disk' "CPU $R_CPU%, RAM $R_MEM_PCT%"
-    menu_add tool 'Live monitor' 'CPU, RAM, disk, network charts'
+    menu_add "$REPLY" 'CPU, RAM and disk' "CPU $R_CPU%, RAM $R_MEM_PCT%" '' view_resources_full
+    menu_state network
+    menu_add "$REPLY" 'Ports, firewall and network' "$NET_PUBLIC public ports" '' view_network
+    menu_state security
+    menu_add "$REPLY" 'Security' '' '' view_security
+    menu_add tool 'All installed software' '' '' view_inventory
+    if declare -F fix_list >/dev/null; then
+        menu_add tool 'Fix problems' 'cause, plan, confirmation, undo' 'FIX' fix_list
+    fi
+}
 
-    menu_add tool 'All installed software' '' 'MORE'
-    menu_add tool 'Full report on one page'
-    menu_add tool 'Learn: guided tour and glossary'
+menu_page_tune() {
+    local group advice state
+    printf '\r\033[K  Reading limits...' >&9
+    tune_collect
+    menu_add tool 'All tuning on one page' "$(awk -F '|' 'NF && $6 != "" { n++ } END { print n + 0 }' <<< "$TUNE_ROWS") changes advised" 'OVERVIEW' view_tune
+    menu_add tool 'Memory budget' 'all limits against the RAM of this server' '' view_budget
+    local head='SERVICES ON THIS SERVER'
+    while IFS= read -r group; do
+        [[ -n $group ]] || continue
+        advice=$(awk -F '|' -v g="$group" '$1 == g && $6 != "" { n++ } END { print n + 0 }' <<< "$TUNE_ROWS")
+        state=ok
+        ((advice == 0)) || state=warn
+        menu_add "$state" "$group" "$advice changes advised" "$head" "view_tune_one:$group"
+        head=''
+    done <<< "$(tune_groups)"
+}
+
+tui_menu_items() {
+    menu_n=0
+    case $page in
+        monitor) menu_title=Monitor; menu_page_monitor ;;
+        debug) menu_title='Troubleshoot and debug'; menu_page_debug ;;
+        tune) menu_title=Tune; menu_page_tune ;;
+        *) menu_title=''; menu_page_main ;;
+    esac
 }
 
 menu_frame() {
@@ -3188,28 +3892,24 @@ menu_frame() {
         ((offset >= 0)) || offset=0
         ((offset <= count - room)) || offset=$((count - room))
     fi
-    printf '%s %.*s%s\n' "$bold$accent" "$((term_cols - 1))" "LINUX HOST AUDIT  ${H_NAME:-}" "$reset"
+    printf '%s %.*s%s\n' "$bold$accent" "$((term_cols - 1))" "LINUX HOST AUDIT${menu_title:+  >  $menu_title}  ${H_NAME:-}" "$reset"
     printf ' %s\n' "$(verdict)"
     ((term_rows < 25)) || printf '\n'
     printf '%s\n' "${lines[@]:offset:room}"
     legend="$g_ok ok  $g_warn warning  $g_crit critical  $g_none not here  "
     if ((term_cols < 62)); then legend=; fi
     printf ' %s%s%s' "$dim" "$legend" "$reset"
-    if ((count > room)); then printf '%sUp/Down scrolls  q quit%s' "$dim" "$reset"
-    else printf '%sEnter open  r rescan  q quit%s' "$dim" "$reset"
+    if [[ -n $menu_title ]]; then legend='q back'; else legend='q quit'; fi
+    if ((count > room)); then printf '%sUp/Down scrolls  %s%s' "$dim" "$legend" "$reset"
+    else printf '%sEnter open  r rescan  %s%s' "$dim" "$legend" "$reset"
     fi
 }
 
 tui_main() (
     local key choice=0 index frame term_rows term_cols accent secondary dim bold reset selected
-    local tui_inherited=no tui_active=yes menu_keys=123456789abcdefg
-    local menu_n=0
-    local -a menu_states menu_labels menu_badges menu_heads
-    local -a views=(view_overview view_problems
-        view_apps view_containers view_kube view_web view_data
-        view_network view_security view_jobs
-        view_logs view_resources_full monitor
-        view_inventory view_report view_learn)
+    local tui_inherited=no tui_active=yes menu_keys=123456789abcdefghijklmnoptuvwxyz page=main
+    local menu_n=0 menu_title='' action
+    local -a menu_states menu_labels menu_badges menu_heads menu_actions
     tui_open || return 1
     tui_style
     tui_glyphs
@@ -3221,6 +3921,7 @@ tui_main() (
     while :; do
         tui_size
         tui_menu_items
+        ((choice < menu_n)) || choice=0
         frame=$(menu_frame)
         tui_paint "$frame"
         tui_key '' || return 0
@@ -3231,16 +3932,24 @@ tui_main() (
                 printf '\033[H\033[J\n  Reading this server again...\n\n' >&9
                 tui_rescan
                 continue ;;
-            q|Q) return 0 ;;
+            q|Q)
+                [[ $page != main ]] || return 0
+                page=main choice=0
+                continue ;;
             '') ;;
             *)
                 [[ -n $key && $menu_keys == *"$key"* ]] || continue
                 index=${menu_keys%%"$key"*}
+                ((${#index} < menu_n)) || continue
                 choice=${#index} ;;
         esac
-        if [[ ${views[choice]} == monitor ]]; then (tui_inherited=yes; monitor_main)
-        else tui_report "${views[choice]}"
-        fi
+        action=${menu_actions[choice]}
+        case $action in
+            page:*) page=${action#page:} choice=0 ;;
+            monitor) (tui_inherited=yes; monitor_main) ;;
+            view_tune_one:*) tui_report view_tune_one "${action#*:}" ;;
+            *) tui_report "$action" ;;
+        esac
     done
 )
 
@@ -3545,6 +4254,7 @@ Views (each prints and exits):
   --logs         Crashes, reboots, why services stopped (may show private data)
   --jobs         Cron, timers, backups, monitoring
   --resources    CPU, RAM, disk, top processes
+  --tune         How full each database and web server limit is, with advice from real load
   --learn        Guided tour and glossary
   --report       All of the above
   --json         Findings and server facts for scripts, with stable finding ids
@@ -3583,7 +4293,7 @@ main() {
     LHA_LOCALE=${LC_ALL:-${LC_CTYPE:-${LANG:-}}}
     export LC_ALL=C
     PATH=${LHA_TEST_PATH:+$LHA_TEST_PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-    PATH+=:/snap/bin:/var/lib/snapd/snap/bin:/var/lib/rancher/rke2/bin:/opt/bin:/run/current-system/sw/bin
+    PATH+=:/snap/bin:/var/lib/snapd/snap/bin:/var/lib/rancher/rke2/bin:/opt/bin:/run/current-system/sw/bin:/usr/local/apache2/bin
     export PATH
     # Path patterns are deliberately expanded. Field lists split on whitespace only.
     IFS=$' \t\n'
@@ -3604,7 +4314,7 @@ main() {
     need_awk || return 3
     case ${1:-} in
         --menu|--monitor|--metrics|--overview|--problems|--apps|--network|--containers|--docker|--k8s|\
-        --web|--db|--security|--logs|--jobs|--resources|--learn|--report|--check|--json)
+        --web|--db|--security|--logs|--jobs|--resources|--tune|--learn|--report|--check|--json)
             if (($# != 1)); then printf 'Unexpected arguments for %s\n' "$1" >&2; return 2; fi ;;
     esac
     case ${1:-} in
@@ -3623,6 +4333,7 @@ main() {
         --logs) one_view view_logs ;;
         --jobs) one_view view_jobs ;;
         --resources) one_view view_resources ;;
+        --tune) one_view view_tune ;;
         --learn) one_view view_learn ;;
         --report) one_view view_report ;;
         --json) NO_COLOR=1 one_view view_json ;;

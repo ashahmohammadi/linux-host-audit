@@ -88,7 +88,7 @@ fix_main() {
     LHA_LOCALE=${LC_ALL:-${LC_CTYPE:-${LANG:-}}}
     export LC_ALL=C
     PATH=${LHA_TEST_PATH:+$LHA_TEST_PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-    PATH+=:/snap/bin:/var/lib/snapd/snap/bin:/var/lib/rancher/rke2/bin:/opt/bin:/run/current-system/sw/bin
+    PATH+=:/snap/bin:/var/lib/snapd/snap/bin:/var/lib/rancher/rke2/bin:/opt/bin:/run/current-system/sw/bin:/usr/local/apache2/bin
     export PATH
     IFS=$' \t\n'
     set +f

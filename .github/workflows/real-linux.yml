@@ -63,6 +63,33 @@ jobs:
           sudo bash linux-host-audit.sh --json | python3 -m json.tool > report.json
           python3 -c "import json; d = json.load(open('report.json')); assert all(f['id'] != 'unknown' for f in d['findings']); print(d['host'])"
 
+  tuning:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: 'mariadb:10.6', env: 'MARIADB_ROOT_PASSWORD=t', expect: 'MariaDB 10.6', value: 'max_connections' }
+          - { image: 'mariadb:10.11', env: 'MARIADB_ROOT_PASSWORD=t', expect: 'MariaDB 10.11', value: 'innodb_buffer_pool_size' }
+          - { image: 'mariadb:11.4', env: 'MARIADB_ROOT_PASSWORD=t', expect: 'MariaDB 11.4', value: 'innodb_buffer_pool_size' }
+          - { image: 'mysql:5.7', env: 'MYSQL_ROOT_PASSWORD=t', expect: 'MySQL 5.7', value: 'max_connections' }
+          - { image: 'mysql:8.0', env: 'MYSQL_ROOT_PASSWORD=t', expect: 'MySQL 8.0', value: 'innodb_redo_log_capacity' }
+          - { image: 'mysql:8.4', env: 'MYSQL_ROOT_PASSWORD=t', expect: 'MySQL 8.4', value: 'innodb_redo_log_capacity' }
+          - { image: 'postgres:12', env: 'POSTGRES_PASSWORD=t', expect: 'PostgreSQL 12', value: 'shared_buffers' }
+          - { image: 'postgres:16', env: 'POSTGRES_PASSWORD=t', expect: 'PostgreSQL 16', value: 'shared_buffers' }
+          - { image: 'redis:6', env: 'X=1', expect: 'Redis 6', value: 'maxclients' }
+          - { image: 'redis:7', env: 'X=1', expect: 'Redis 7', value: 'maxclients' }
+          - { image: 'valkey/valkey:8', env: 'X=1', expect: 'Valkey 8', value: 'maxclients' }
+          - { image: 'mongo:6', env: 'X=1', expect: 'MongoDB 6', value: 'wiredTigerCacheSizeGB' }
+          - { image: 'mongo:8', env: 'X=1', expect: 'MongoDB 8', value: 'maxIncomingConnections' }
+          - { image: 'nginx:1.27', env: 'X=1', expect: 'Nginx 1.27', value: 'worker_connections' }
+          - { image: 'httpd:2.4', env: 'X=1', expect: 'Apache 2.4', value: 'MaxRequestWorkers' }
+          - { image: 'php:8.3-fpm', env: 'X=1', expect: 'PHP-FPM pools', value: 'www (dynamic)' }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read a real ${{ matrix.image }}, and compare with what it reports itself
+        run: bash tests/tune-real.sh '${{ matrix.image }}' '${{ matrix.env }}' '${{ matrix.expect }}' '${{ matrix.value }}'
+
   fixer:
     runs-on: ubuntu-latest
     steps:
@@ -84,7 +111,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq nginx ufw
-          sudo bash tests/fix-real.sh
+          sudo LHA_I_AM_DISPOSABLE=yes bash tests/fix-real.sh
 
   docker:
     runs-on: ubuntu-latest
