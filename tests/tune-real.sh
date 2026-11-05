@@ -3,6 +3,11 @@
 image=$1 env=$2 expect=$3 value=$4
 docker run -d --name svc -e "$env" "$image" >/dev/null || exit 1
 sleep 30
+if [[ $(docker inspect -f '{{.State.Running}}' svc) != true ]]; then
+    echo "FAIL: $image did not start. This is about the service, not the audit:"
+    docker logs svc 2>&1 | tail -n 15
+    exit 1
+fi
 docker cp linux-host-audit.sh svc:/tmp/audit.sh
 docker exec svc sh -c '
     command -v bash >/dev/null || exit 9

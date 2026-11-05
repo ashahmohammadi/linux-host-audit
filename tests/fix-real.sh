@@ -173,7 +173,8 @@ systemctl reset-failed nginx
 systemctl start nginx
 
 echo '=== kernel limit: fix, then undo'
-before=$(sysctl -n fs.file-max)
+sysctl -w fs.file-max=1000000 >/dev/null
+before=1000000
 fx_transaction file-limit '' | tail -n 1
 run=$(ls -t "$FX_HOME/runs" | head -n 1)
 check 'limit raised' "(($(sysctl -n fs.file-max) == before * 2))"
@@ -232,7 +233,7 @@ mkdir -p /etc/ssh/sshd_config.d
 printf 'PermitRootLogin yes\n' > /etc/ssh/sshd_config.d/01-test.conf
 FX_DEADMAN_SECONDS=8 FX_DEADMAN_AUTO=wait
 fx_transaction ssh-root-password '' | tail -n 3
-check 'change applied' "[[ \$(sshd -T | awk '\$1 == \"permitrootlogin\" { print \$2 }') == prohibit-password ]]"
+check 'change applied' "sshd -T | grep -qE '^permitrootlogin (prohibit-password|without-password)'"
 sleep 12
 check 'timer reverted it' "[[ \$(sshd -T | awk '\$1 == \"permitrootlogin\" { print \$2 }') == yes ]]"
 check 'sshd still healthy' "sshd -t"

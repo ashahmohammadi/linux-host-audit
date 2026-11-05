@@ -177,6 +177,12 @@ dx_file_limit() {
     local used max
     read -r used _ max < /proc/sys/fs/file-nr
     FX_CAUSE="$used of $max open file handles are in use."
+    # Modern kernels default to the largest number there is, so doubling it would overflow.
+    if ((max >= 4611686018427387904)); then
+        FX_CAUSE='The system-wide limit is already unlimited, so the limit is on one program.'
+        FX_STEPS=('Find the program near its own limit: linux-host-audit.sh --tune' 'Raise LimitNOFILE in its service unit.')
+        return 0
+    fi
     FX_MODE=auto FX_RISK=low FX_NEW_VALUE=$((max * 2))
     FX_PLAN=("Raise fs.file-max to $FX_NEW_VALUE (kernel setting, kept across reboots)")
 }

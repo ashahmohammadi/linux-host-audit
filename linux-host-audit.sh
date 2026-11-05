@@ -3197,11 +3197,14 @@ tune_postgres() {
 }
 
 tune_redis() {
-    local name=$1 cli=$2 info conf max used clients limit evicted hits misses frag rec why group
+    local name=$1 cli=$2 info conf max used clients limit evicted hits misses frag rec why group version
     has "$cli" || return 0
     info=$(run_t 5 "$cli" -h 127.0.0.1 info 2>/dev/null | tr -d '\r' | tr ':' '\t')
     if [[ -z $info || $info == *NOAUTH* ]]; then tune_note "$name" 'It needs a password, so its limits could not be read.'; return 0; fi
-    group="$name $(tune_get "$info" redis_version)"
+    # Valkey keeps a redis_version of 7.2 for clients, and has its own real version.
+    version=$(tune_get "$info" valkey_version)
+    [[ $version != 0 ]] || version=$(tune_get "$info" redis_version)
+    group="$name $version"
     max=$(tune_get "$info" maxmemory)
     used=$(tune_get "$info" used_memory)
     evicted=$(tune_get "$info" evicted_keys)
@@ -3320,12 +3323,11 @@ tune_phpfpm() {
     workers=$(ps -eo pid=,rss=,args= 2>/dev/null | awk '$3 == "php-fpm:" && $4 == "pool" { print }')
     pools=$(cat /etc/php-fpm.d/*.conf /etc/php/*/fpm/pool.d/*.conf /usr/local/etc/php-fpm.d/*.conf /opt/cpanel/ea-php*/root/etc/php-fpm.d/*.conf \
         /opt/plesk/php/*/etc/php-fpm.d/*.conf /www/server/php/*/etc/php-fpm.conf 2>/dev/null | clean | awk '
-        function flush() { if (name != "" && name != "global") print name, (pm == "" ? "?" : pm), (max == "" ? 0 : max) }
-        /^[ \t]*\[.*\]/ { flush(); name = $0; gsub(/[][ \t]/, "", name); pm = ""; max = ""; next }
-        /^[ \t]*pm[ \t]*=/ { pm = $NF }
-        /^[ \t]*pm\.max_children[ \t]*=/ { max = $NF }
-        /^[ \t]*"?pm_max_children/ { max = $NF }
-        END { flush() }')
+        /^[ \t]*\[.*\]/ { name = $0; gsub(/[][ \t]/, "", name); if (name != "global") seen[name] = 1; next }
+        /^[ \t]*pm[ \t]*=/ { pm[name] = $NF }
+        /^[ \t]*pm\.max_children[ \t]*=/ { max[name] = $NF }
+        # A pool can continue in a later file, so its settings are gathered by name.
+        END { for (p in seen) print p, (p in pm ? pm[p] : "?"), (p in max ? max[p] : 0) }')
     for file in /var/log/php-fpm/*.log /var/log/php*-fpm.log /opt/cpanel/ea-php*/root/usr/var/log/php-fpm.log; do
         [[ -r $file ]] && logs+=$(tail -n 20000 "$file" | grep 'reached pm.max_children\|max_children setting')$'\n'
     done

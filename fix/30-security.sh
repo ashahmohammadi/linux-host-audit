@@ -83,7 +83,13 @@ ap_ssh_root_password() {
     sshd -t || return 1
     fx_run systemctl reload "$unit"
 }
-ck_ssh_root_password() { [[ $(sshd -T 2>/dev/null | awk '$1 == "permitrootlogin" { print $2 }') == prohibit-password ]]; }
+# sshd -T prints the old name of this setting on many versions.
+ck_ssh_root_password() {
+    case $(sshd -T 2>/dev/null | awk '$1 == "permitrootlogin" { print $2 }') in
+        prohibit-password|without-password) return 0 ;;
+    esac
+    return 1
+}
 
 dx_empty_passwords() {
     local names
