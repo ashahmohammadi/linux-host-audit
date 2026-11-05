@@ -58,6 +58,29 @@ jobs:
           sudo bash linux-host-audit.sh --json | python3 -m json.tool > report.json
           python3 -c "import json; d = json.load(open('report.json')); assert all(f['id'] != 'unknown' for f in d['findings']); print(d['host'])"
 
+  fixer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The fixer file must match its sources, and the audit must hold no fix code
+        run: |
+          bash make-fix.sh
+          git diff --exit-code linux-host-fix.sh
+          ! grep -nE '(^|[^a-z_])(fx_[a-z]|ap_[a-z]+_[a-z]+\(\))' linux-host-audit.sh
+      - name: Every finding id has a diagnosis, and every fix has a check
+        run: |
+          grep -oE 'fid=[a-z0-9-]+' linux-host-audit.sh | cut -d= -f2 | sort -u | while read -r id; do
+              grep -q "^dx_${id//-/_}()" linux-host-fix.sh || { echo "NO DIAGNOSIS: $id"; exit 1; }
+          done
+          grep -oE '^ap_[a-z0-9_]+' linux-host-fix.sh | sed 's/^ap_//' | while read -r name; do
+              grep -q "^ck_$name()" linux-host-fix.sh || { echo "NO CHECK: $name"; exit 1; }
+          done
+      - name: Break things for real, and fix them
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nginx ufw
+          sudo bash tests/fix-real.sh
+
   docker:
     runs-on: ubuntu-latest
     steps:
