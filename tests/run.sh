@@ -89,6 +89,21 @@ if grep -q $'\033' <<< "$out"; then ((fail += 1)); echo 'FAIL [broken] raw escap
 audit --check >/dev/null
 equals "$?" 2 'exit code of --check'
 
+# The contract for scripts and a future fixer: valid JSON, and every finding has a stable id.
+out=$(audit --json)
+report=$(python -c '
+import json, sys
+d = json.load(sys.stdin)
+ids = [f["id"] for f in d["findings"]]
+print("valid", len(ids), "unknown" in ids, "service-failed" in ids, "disk-full" in ids)
+targets = {f["id"]: f["target"] for f in d["findings"]}
+print(targets.get("container-unhealthy"), d["host"]["package_manager"], d["listeners"][0]["port"])
+' <<< "$out" 2>&1)
+has_text "$report" 'False True True'
+has_text "$report" 'api apt-get 22'
+missing=$(grep -nE '(^|[ (])finding ("\$|[A-Z]{4} )' "$script" | grep -v 'fid=')
+equals "$missing" '' 'finding without an id'
+
 scenario=clean kcfg=
 out=$(audit --overview)
 has_text "$out" 'UFW active'

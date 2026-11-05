@@ -23,7 +23,20 @@ jobs:
           - opensuse/leap:15
           - archlinux:latest
           - alpine:3.20
+          - alpine:3.10
           - bash:3.2
+          - bash:4.0
+          - centos:7
+          - centos:6
+          - ubuntu:18.04
+          - ubuntu:16.04
+          - ubuntu:14.04
+          - debian:10
+          - debian:9
+          - debian:8
+          - oraclelinux:8
+          - amazonlinux:2
+          - opensuse/tumbleweed
     steps:
       - uses: actions/checkout@v4
       - name: Run every view
@@ -42,6 +55,8 @@ jobs:
           bash tests/real-smoke.sh
           sudo bash linux-host-audit.sh --problems | tee problems.txt
           ! grep -F 'disk errors' problems.txt
+          sudo bash linux-host-audit.sh --json | python3 -m json.tool > report.json
+          python3 -c "import json; d = json.load(open('report.json')); assert all(f['id'] != 'unknown' for f in d['findings']); print(d['host'])"
 
   docker:
     runs-on: ubuntu-latest

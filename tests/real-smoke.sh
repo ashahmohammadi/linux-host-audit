@@ -11,7 +11,7 @@ snapshot() { find /etc /usr/local /root /home -xdev -type f 2>/dev/null | sort; 
 before=$(snapshot)
 
 for view in --overview --problems --apps --network --containers --k8s --web --db --security \
-    --logs --jobs --resources --learn --report --metrics --help --version '--text --found-only'; do
+    --logs --jobs --resources --learn --report --json --metrics --help --version '--text --found-only'; do
     # shellcheck disable=SC2086 # the last entry carries two words on purpose
     out=$(NO_COLOR=1 bash "$script" $view 2>&1 </dev/null)
     rc=$?

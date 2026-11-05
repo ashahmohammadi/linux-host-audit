@@ -48,6 +48,12 @@ scheduled jobs, backups, a live monitor, and a guided tour.
 
 `--help` lists every view. `--check` prints one status line and exits 0, 1 or 2 for cron or monitoring.
 
+## For scripts and tools
+
+`--json` prints the server facts (OS, version, package manager, init system) and every finding with
+a stable `id`, its `target`, and its severity. Ids such as `disk-full` or `service-failed` are a
+contract: other tools can act on them without reading the English text, so never rename one.
+
 ## Limits
 
 - Bash is required, so Alpine needs `apk add bash`.

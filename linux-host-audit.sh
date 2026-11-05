@@ -4,7 +4,7 @@
 # Never prints passwords, process arguments, container environments or Kubernetes secrets.
 # Bash 3.2+ on any Linux. Missing tools only hide the part of the report that needs them.
 
-LHA_VERSION=3.1.0
+LHA_VERSION=3.2.0
 
 section() { title "$1"; }
 has() { type -P "$1" >/dev/null 2>&1; }
@@ -1108,9 +1108,12 @@ human_age() {
 }
 
 # Findings are the heart of the report: what is wrong, why it matters, what to look at next.
+# Callers set fid (a stable id) and ftarget (what it is about) for --json, so tools can act on
+# a finding without reading its English. Never rename an id: that breaks whatever relies on it.
 F_N=0 F_CRIT=0 F_WARN=0 F_INFO=0
 finding() {
     F_SEV[F_N]=$1 F_AREA[F_N]=$2 F_TITLE[F_N]=$3 F_WHY[F_N]=$4 F_NEXT[F_N]=${5:-}
+    F_ID[F_N]=${fid:-unknown} F_TARGET[F_N]=${ftarget:-}
     ((F_N += 1))
     case $1 in
         CRIT) ((F_CRIT += 1)) ;;
@@ -1248,28 +1251,33 @@ check_host() {
         H_NTP=$(run_t 3 timedatectl show -p NTPSynchronized --value 2>/dev/null) || H_NTP=
     fi
     check_eol
+    H_PKG=unknown
+    for line in apt-get dnf yum zypper apk pacman opkg; do
+        if has "$line"; then H_PKG=$line; break; fi
+    done
     if [[ $H_NTP == no ]]; then
-        finding WARN host 'Server clock is not synchronized' \
+        fid=clock-unsynced finding WARN host 'Server clock is not synchronized' \
             'TLS, logins, logs and clusters all break in odd ways when clocks drift.' 'timedatectl status'
     fi
     if ((LHA_UID != 0)); then
-        finding INFO host 'Running without root, so this report is partial' \
+        fid=not-root finding INFO host 'Running without root, so this report is partial' \
             'Process owners, firewall rules, certificates and some logs stay hidden.' 'sudo bash linux-host-audit.sh'
     fi
 }
 
 # Last month of free security updates. Newer or unlisted systems simply show nothing.
 check_eol() {
-    local id='' version='' line
-    H_EOL=
+    local line
+    H_EOL= H_OS_ID= H_OS_VERSION=
     [[ -r /etc/os-release ]] || return 0
     while IFS= read -r line; do
         case $line in
-            ID=*) id=${line#ID=} id=${id//\"/} ;;
-            VERSION_ID=*) version=${line#VERSION_ID=} version=${version//\"/} ;;
+            ID=*) H_OS_ID=${line#ID=} H_OS_ID=${H_OS_ID//\"/} ;;
+            VERSION_ID=*) H_OS_VERSION=${line#VERSION_ID=} H_OS_VERSION=${H_OS_VERSION//\"/} ;;
         esac
     done < /etc/os-release
-    case $id:${version%%.*} in
+    case $H_OS_ID:${H_OS_VERSION%%.*} in
+        amzn:2) H_EOL=2026-06 ;;
         almalinux:8|rocky:8|ol:8|rhel:8|cloudlinux:8) H_EOL=2029-03 ;;
         almalinux:9|rocky:9|ol:9|rhel:9|cloudlinux:9) H_EOL=2032-05 ;;
         centos:6) H_EOL=2020-11 ;;
@@ -1281,7 +1289,7 @@ check_eol() {
         debian:11) H_EOL=2026-08 ;;
         debian:12) H_EOL=2028-06 ;;
     esac
-    case $id:$version in
+    case $H_OS_ID:$H_OS_VERSION in
         ubuntu:14.04*) H_EOL=2019-04 ;;
         ubuntu:16.04*) H_EOL=2021-04 ;;
         ubuntu:18.04*) H_EOL=2023-05 ;;
@@ -1290,7 +1298,7 @@ check_eol() {
         ubuntu:24.04*) H_EOL=2029-04 ;;
     esac
     if [[ -n $H_EOL && $H_EOL < $(date +%Y-%m) ]]; then
-        finding WARN security "$H_OS no longer gets free security updates" \
+        fid=os-eol ftarget="$H_OS" finding WARN security "$H_OS no longer gets free security updates" \
             "Standard support ended in $H_EOL, so new holes stay open. Plan an upgrade." 'cat /etc/os-release'
     fi
 }
@@ -1333,32 +1341,32 @@ check_resources() {
 
     R_PER_CORE=$(awk -v l="$R_LOAD1" -v c="$H_CPUS" 'BEGIN { printf "%d", 100 * l / c }')
     if ((R_PER_CORE >= 400)); then
-        finding CRIT resources "Load is $R_LOAD1 on $H_CPUS CPU cores" \
+        fid=load-high finding CRIT resources "Load is $R_LOAD1 on $H_CPUS CPU cores" \
             'Far more work is waiting than the CPUs can run, so everything feels slow.' 'top -o %CPU'
     elif ((R_PER_CORE >= 200)); then
-        finding WARN resources "Load is $R_LOAD1 on $H_CPUS CPU cores" \
+        fid=load-high finding WARN resources "Load is $R_LOAD1 on $H_CPUS CPU cores" \
             'Work is queueing. It can be CPU, or processes stuck waiting for disk.' 'top -o %CPU'
     fi
     if ((R_STEAL >= 10)); then
-        finding WARN resources "CPU steal is $R_STEAL%" \
+        fid=cpu-steal finding WARN resources "CPU steal is $R_STEAL%" \
             'The hypervisor is giving your CPU time to other VMs. The host may be oversold.' 'vmstat 1 5'
     fi
     if ((R_WAIT >= 25)); then
-        finding WARN resources "CPU spends $R_WAIT% of its time waiting for disk" \
+        fid=io-wait finding WARN resources "CPU spends $R_WAIT% of its time waiting for disk" \
             'The disk is the bottleneck, not the CPU.' 'iostat -x 1 3'
     fi
     if ((mem_total > 0)); then
         pct=$((100 * mem_avail / mem_total))
         if ((pct < 5)); then
-            finding CRIT resources "Only $pct% of RAM is available" \
+            fid=memory-low finding CRIT resources "Only $pct% of RAM is available" \
                 'The kernel may start killing processes (OOM killer) at any moment.' 'ps aux --sort=-rss | head'
         elif ((pct < 10)); then
-            finding WARN resources "Only $pct% of RAM is available" \
+            fid=memory-low finding WARN resources "Only $pct% of RAM is available" \
                 'Little memory is left for traffic spikes or disk cache.' 'ps aux --sort=-rss | head'
         fi
     fi
     if ((swap_total > 0 && R_SWAP_USED * 100 / swap_total >= 50)); then
-        finding WARN resources "$((R_SWAP_USED * 100 / swap_total))% of swap is in use" \
+        fid=swap-high finding WARN resources "$((R_SWAP_USED * 100 / swap_total))% of swap is in use" \
             'Heavy swap use means RAM ran short, and swap is far slower than RAM.' 'free -h'
     fi
 
@@ -1366,17 +1374,17 @@ check_resources() {
     while read -r mnt use size free; do
         [[ -n $mnt ]] || continue
         if ((use >= 95)); then
-            finding CRIT disk "Disk $mnt is $use% full" \
+            fid=disk-full ftarget="$mnt" finding CRIT disk "Disk $mnt is $use% full" \
                 'At 100% databases stop, logs fail and services crash.' "du -xh $mnt --max-depth=2 | sort -h | tail"
         elif ((use >= 85)); then
-            finding WARN disk "Disk $mnt is $use% full" \
+            fid=disk-full ftarget="$mnt" finding WARN disk "Disk $mnt is $use% full" \
                 "$(human_kb "$free") left. Plan a cleanup before it fills." "du -xh $mnt --max-depth=2 | sort -h | tail"
         fi
     done <<< "$R_DISKS"
     while read -r mnt use size free; do
         [[ -n $mnt ]] || continue
         if ((use >= 90)); then
-            finding CRIT disk "Disk $mnt used $use% of its inodes" \
+            fid=inodes-full ftarget="$mnt" finding CRIT disk "Disk $mnt used $use% of its inodes" \
                 'New files fail with "no space left" even though free space remains.' \
                 "du --inodes -x $mnt --max-depth=2 | sort -n | tail"
         fi
@@ -1384,18 +1392,18 @@ check_resources() {
 
     if [[ -z $H_CONTAINER && -r /proc/mounts ]]; then
         while read -r mnt; do
-            [[ -z $mnt ]] || finding CRIT disk "Filesystem $mnt is mounted read-only" \
+            [[ -z $mnt ]] || fid=fs-readonly ftarget="$mnt" finding CRIT disk "Filesystem $mnt is mounted read-only" \
                 'Linux usually does this after disk errors. Writes will fail.' 'dmesg | tail -30'
         done <<< "$(awk '$3 ~ /^(ext[234]|xfs|btrfs)$/ && $4 ~ /^ro(,|$)/ { print $2 }' /proc/mounts)"
     fi
     if [[ -r /proc/mdstat ]] && grep -q '\[[U]*_[U_]*\]' /proc/mdstat; then
-        finding CRIT disk 'A software RAID array is degraded' \
+        fid=raid-degraded finding CRIT disk 'A software RAID array is degraded' \
             'One disk already failed. Another failure can lose the data.' 'cat /proc/mdstat'
     fi
     if has zpool; then
         line=$(run_t 5 zpool status -x 2>/dev/null) || line=
         if [[ -n $line && $line != *'all pools are healthy'* && $line != 'no pools available'* ]]; then
-            finding CRIT disk 'A ZFS pool is not healthy' 'ZFS reports a problem with a pool.' 'zpool status -x'
+            fid=zfs-unhealthy finding CRIT disk 'A ZFS pool is not healthy' 'ZFS reports a problem with a pool.' 'zpool status -x'
         fi
     fi
 
@@ -1406,7 +1414,7 @@ check_resources() {
             [[ -b $mnt ]] || continue
             line=$(run_t 8 smartctl -H "$mnt" 2>/dev/null)
             if [[ $line == *FAILED* ]]; then
-                finding CRIT disk "Drive $mnt reports that it is failing" \
+                fid=smart-failing ftarget="$mnt" finding CRIT disk "Drive $mnt reports that it is failing" \
                     'SMART predicts failure. Copy your data off and replace the drive.' "smartctl -a $mnt"
             fi
         done
@@ -1414,7 +1422,7 @@ check_resources() {
     if [[ -r /proc/sys/fs/file-nr ]]; then
         read -r key rest value < /proc/sys/fs/file-nr
         if [[ $value =~ ^[0-9]+$ ]] && ((value > 0 && key * 100 / value >= 80)); then
-            finding CRIT resources 'Open file limit is almost reached' \
+            fid=file-limit finding CRIT resources 'Open file limit is almost reached' \
                 'Services will fail with "too many open files".' 'cat /proc/sys/fs/file-nr'
         fi
     fi
@@ -1422,13 +1430,13 @@ check_resources() {
         read -r key < /proc/sys/net/netfilter/nf_conntrack_count
         read -r value < /proc/sys/net/netfilter/nf_conntrack_max
         if ((value > 0 && key * 100 / value >= 80)); then
-            finding CRIT network 'Connection tracking table is almost full' \
+            fid=conntrack-full finding CRIT network 'Connection tracking table is almost full' \
                 'When full, the kernel silently drops new connections.' 'sysctl net.netfilter.nf_conntrack_count'
         fi
     fi
     R_ZOMBIES=$(awk '$3 == "Z"' /proc/[0-9]*/stat 2>/dev/null | wc -l | tr -d ' ')
     if ((R_ZOMBIES >= 20)); then
-        finding WARN resources "$R_ZOMBIES zombie processes" \
+        fid=zombies finding WARN resources "$R_ZOMBIES zombie processes" \
             'A parent process is not cleaning up its children, a sign of a buggy app.' 'ps -eo stat,ppid,comm | grep "^Z"'
     fi
 }
@@ -1614,33 +1622,33 @@ check_network() {
         port_name "$port"
         if [[ -z $REPLY ]] && ((port < 32768)) && ((unknown < 5)); then
             ((unknown += 1))
-            finding INFO network "Port $port/$proto is open to the world: $proc" \
+            fid=port-unknown ftarget="$port/$proto" finding INFO network "Port $port/$proto is open to the world: $proc" \
                 'This tool does not recognize it. Make sure you know why it is open.' "ss -lntup | grep :$port"
         fi
         case $port in
             2375)
-                finding CRIT security 'Docker API is open without encryption on port 2375' \
+                fid=docker-api-open ftarget=2375 finding CRIT security 'Docker API is open without encryption on port 2375' \
                     'Anyone who reaches it gets root on this server.' 'ss -lntp | grep 2375' ;;
             6379|11211|27017|9200|2379|5900|5901|3306|5432|1433)
                 port_name "$port"
                 if [[ $NET_FW_ON == yes ]]; then
-                    finding INFO security "$REPLY listens on all interfaces (port $port)" \
+                    fid=db-listens-all ftarget="$port" finding INFO security "$REPLY listens on all interfaces (port $port)" \
                         "Firewall reported: $NET_FW. Confirm it really blocks this port." "ss -lntp | grep :$port"
                 else
-                    finding WARN security "$REPLY is reachable from the network (port $port)" \
+                    fid=db-exposed ftarget="$port" finding WARN security "$REPLY is reachable from the network (port $port)" \
                         'No active firewall was seen, and internet-exposed databases get attacked.' "ss -lntp | grep :$port"
                 fi ;;
         esac
     done <<< "$NET_ROWS"
     if has ip && [[ -z $(run_t 3 ip route show default 2>/dev/null) ]] &&
         [[ -z $(run_t 3 ip -6 route show default 2>/dev/null) ]]; then
-        finding WARN network 'No default route' 'This server cannot reach other networks.' 'ip route'
+        fid=no-default-route finding WARN network 'No default route' 'This server cannot reach other networks.' 'ip route'
     fi
     if [[ -r /etc/resolv.conf ]] && ! grep -q '^nameserver' /etc/resolv.conf; then
-        finding WARN network 'No DNS server configured' 'Domain names cannot be resolved.' 'cat /etc/resolv.conf'
+        fid=no-dns finding WARN network 'No DNS server configured' 'Domain names cannot be resolved.' 'cat /etc/resolv.conf'
     fi
     if [[ $NET_FW_ON == no ]] && ((NET_PUBLIC > 0)) && [[ -z $H_CONTAINER ]]; then
-        finding WARN security 'No active firewall was found' \
+        fid=no-firewall finding WARN security 'No active firewall was found' \
             'Every public port below is open to the world, unless a cloud firewall protects it.' 'ss -lntu'
     fi
 }
@@ -1706,7 +1714,7 @@ check_services() {
             $1 == "Result" { r = $2 }
             $1 == "ExecMainStatus" { s = $2 }
             END { if (r != "") { printf "%s", r; if (s + 0 != 0) printf ", exit status %s", s } }')
-        finding "$severity" services "Service $unit has failed" \
+        fid=service-failed ftarget="$unit" finding "$severity" services "Service $unit has failed" \
             "It is not running. Last result: ${reason:-unknown}." "journalctl -u $unit -n 50 --no-pager"
     done <<< "$SVC_FAILED"
 }
@@ -1733,11 +1741,11 @@ check_mail() {
         if has exim; then text=exim; else text=exim4; fi
         has "$text" && MAIL_QUEUE=$(run_t 8 "$text" -bpc 2>/dev/null | clean)
     elif [[ -n $(sig_list RUNNING '^Postfix') ]] && has postqueue; then
-        MAIL_QUEUE=$(run_t 8 postqueue -p 2>/dev/null | awk '/^[0-9A-F]{6,}/ { n++ } END { print n + 0 }')
+        MAIL_QUEUE=$(run_t 8 postqueue -p 2>/dev/null | awk '/^[0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]/ { n++ } END { print n + 0 }')
     fi
     [[ $MAIL_QUEUE =~ ^[0-9]+$ ]] || MAIL_QUEUE=
     if [[ -n $MAIL_QUEUE ]] && ((MAIL_QUEUE >= 1000)); then
-        finding WARN services "$MAIL_QUEUE emails are stuck in the mail queue" \
+        fid=mail-queue finding WARN services "$MAIL_QUEUE emails are stuck in the mail queue" \
             'Mail is not leaving, or a hacked site is sending spam.' 'exim -bp | head'
     fi
     return 0
@@ -1756,6 +1764,11 @@ view_apps() {
     [[ -z $list ]] || { sub 'Installed but not running'; printf '  %s\n' "$list" | fold -s -w 76; }
     line=$(app_versions)
     [[ -z $line ]] || { sub 'Versions'; printf '%s\n' "$line" | indent; }
+    if [[ -n $APP_ROWS ]]; then
+        sub 'Official support of the versions in use'
+        printf '%s' "$APP_ROWS" | awk -F '|' -v now="$(date +%Y-%m)" '{
+            printf "  %-12s %-10s %s %s\n", $1, $2, ($3 < now ? "ended" : "until"), $3 }'
+    fi
     if [[ -n $MAIL_QUEUE ]]; then
         sub 'Mail'
         kv Queue "$MAIL_QUEUE messages waiting to be sent"
@@ -1811,14 +1824,14 @@ check_containers() {
             err=$(run_t 8 "$engine" ps -q 2>&1 >/dev/null)
             case $err in
                 *'permission denied'*)
-                    finding INFO containers "No permission to read $engine" \
+                    fid=engine-no-access ftarget="$engine" finding INFO containers "No permission to read $engine" \
                         'Run this tool as root, or as a user in the docker group.' 'sudo bash linux-host-audit.sh' ;;
                 *'Cannot connect'*|*'Is the docker daemon'*)
-                    finding CRIT containers "$engine is installed but its daemon is down" \
+                    fid=engine-down ftarget="$engine" finding CRIT containers "$engine is installed but its daemon is down" \
                         'All its containers are stopped.' "systemctl status $engine" ;;
                 *)
                     if ((rc == 124)); then
-                        finding CRIT containers "$engine is not answering" \
+                        fid=engine-hung ftarget="$engine" finding CRIT containers "$engine is not answering" \
                             'The engine is hung; containers may be stuck too.' "systemctl status $engine"
                     fi ;;
             esac
@@ -1836,25 +1849,25 @@ check_containers() {
                     names+=" $name"
                     if [[ $status == *unhealthy* ]]; then
                         ((unhealthy += 1))
-                        finding CRIT containers "Container $name is unhealthy" \
+                        fid=container-unhealthy ftarget="$name" finding CRIT containers "Container $name is unhealthy" \
                             'It runs, but its own health check fails.' "$engine logs --tail 50 $name"
                     fi ;;
                 Restarting*)
                     ((restarting += 1))
-                    finding CRIT containers "Container $name keeps restarting" \
+                    fid=container-restarting ftarget="$name" finding CRIT containers "Container $name keeps restarting" \
                         'It crashes on start, over and over.' "$engine logs --tail 50 $name" ;;
                 Dead*)
-                    finding CRIT containers "Container $name is dead" \
+                    fid=container-dead ftarget="$name" finding CRIT containers "Container $name is dead" \
                         'The engine failed to stop or remove it cleanly.' "$engine inspect $name" ;;
                 Exited*)
                     ((stopped += 1))
                     code=${status#*\(} code=${code%%\)*}
                     case $code in
                         0|143) ;;
-                        137) finding WARN containers "Container $name was killed (exit 137)" \
+                        137) fid=container-killed ftarget="$name" finding WARN containers "Container $name was killed (exit 137)" \
                                 'Usually out of memory, or a forced stop.' \
                                 "$engine inspect -f '{{.State.OOMKilled}}' $name" ;;
-                        *) finding WARN containers "Container $name stopped with error code $code" \
+                        *) fid=container-exit-error ftarget="$name" finding WARN containers "Container $name stopped with error code $code" \
                                 'The program inside exited with a failure.' "$engine logs --tail 50 $name" ;;
                     esac ;;
                 *) ((stopped += 1)) ;;
@@ -1867,13 +1880,13 @@ check_containers() {
             while read -r name bad oomed code; do
                 name=${name#/}
                 [[ -n $name ]] || continue
-                [[ $bad != true ]] || finding WARN containers "Container $name runs in privileged mode" \
+                [[ $bad != true ]] || fid=container-privileged ftarget="$name" finding WARN containers "Container $name runs in privileged mode" \
                     'If it is broken into, the attacker effectively gets root on the host.' \
                     "$engine inspect -f '{{.HostConfig.Privileged}}' $name"
-                [[ $oomed != true ]] || finding WARN containers "Container $name was killed for memory" \
+                [[ $oomed != true ]] || fid=container-oom ftarget="$name" finding WARN containers "Container $name was killed for memory" \
                     'It hit a memory limit, or the host ran out of RAM.' "$engine stats --no-stream $name"
                 if [[ $code =~ ^[0-9]+$ ]] && ((code >= 10)); then
-                    finding WARN containers "Container $name restarted $code times" \
+                    fid=container-restart-count ftarget="$name" finding WARN containers "Container $name restarted $code times" \
                         'A healthy container does not need to restart this often.' "$engine logs --tail 50 $name"
                 fi
             done <<< "$info"
@@ -1894,7 +1907,7 @@ check_containers() {
     if ((CT_N > 0 && LHA_UID == 0)); then
         while read -r line; do
             [[ -n $line ]] || continue
-            finding WARN containers "A container log has grown to $line GiB" \
+            fid=container-log-large finding WARN containers "A container log has grown to $line GiB" \
                 'Without log rotation, these files quietly fill the disk.' \
                 'du -sh /var/lib/docker/containers/* | sort -h | tail'
         done <<< "$(ls -lS /var/lib/docker/containers/*/*-json.log 2>/dev/null | awk 'n++ < 3 && $5 >= 1073741824 { printf "%.1f\n", $5 / 1073741824 }')"
@@ -2004,18 +2017,18 @@ check_kube() {
     fi
     K_ON=yes
     if ((${#KUBE[@]} == 0)); then
-        finding INFO kubernetes 'Kubernetes parts exist, but there is no kubectl here' \
+        fid=kube-no-client finding INFO kubernetes 'Kubernetes parts exist, but there is no kubectl here' \
             'Cluster state cannot be read from this machine.' 'crictl ps'
         return 0
     fi
     if ! nodes=$(ku get nodes --no-headers) || [[ -z $nodes ]]; then
         if [[ -z $K_CFG ]]; then
             K_ROLE='worker node or no credentials'
-            finding INFO kubernetes 'No cluster credentials on this machine' \
+            fid=kube-no-credentials finding INFO kubernetes 'No cluster credentials on this machine' \
                 'This is normal on a worker node. Run this tool on a control-plane node for the full cluster view.' \
                 'systemctl status kubelet'
         else
-            finding CRIT kubernetes 'Kubernetes API is not answering' \
+            fid=kube-api-down finding CRIT kubernetes 'Kubernetes API is not answering' \
                 'kubectl cannot reach the cluster. Workloads may still run, but nothing can be managed.' \
                 "journalctl -u kubelet -n 50 --no-pager"
         fi
@@ -2027,7 +2040,7 @@ check_kube() {
     K_READY=$(awk '$2 ~ /^Ready/ { n++ } END { print n + 0 }' <<< "$nodes")
     if ((K_READY < K_NODES)); then
         while read -r line; do
-            [[ -z $line ]] || finding CRIT kubernetes "Node $line is not Ready" \
+            [[ -z $line ]] || fid=kube-node-notready ftarget="$line" finding CRIT kubernetes "Node $line is not Ready" \
                 'Pods on this node are not being served or scheduled.' "kubectl describe node $line"
         done <<< "$(awk '$2 !~ /^Ready/ { print $1 }' <<< "$nodes")"
     fi
@@ -2035,11 +2048,11 @@ check_kube() {
     while read -r line; do
         [[ -n $line ]] || continue
         case " $line " in
-            *' MemoryPressure '*) finding CRIT kubernetes "Node ${line%% *} is short of memory" \
+            *' MemoryPressure '*) fid=kube-node-memory ftarget="${line%% *}" finding CRIT kubernetes "Node ${line%% *} is short of memory" \
                 'Kubernetes will start evicting pods.' "kubectl describe node ${line%% *}" ;;
         esac
         case " $line " in
-            *' DiskPressure '*) finding CRIT kubernetes "Node ${line%% *} is short of disk" \
+            *' DiskPressure '*) fid=kube-node-disk ftarget="${line%% *}" finding CRIT kubernetes "Node ${line%% *} is short of disk" \
                 'Kubernetes will start evicting pods and removing images.' "kubectl describe node ${line%% *}" ;;
         esac
     done <<< "$f"
@@ -2052,7 +2065,7 @@ check_kube() {
     }' <<< "$pods")
     K_BAD=$(awk 'NF { n++ } END { print n + 0 }' <<< "$K_BAD_ROWS")
     if ((K_BAD > 0)); then
-        finding CRIT kubernetes "$K_BAD pods are not healthy" \
+        fid=kube-pods-unhealthy finding CRIT kubernetes "$K_BAD pods are not healthy" \
             "$(awk '{ print $4 }' <<< "$K_BAD_ROWS" | sort | uniq -c | sort -rn | head -n 4 | awk '{ printf "%s%s x%s", (NR > 1 ? ", " : ""), $2, $1 }')" \
             'kubectl get pods -A | grep -Ev "Running|Completed"'
     fi
@@ -2060,23 +2073,23 @@ check_kube() {
         printf "%6d  %s/%s\n", $5, $1, $2 }' <<< "$pods" | sort -rn | head -n 10)
     if [[ -n $K_RESTARTS ]]; then
         count=$(awk 'END { print NR }' <<< "$K_RESTARTS")
-        finding WARN kubernetes "$count pods restarted 10 times or more" \
+        fid=kube-pods-restarting finding WARN kubernetes "$count pods restarted 10 times or more" \
             'They may look healthy now, but they keep crashing.' 'kubectl get pods -A --sort-by=.status.containerStatuses[0].restartCount'
     fi
     line=$(ku get deploy -A --no-headers | clean | awk '{ split($3, r, "/"); if (r[1] + 0 < r[2] + 0) print $1 "/" $2 " " $3 }')
     if [[ -n $line ]]; then
-        finding CRIT kubernetes "$(awk 'END { print NR }' <<< "$line") deployments lack ready replicas" \
+        fid=kube-deployments-unready finding CRIT kubernetes "$(awk 'END { print NR }' <<< "$line") deployments lack ready replicas" \
             "$(head -n 3 <<< "$line" | tr '\n' ';')" 'kubectl get deploy -A'
     fi
     line=$(ku get pvc -A --no-headers | clean | awk '$3 != "Bound" { print $1 "/" $2 " " $3 }')
     if [[ -n $line ]]; then
-        finding WARN kubernetes "$(awk 'END { print NR }' <<< "$line") storage claims are not bound" \
+        fid=kube-pvc-unbound finding WARN kubernetes "$(awk 'END { print NR }' <<< "$line") storage claims are not bound" \
             "$(head -n 3 <<< "$line" | tr '\n' ';')" 'kubectl get pvc -A'
     fi
     for f in /etc/kubernetes/pki/apiserver.crt /var/lib/rancher/k3s/server/tls/serving-kube-apiserver.crt; do
         [[ -r $f ]] && has openssl || continue
         if ! openssl x509 -checkend $((30 * 86400)) -noout -in "$f" >/dev/null 2>&1; then
-            finding CRIT kubernetes 'Kubernetes API certificate expires within 30 days' \
+            fid=kube-cert-expiring ftarget="$f" finding CRIT kubernetes 'Kubernetes API certificate expires within 30 days' \
                 'When it expires the cluster stops accepting commands.' "openssl x509 -enddate -noout -in $f"
         fi
     done
@@ -2199,13 +2212,13 @@ check_web() {
             ((W_CERT_N += 1))
             W_CERTS+=$(printf '%-36.36s %6s days  %s' "$subject" "${days:-?}" "$end")$'\n'
             if ! openssl x509 -checkend 0 -noout -in "$cert" >/dev/null 2>&1; then
-                finding CRIT web "TLS certificate expired: $subject" \
+                fid=tls-expired ftarget="$subject" finding CRIT web "TLS certificate expired: $subject" \
                     'Browsers show a security error and visitors leave.' "openssl x509 -enddate -noout -in $cert"
             elif ! openssl x509 -checkend $((7 * 86400)) -noout -in "$cert" >/dev/null 2>&1; then
-                finding CRIT web "TLS certificate expires within 7 days: $subject" \
+                fid=tls-expiring-soon ftarget="$subject" finding CRIT web "TLS certificate expires within 7 days: $subject" \
                     'Renewal is probably failing.' 'certbot renew --dry-run'
             elif ! openssl x509 -checkend $((21 * 86400)) -noout -in "$cert" >/dev/null 2>&1; then
-                finding WARN web "TLS certificate expires within 21 days: $subject" \
+                fid=tls-expiring ftarget="$subject" finding WARN web "TLS certificate expires within 21 days: $subject" \
                     "Let's Encrypt renews at 30 days left, so renewal may be failing." 'certbot renew --dry-run'
             fi
         done <<< "$(printf '%s\n' "$W_CERT_PATHS" | sort -u)"
@@ -2264,7 +2277,7 @@ check_mysql() {
         case $out in
             *'Access denied'*) db_row MySQL/MariaDB running 'needs a password for details' ;;
             *) db_row MySQL/MariaDB down 'client cannot connect'
-               finding CRIT data 'MySQL/MariaDB is not answering' 'Apps using it will show database errors.' \
+               fid=mysql-down finding CRIT data 'MySQL/MariaDB is not answering' 'Apps using it will show database errors.' \
                    'systemctl status mysql mariadb' ;;
         esac
         return 0
@@ -2274,7 +2287,7 @@ check_mysql() {
     up=$(awk '$1 == "Uptime" { print $2 }' <<< "$out")
     db_row MySQL/MariaDB running "connections $conn of $max, up $(human_age "${up:-0}")"
     if [[ $conn =~ ^[0-9]+$ && $max =~ ^[1-9][0-9]*$ ]] && ((conn * 100 / max >= 80)); then
-        finding WARN data "MySQL uses $conn of $max connections" \
+        fid=mysql-connections finding WARN data "MySQL uses $conn of $max connections" \
             'At the limit, apps get "too many connections".' "$client -e 'SHOW PROCESSLIST'"
     fi
     out=$(run_t 6 "$client" --connect-timeout=3 -e 'SHOW SLAVE STATUS\G' 2>/dev/null)
@@ -2282,7 +2295,7 @@ check_mysql() {
         behind=$(awk '/Seconds_Behind_Master:/ { print $2 }' <<< "$out")
         db_row 'MySQL replica' "${behind:-?}s behind" "$(awk '/Slave_(IO|SQL)_Running:/ { printf "%s ", $0 }' <<< "$out" | tr -s ' ')"
         if [[ $out == *'Running: No'* ]]; then
-            finding CRIT data 'MySQL replication is stopped' 'This replica no longer receives data.' \
+            fid=mysql-replication-stopped finding CRIT data 'MySQL replication is stopped' 'This replica no longer receives data.' \
                 "$client -e 'SHOW SLAVE STATUS\\G'"
         fi
     fi
@@ -2292,7 +2305,7 @@ check_postgres() {
     if ! has pg_isready; then db_row PostgreSQL "$1" 'pg_isready not available'; return 0; fi
     if ! run_t 5 pg_isready -t 3 >/dev/null 2>&1; then
         db_row PostgreSQL down 'pg_isready failed'
-        finding CRIT data 'PostgreSQL is not answering' 'Apps using it will show database errors.' 'systemctl status postgresql'
+        fid=postgres-down finding CRIT data 'PostgreSQL is not answering' 'Apps using it will show database errors.' 'systemctl status postgresql'
         return 0
     fi
     db_row PostgreSQL running 'answers; details need the postgres user'
@@ -2306,7 +2319,7 @@ check_redis() {
         *PONG*) ;;
         *NOAUTH*|*'Authentication required'*) db_row "$name" running 'password protected'; return 0 ;;
         *) db_row "$name" down 'no answer on 127.0.0.1:6379'
-           finding CRIT data "$name is not answering" 'Caches, sessions and queues using it will fail.' "$cli ping"
+           fid=redis-down ftarget="$name" finding CRIT data "$name is not answering" 'Caches, sessions and queues using it will fail.' "$cli ping"
            return 0 ;;
     esac
     out=$(run_t 5 "$cli" -h 127.0.0.1 info 2>/dev/null | tr -d '\r')
@@ -2316,10 +2329,10 @@ check_redis() {
     save=$(awk -F: '$1 == "rdb_last_bgsave_status" { print $2 }' <<< "$out")
     db_row "$name" running "$role, memory $mem, clients $clients"
     if [[ $save == err ]]; then
-        finding CRIT data "$name cannot save to disk" 'A restart would lose recent data, and writes may be refused.' "$cli info persistence"
+        fid=redis-save-failing ftarget="$name" finding CRIT data "$name cannot save to disk" 'A restart would lose recent data, and writes may be refused.' "$cli info persistence"
     fi
     if [[ $NET_ROWS == *"tcp 6379 public"* ]]; then
-        finding CRIT security "$name answers with no password on a public port" \
+        fid=redis-open ftarget="$name" finding CRIT security "$name answers with no password on a public port" \
             'Anyone can read the data, and this is a well-known way to take over servers.' 'ss -lntp | grep 6379'
     fi
 }
@@ -2341,7 +2354,7 @@ check_data() {
         out=$(run_t 5 curl -s -m 3 http://127.0.0.1:9200/_cluster/health 2>/dev/null | clean)
         case $out in
             *'"status":"red"'*) db_row Elasticsearch red 'some data is unavailable'
-                finding CRIT data 'Search cluster status is red' 'Some data is unavailable.' 'curl -s localhost:9200/_cluster/health?pretty' ;;
+                fid=search-red finding CRIT data 'Search cluster status is red' 'Some data is unavailable.' 'curl -s localhost:9200/_cluster/health?pretty' ;;
             *'"status":"yellow"'*) db_row Elasticsearch yellow 'data safe, replicas missing' ;;
             *'"status":"green"'*) db_row Elasticsearch green healthy ;;
             *) db_row Elasticsearch running 'needs a password for details' ;;
@@ -2397,26 +2410,26 @@ check_security() {
         count=$(awk '$1 == "passwordauthentication" { print $2 }' <<< "$out")
         S_SSH="root login ${value:-default}, password login ${count:-default}, port $(awk '$1 == "port" { print $2; exit }' <<< "$out")"
         if [[ $value == yes && $count != no ]]; then
-            finding WARN security 'SSH allows root login with a password' \
+            fid=ssh-root-password finding WARN security 'SSH allows root login with a password' \
                 'Bots guess root passwords all day. Prefer SSH keys.' 'grep -Ei "permitroot|passwordauth" /etc/ssh/sshd_config'
         fi
     fi
     value=$(awk -F: '$3 == 0 && $1 != "root" { printf "%s%s", (n++ ? ", " : ""), $1 }' /etc/passwd 2>/dev/null | clean)
     if [[ -n $value ]]; then
-        finding CRIT security "Account with root power besides root: $value" \
+        fid=extra-uid0 ftarget="$value" finding CRIT security "Account with root power besides root: $value" \
             'If nobody here created it on purpose, treat it as a break-in.' "awk -F: '\$3 == 0' /etc/passwd"
     fi
     if [[ -r /etc/shadow ]]; then
         # Only count. Password hashes must never appear in output.
         count=$(awk -F: '$2 == "" { n++ } END { print n + 0 }' /etc/shadow 2>/dev/null)
         if ((count > 0)); then
-            finding CRIT security "$count accounts have an empty password" \
+            fid=empty-passwords finding CRIT security "$count accounts have an empty password" \
                 'Anyone could log in as them without a password.' "sudo awk -F: '\$2 == \"\" { print \$1 }' /etc/shadow"
         fi
     fi
     while read -r pid exe; do
         [[ -n $pid ]] || continue
-        finding WARN security "A program runs from a temporary folder (PID $pid)" \
+        fid=exe-in-tmp ftarget="$pid" finding WARN security "A program runs from a temporary folder (PID $pid)" \
             "$(printf '%s' "$exe" | cut -c1-60). Malware likes these folders." "ls -l /proc/$pid/exe"
     done <<< "$(ls -l /proc/[0-9]*/exe 2>/dev/null | clean | awk '
         match($0, / -> \/(tmp|var\/tmp|dev\/shm)\//) {
@@ -2428,12 +2441,12 @@ check_security() {
     if [[ -z $H_CONTAINER ]]; then
         value=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | grep -v 'rescue\|debug' | sort -V 2>/dev/null | tail -n 1)
         if [[ -n $value && $value != "$H_KERNEL" ]]; then
-            finding WARN security "A newer kernel is installed: $value" \
+            fid=kernel-pending ftarget="$value" finding WARN security "A newer kernel is installed: $value" \
                 "The server still runs $H_KERNEL, so its fixes are not active until a reboot." 'uname -r'
         fi
     fi
     if [[ -f /var/run/reboot-required ]]; then
-        finding WARN security 'A reboot is required' 'Installed security fixes are not active until a reboot.' 'cat /var/run/reboot-required.pkgs'
+        fid=reboot-required finding WARN security 'A reboot is required' 'Installed security fixes are not active until a reboot.' 'cat /var/run/reboot-required.pkgs'
     fi
     if has apt-get; then
         # Empty cache paths keep apt from rewriting its package cache files.
@@ -2449,10 +2462,10 @@ check_security() {
     fi
     if [[ $S_UPDATES =~ ^[0-9]+$ ]] && ((S_UPDATES > 0)); then
         if ((${count:-0} > 0)); then
-            finding WARN security "$count security updates are waiting ($S_UPDATES updates in total)" \
+            fid=updates-security finding WARN security "$count security updates are waiting ($S_UPDATES updates in total)" \
                 'Known holes stay open until they are installed.' 'apt list --upgradable'
         elif ((S_UPDATES >= 50)); then
-            finding INFO security "$S_UPDATES package updates are waiting" 'The system has not been updated for a while.' 'apt list --upgradable'
+            fid=updates-many finding INFO security "$S_UPDATES package updates are waiting" 'The system has not been updated for a while.' 'apt list --upgradable'
         fi
     fi
     # Plain log files first: a time-filtered journal search can take many seconds.
@@ -2516,7 +2529,7 @@ check_logs() {
     victims=$(grep -io 'killed process [0-9]* ([^)]*)' <<< "$log" | sed 's/.*(//; s/)//' | sort | uniq -c | sort -rn |
         head -n 4 | awk '{ printf "%s%s x%s", (NR > 1 ? ", " : ""), $2, $1 }')
     if [[ ${R_OOM:-0} =~ ^[1-9] || -n $victims ]]; then
-        finding WARN resources "The kernel killed ${R_OOM:-some} processes for lack of memory since boot" \
+        fid=oom-kills ftarget="$victims" finding WARN resources "The kernel killed ${R_OOM:-some} processes for lack of memory since boot" \
             "${victims:+Killed in the last 7 days: $victims. }A service may have died silently. Add RAM or lower its memory settings." \
             'journalctl -k | grep -i "out of memory"'
     fi
@@ -2528,11 +2541,11 @@ check_logs() {
     L_HW=$(grep -iE 'machine check events logged|hardware error|soft lockup|blocked for more than|segfault' <<< "$log" |
         grep -iv 'command line' | tail -n 8 | cut -c1-120)
     if [[ -n $L_DISK ]]; then
-        finding CRIT disk "Kernel logged $(awk 'END { print NR }' <<< "$count") disk errors recently" \
+        fid=disk-errors finding CRIT disk "Kernel logged $(awk 'END { print NR }' <<< "$count") disk errors recently" \
             'The disk may be failing. Check your backups before anything else.' 'journalctl -k -p err --since "7 days ago"'
     fi
     if [[ -n $L_HW ]]; then
-        finding WARN host 'Kernel logged crashes or hardware warnings' \
+        fid=kernel-faults finding WARN host 'Kernel logged crashes or hardware warnings' \
             'Programs crashed, or the hardware reported a fault.' 'journalctl -k -p warning --since "7 days ago"'
     fi
     return 0
@@ -2602,7 +2615,7 @@ check_jobs() {
         age=$((($(date +%s) - age) / 86400))
         J_BACKUP_AGE="newest in $f is $age days old"
         if ((age > 8)); then
-            finding WARN jobs "The newest backup in $f is $age days old" \
+            fid=backup-old ftarget="$f" finding WARN jobs "The newest backup in $f is $age days old" \
                 'Backups may have stopped. An old backup means lost work.' "ls -lt $f | head"
         fi
         break
@@ -2612,11 +2625,11 @@ check_jobs() {
         J_BACKUP='a scheduled job mentions backups; confirm it works'
     fi
     if [[ -z $J_BACKUP ]]; then
-        finding WARN jobs 'No backup tool or backup job was found' \
+        fid=backup-missing finding WARN jobs 'No backup tool or backup job was found' \
             'This check only sees this server. Confirm that a backup exists somewhere and that it restores.' 'crontab -l'
     fi
     if [[ -z $J_MONITOR ]]; then
-        finding INFO jobs 'No monitoring agent is running' \
+        fid=monitoring-missing finding INFO jobs 'No monitoring agent is running' \
             'Nothing warns you when this server has a problem. This tool only sees right now.' ''
     fi
     return 0
@@ -2709,6 +2722,7 @@ run_checks() {
     check_web
     progress 'databases'
     check_data
+    check_app_versions
     progress 'security and updates'
     check_security
     progress 'logs'
@@ -2868,6 +2882,136 @@ view_report() {
     view_logs
     print_signatures
     title 'Done' "Read-only scan of ${H_NAME:-this server} finished."
+}
+
+# ---------------------------------------------------------------------------
+# End of official support for the applications in use
+# ---------------------------------------------------------------------------
+app_row() {
+    local app=$1 version=$2 eol=$3
+    [[ -n $eol ]] || return 0
+    APP_ROWS+="$app|$version|$eol"$'\n'
+    if [[ $eol < $(date +%Y-%m) ]]; then
+        fid=app-eol ftarget="$app:$version" finding WARN security "$app $version no longer gets official fixes" \
+            "Official support ended in $eol. Your OS vendor may still patch it. Check, then plan an upgrade." \
+            "$app --version"
+    fi
+}
+
+check_app_versions() {
+    local text version listed=' ' eol
+    APP_ROWS=
+    # Every PHP that actually serves sites, plus the command line one.
+    text=$(printf '%s' "$active_units" | awk '$3 == "active" && $1 ~ /php/ { print $1 }')
+    has php && text+=$'\n'php-cli-$(run_t 4 php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null)
+    while IFS= read -r version; do
+        version=$(sed -E 's/^php-cli-//; s/^[^0-9]*([0-9])\.?([0-9]).*/\1.\2/' <<< "$version")
+        [[ $version =~ ^[0-9]\.[0-9]$ && $listed != *" $version "* ]] || continue
+        listed+="$version "
+        case $version in
+            5.*) eol=2018-12 ;; 7.0) eol=2019-01 ;; 7.1) eol=2019-12 ;; 7.2) eol=2020-11 ;;
+            7.3) eol=2021-12 ;; 7.4) eol=2022-11 ;; 8.0) eol=2023-11 ;; 8.1) eol=2025-12 ;;
+            8.2) eol=2026-12 ;; 8.3) eol=2027-12 ;; 8.4) eol=2028-12 ;; *) eol= ;;
+        esac
+        app_row php "$version" "$eol"
+    done <<< "$text"
+    text=
+    if has mariadb; then text=$(run_t 3 mariadb --version 2>/dev/null)
+    elif has mysql; then text=$(run_t 3 mysql --version 2>/dev/null)
+    fi
+    if [[ -n $(sig_list RUNNING '^(MariaDB server|MySQL-compatible)') ]]; then
+        version=$(sed -E 's/.*(Distrib|Ver) ([0-9]+\.[0-9]+).*/\2/' <<< "$text")
+        if [[ $text == *MariaDB* ]]; then
+            case $version in
+                5.*|10.[0-2]) eol=2022-05 ;; 10.3) eol=2023-05 ;; 10.4) eol=2024-06 ;; 10.5) eol=2025-06 ;;
+                10.6) eol=2026-07 ;; 10.11) eol=2028-02 ;; 11.4) eol=2029-05 ;; *) eol= ;;
+            esac
+            app_row mariadb "$version" "$eol"
+        else
+            case $version in
+                5.5) eol=2018-12 ;; 5.6) eol=2021-02 ;; 5.7) eol=2023-10 ;; 8.0) eol=2026-04 ;; 8.4) eol=2032-04 ;; *) eol= ;;
+            esac
+            app_row mysql "$version" "$eol"
+        fi
+    fi
+    if [[ -n $(sig_list RUNNING '^PostgreSQL server') ]] && has psql; then
+        version=$(run_t 3 psql --version 2>/dev/null | sed -E 's/.* ([0-9]+)[.0-9]*.*/\1/')
+        case $version in
+            9|10) eol=2022-11 ;; 11) eol=2023-11 ;; 12) eol=2024-11 ;; 13) eol=2025-11 ;; 14) eol=2026-11 ;;
+            15) eol=2027-11 ;; 16) eol=2028-11 ;; 17) eol=2029-11 ;; *) eol= ;;
+        esac
+        app_row postgresql "$version" "$eol"
+    fi
+    if has node; then
+        version=$(run_t 3 node --version 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/')
+        if [[ $version =~ ^[0-9]+$ ]]; then
+            case $version in
+                ?|1[0-6]) eol=2023-09 ;; 17|18) eol=2025-04 ;; 19|20) eol=2026-04 ;; 21|22) eol=2027-04 ;;
+                23|24) eol=2028-04 ;; *) eol= ;;
+            esac
+            app_row nodejs "$version" "$eol"
+        fi
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# JSON: everything a script or a future fixer needs, with no English to parse
+# ---------------------------------------------------------------------------
+js() {
+    local text=$1
+    text=${text//\\/\\\\}
+    text=${text//\"/\\\"}
+    text=${text//$'\t'/ }
+    printf '"%s"' "$text"
+}
+
+view_json() {
+    local i sep='' proto port scope addr proc pid line group label status
+    printf '{"tool":"linux-host-audit","version":%s,"generated":%s,' "$(js "$LHA_VERSION")" "$(js "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")"
+    printf '"host":{"name":%s,"os_id":%s,"os_version":%s,"os":%s,"os_eol":%s,' "$(js "$H_NAME")" "$(js "$H_OS_ID")" \
+        "$(js "$H_OS_VERSION")" "$(js "$H_OS")" "$(js "$H_EOL")"
+    printf '"kernel":%s,"arch":%s,"init":%s,"package_manager":%s,"virtualization":%s,"container":%s,' "$(js "$H_KERNEL")" \
+        "$(js "$H_ARCH")" "$(js "$H_INIT")" "$(js "$H_PKG")" "$(js "$H_VIRT")" "$(js "$H_CONTAINER")"
+    if ((LHA_UID == 0)); then line=true; else line=false; fi
+    printf '"cpus":%s,"memory_kb":%s,"uptime_seconds":%s,"is_root":%s},' "$H_CPUS" "${R_MEM_TOTAL:-0}" "${H_UPTIME:-0}" "$line"
+    printf '"summary":{"critical":%s,"warning":%s,"info":%s},"findings":[' "$F_CRIT" "$F_WARN" "$F_INFO"
+    for ((i = 0; i < F_N; i++)); do
+        printf '%s{"id":%s,"severity":%s,"area":%s,"target":%s,"title":%s,"why":%s,"next":%s}' "$sep" "$(js "${F_ID[i]}")" \
+            "$(js "${F_SEV[i]}")" "$(js "${F_AREA[i]}")" "$(js "${F_TARGET[i]}")" "$(js "${F_TITLE[i]}")" \
+            "$(js "${F_WHY[i]}")" "$(js "${F_NEXT[i]}")"
+        sep=,
+    done
+    printf '],"listeners":['
+    sep=
+    while read -r proto port scope addr proc pid; do
+        [[ -n $proto ]] || continue
+        printf '%s{"proto":%s,"port":%s,"scope":%s,"address":%s,"process":%s}' "$sep" "$(js "$proto")" "$port" "$(js "$scope")" \
+            "$(js "$addr")" "$(js "$proc")"
+        sep=,
+    done <<< "$NET_ROWS"
+    printf '],"failed_services":['
+    sep=
+    while read -r line; do
+        [[ -n $line ]] || continue
+        printf '%s%s' "$sep" "$(js "$line")"
+        sep=,
+    done <<< "$SVC_FAILED"
+    printf '],"app_versions":['
+    sep=
+    while IFS='|' read -r label line status; do
+        [[ -n $label ]] || continue
+        printf '%s{"app":%s,"version":%s,"support_until":%s}' "$sep" "$(js "$label")" "$(js "$line")" "$(js "$status")"
+        sep=,
+    done <<< "$APP_ROWS"
+    printf '],"software":['
+    sep=
+    while IFS='|' read -r group label status line; do
+        [[ -n $label && $status != NOT-DETECTED ]] || continue
+        printf '%s{"name":%s,"group":%s,"status":%s}' "$sep" "$(js "$label")" "$(js "$group")" "$(js "$status")"
+        sep=,
+    done <<< "$sig_rows"
+    printf ']}\n'
 }
 
 view_resources_full() {
@@ -3403,6 +3547,7 @@ Views (each prints and exits):
   --resources    CPU, RAM, disk, top processes
   --learn        Guided tour and glossary
   --report       All of the above
+  --json         Findings and server facts for scripts, with stable finding ids
 Tools:
   --menu         Open the interactive menu
   --monitor      Live CPU, RAM, disk and network charts
@@ -3446,7 +3591,7 @@ main() {
     fi
     case ${1:-} in
         --menu|--monitor|--metrics|--overview|--problems|--apps|--network|--containers|--docker|--k8s|\
-        --web|--db|--security|--logs|--jobs|--resources|--learn|--report|--check)
+        --web|--db|--security|--logs|--jobs|--resources|--learn|--report|--check|--json)
             if (($# != 1)); then printf 'Unexpected arguments for %s\n' "$1" >&2; return 2; fi ;;
     esac
     case ${1:-} in
@@ -3467,6 +3612,7 @@ main() {
         --resources) one_view view_resources ;;
         --learn) one_view view_learn ;;
         --report) one_view view_report ;;
+        --json) NO_COLOR=1 one_view view_json ;;
         --check)
             NO_COLOR=1 ui_colors
             run_checks
