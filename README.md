@@ -71,6 +71,13 @@ appear too), ports and firewall, Docker, Podman, LXD, Incus, Proxmox, libvirt, K
 k0s, RKE2, MicroK8s, OpenShift), websites, domains and SSL, databases and caches, security, logs,
 application errors, scheduled jobs, backups, a live monitor, and a guided tour.
 
+`--panel` is full troubleshooting for cPanel & WHM, Plesk and DirectAdmin: the version and how long
+its vendor supports it, the update state, services, panel logs grouped and explained, sites on each PHP
+version on cPanel, and the vendor's own commands for that panel. Tuning and fix steps also follow each
+panel, because a panel rewrites the files it generates. So on a panel server this tool shows the right
+place to change a setting and leaves those files alone. [SOURCES.md](SOURCES.md) lists the vendor page
+behind each command, and says which were run for real and which only come from the documentation.
+
 `--errors` reads a bounded tail of the error log of each running application: nginx, Apache, LiteSpeed,
 PHP-FPM, MySQL, MariaDB, PostgreSQL, Redis, Valkey, MongoDB, Elasticsearch, OpenSearch, HAProxy, Varnish,
 Tomcat, RabbitMQ, Kafka, ClickHouse, Cassandra, Squid, Exim, Postfix, Dovecot, PowerDNS, BIND, cPanel,

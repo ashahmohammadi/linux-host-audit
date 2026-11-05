@@ -12,7 +12,7 @@ uname) case $1 in -s) echo Linux ;; -r) echo 6.8.0-45-generic ;; -m) echo x86_64
 getconf) echo 4 ;;
 systemd-detect-virt) echo kvm ;;
 timedatectl) [[ $SCENARIO == broken ]] && echo no || echo yes ;;
-date) if [[ $1 == +%s ]]; then echo 1793000000; elif [[ $1 == -d ]]; then echo 1793200000; else echo '2026-11-04 21:00 UTC'; fi ;;
+date) if [[ $1 == +%s ]]; then echo 1793000000; elif [[ $1 == -d ]]; then echo 1793200000; elif [[ $1 == -r ]]; then /usr/bin/date -r "$2" +%s; else echo '2026-11-04 21:00 UTC'; fi ;;
 df)
     if [[ $SCENARIO == broken ]]; then
         if [[ $args == *' -lP -i '* || $args == *' -i '* ]]; then

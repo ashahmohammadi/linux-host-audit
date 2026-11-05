@@ -145,19 +145,39 @@ dx_kube_node_notready() {
 }
 ap_kube_node_notready() { ap_service_failed "$FX_UNIT"; }
 ck_kube_node_notready() { ck_service_failed "$FX_UNIT"; }
-dx_kube_node_memory() { FX_CAUSE='The kubelet reports memory pressure, and will evict pods.'; FX_STEPS=("kubectl top pods -A --sort-by=memory" "kubectl describe node $1"); }
-dx_kube_node_disk() { FX_CAUSE='The kubelet reports disk pressure, and will evict pods and remove images.'; FX_STEPS=('Run the disk fix on that node.' 'crictl rmi --prune'); }
+# crictl finds its socket by itself only on plain Kubernetes.
+fx_crictl() {
+    if has k3s; then REPLY='k3s crictl'
+    elif [[ -x /var/lib/rancher/rke2/bin/crictl ]]; then REPLY='CRI_CONFIG_FILE=/var/lib/rancher/rke2/agent/etc/crictl.yaml /var/lib/rancher/rke2/bin/crictl'
+    elif has microk8s; then REPLY='microk8s ctr'
+    else REPLY=crictl
+    fi
+}
+dx_kube_node_memory() { FX_CAUSE='The kubelet reports memory pressure, and will evict pods.'; FX_STEPS=("kubectl top pods -A --sort-by=memory, which needs metrics-server" "kubectl describe node $1"); }
+dx_kube_node_disk() {
+    FX_CAUSE='The kubelet reports disk pressure, and will evict pods and remove images.'
+    fx_crictl
+    FX_STEPS=('Run the disk fix on that node.')
+    if [[ $REPLY != *ctr ]]; then FX_STEPS+=("$REPLY rmi --prune"); fi
+}
 dx_kube_deployments_unready() { FX_CAUSE='Deployments have fewer ready pods than requested.'; FX_STEPS=('kubectl get deploy -A' 'kubectl rollout status deploy/NAME -n NS' 'kubectl rollout undo deploy/NAME -n NS undoes a bad release.'); }
 dx_kube_pvc_unbound() { FX_CAUSE='A storage claim has no volume.'; FX_STEPS=('kubectl get pvc -A' 'kubectl describe pvc NAME -n NS' 'kubectl get storageclass'); }
 dx_kube_pods_restarting() { FX_CAUSE='These pods keep restarting.'; FX_STEPS=('kubectl logs POD -n NS --previous' 'kubectl get events -A --sort-by=.lastTimestamp | tail -20'); }
 dx_kube_api_down() {
     FX_CAUSE='kubectl cannot reach the API server.'
-    FX_STEPS=('systemctl status kubelet k3s rke2-server' 'crictl ps -a | grep -E "apiserver|etcd"' 'df -h /var/lib/etcd' 'kubeadm certs check-expiration')
+    fx_crictl
+    FX_STEPS=('systemctl status kubelet k3s rke2-server' "$REPLY ps -a | grep -E \"apiserver|etcd\"" 'df -h /var/lib/etcd')
+    if has k3s; then FX_STEPS+=('k3s certificate check')
+    elif has rke2; then FX_STEPS+=('rke2 certificate check')
+    else FX_STEPS+=('kubeadm certs check-expiration, or on Kubernetes before 1.20: kubeadm alpha certs check-expiration')
+    fi
 }
 dx_kube_cert_expiring() {
     FX_CAUSE="$1 expires within 30 days."
     FX_MODE=never
-    FX_STEPS=('kubeadm: kubeadm certs renew all, then restart the control-plane static pods one at a time.' 'k3s or RKE2: restart the service, which rotates certificates near expiry.')
+    FX_STEPS=('kubeadm: kubeadm certs renew all, then restart the control-plane static pods one at a time. Before 1.20 it is kubeadm alpha certs renew all.'
+        'k3s and RKE2 renew what expires within 120 days at each start, or within 90 before the May 2025 releases.'
+        'By hand on k3s: systemctl stop k3s, k3s certificate rotate, systemctl start k3s. RKE2 is the same with rke2 and rke2-server.')
 }
-dx_kube_no_client() { FX_CAUSE='No kubectl on this machine.'; FX_STEPS=('crictl ps' 'Run this tool on a control-plane node.'); }
+dx_kube_no_client() { FX_CAUSE='No kubectl on this machine.'; fx_crictl; FX_STEPS=("$REPLY ps" 'Run this tool on a control-plane node.'); }
 dx_kube_no_credentials() { FX_CAUSE='Normal on a worker node.'; FX_STEPS=('Run this tool on a control-plane node.'); }

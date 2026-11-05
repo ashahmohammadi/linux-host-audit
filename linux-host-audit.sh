@@ -4,7 +4,7 @@
 # Never prints passwords, process arguments, container environments or Kubernetes secrets.
 # Bash 3.2+ on any Linux. Missing tools only hide the part of the report that needs them.
 
-LHA_VERSION=3.6.0
+LHA_VERSION=3.7.0
 # Lets tests point file checks at a made-up server. Empty on a real one.
 LHA_ROOT=${LHA_TEST_ROOT:-}
 
@@ -1375,8 +1375,16 @@ check_eol() {
     done < /etc/os-release
     case $H_OS_ID:${H_OS_VERSION%%.*} in
         amzn:2) H_EOL=2026-06 ;;
-        almalinux:8|rocky:8|ol:8|rhel:8|cloudlinux:8) H_EOL=2029-03 ;;
-        almalinux:9|rocky:9|ol:9|rhel:9|cloudlinux:9) H_EOL=2032-05 ;;
+        amzn:2023) H_EOL=2029-06 ;;
+        almalinux:8|rocky:8|rhel:8|cloudlinux:8) H_EOL=2029-05 ;;
+        almalinux:9|rocky:9|rhel:9|cloudlinux:9) H_EOL=2032-05 ;;
+        almalinux:10|rocky:10|rhel:10) H_EOL=2035-05 ;;
+        ol:7) H_EOL=2024-12 ;;
+        ol:8) H_EOL=2029-07 ;;
+        ol:9) H_EOL=2032-06 ;;
+        ol:10) H_EOL=2035-06 ;;
+        centos:9) H_EOL=2027-05 ;;
+        centos:10) H_EOL=2030-05 ;;
         centos:6) H_EOL=2020-11 ;;
         centos:7|rhel:7|cloudlinux:7) H_EOL=2024-06 ;;
         centos:8) H_EOL=2021-12 ;;
@@ -1392,9 +1400,11 @@ check_eol() {
         ubuntu:16.04*) H_EOL=2021-04 ;;
         ubuntu:18.04*) H_EOL=2023-05 ;;
         ubuntu:20.04*) H_EOL=2025-05 ;;
-        ubuntu:22.04*) H_EOL=2027-04 ;;
-        ubuntu:24.04*) H_EOL=2029-04 ;;
-        ubuntu:26.04*) H_EOL=2031-04 ;;
+        ubuntu:22.04*) H_EOL=2027-05 ;;
+        ubuntu:24.04*) H_EOL=2029-05 ;;
+        ubuntu:25.04*) H_EOL=2026-01 ;;
+        ubuntu:25.10*) H_EOL=2026-06 ;;
+        ubuntu:26.04*) H_EOL=2031-05 ;;
     esac
     if [[ -n $H_EOL && $H_EOL < $(date +%Y-%m) ]]; then
         fid=os-eol ftarget="$H_OS" finding WARN security "$H_OS no longer gets free security updates" \
@@ -1936,7 +1946,7 @@ check_mail() {
     [[ $MAIL_QUEUE =~ ^[0-9]+$ ]] || MAIL_QUEUE=
     if [[ -n $MAIL_QUEUE ]] && ((MAIL_QUEUE >= 1000)); then
         fid=mail-queue finding WARN services "$MAIL_QUEUE emails are stuck in the mail queue" \
-            'Mail is not leaving, or a hacked site is sending spam.' "$(if [[ -n $(sig_list RUNNING '^Exim') ]]; then printf 'exim -bp | head'; else printf 'postqueue -p | head'; fi)"
+            'Mail is not leaving, or a hacked site is sending spam.' "$(if [[ -n $(sig_list RUNNING '^Exim') ]]; then printf '%s -bp | exiqsumm | tail' "$text"; else printf 'postqueue -p | head'; fi)"
     fi
     return 0
 }
@@ -2458,17 +2468,17 @@ db_row() { DB_ROWS+=$(printf '%-16s %-14s %s' "$1" "$2" "$3")$'\n'; }
 listening() { [[ $NET_ROWS == *"tcp $1 "* ]]; }
 
 check_mysql() {
-    local client=mysql out conn max up behind
-    has mysql || client=mariadb
-    has "$client" || { db_row MySQL/MariaDB "$1" 'no client to query it'; return 0; }
-    out=$(run_t 6 "$client" --connect-timeout=3 -NBe \
+    local out conn max up behind
+    sql_find
+    has "${SQL[0]}" || { db_row MySQL/MariaDB "$1" 'no client to query it'; return 0; }
+    out=$(run_t 6 "${SQL[@]}" --connect-timeout=3 -NBe \
         "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected','Uptime'); SHOW VARIABLES LIKE 'max_connections'" 2>&1)
     if (($? != 0)); then
         case $out in
             *'Access denied'*) db_row MySQL/MariaDB running 'needs a password for details' ;;
             *) db_row MySQL/MariaDB down 'client cannot connect'
                fid=mysql-down finding CRIT data 'MySQL/MariaDB is not answering' 'Apps using it will show database errors.' \
-                   'systemctl status mysql mariadb' ;;
+                   'systemctl status mariadb mysqld mysql' ;;
         esac
         return 0
     fi
@@ -2478,18 +2488,18 @@ check_mysql() {
     db_row MySQL/MariaDB running "connections $conn of $max, up $(human_age "${up:-0}")"
     if [[ $conn =~ ^[0-9]+$ && $max =~ ^[1-9][0-9]*$ ]] && ((conn * 100 / max >= 80)); then
         fid=mysql-connections finding WARN data "MySQL uses $conn of $max connections" \
-            'At the limit, apps get "too many connections".' "$client -e 'SHOW PROCESSLIST'"
+            'At the limit, apps get "too many connections".' "${SQL[*]} -e 'SHOW PROCESSLIST'"
     fi
     # MySQL 8.4 removed the old statement and the old field names. MariaDB before 10.5 and
     # MySQL before 8.0.22 know only those.
-    out=$(run_t 6 "$client" --connect-timeout=3 -e 'SHOW REPLICA STATUS\G' 2>/dev/null) || out=
-    [[ -n $out ]] || out=$(run_t 6 "$client" --connect-timeout=3 -e 'SHOW SLAVE STATUS\G' 2>/dev/null)
+    out=$(run_t 6 "${SQL[@]}" --connect-timeout=3 -e 'SHOW REPLICA STATUS\G' 2>/dev/null) || out=
+    [[ -n $out ]] || out=$(run_t 6 "${SQL[@]}" --connect-timeout=3 -e 'SHOW SLAVE STATUS\G' 2>/dev/null)
     if [[ -n $out ]]; then
         behind=$(awk '/Seconds_Behind_(Master|Source):/ { print $2 }' <<< "$out")
         db_row 'MySQL replica' "${behind:-?}s behind" "$(awk '/(Slave|Replica)_(IO|SQL)_Running:/ { printf "%s ", $0 }' <<< "$out" | tr -s ' ')"
         if [[ $out == *'Running: No'* ]]; then
             fid=mysql-replication-stopped finding CRIT data 'MySQL replication is stopped' 'This replica no longer receives data.' \
-                "$client -e 'SHOW REPLICA STATUS\\G'"
+                "${SQL[*]} -e 'SHOW REPLICA STATUS\\G'"
         fi
     fi
 }
@@ -2500,7 +2510,7 @@ check_postgres() {
     port=$(port_of postgres)
     if ! run_t 5 pg_isready -t 3 ${port:+-p "$port"} >/dev/null 2>&1; then
         db_row PostgreSQL down 'pg_isready failed'
-        fid=postgres-down finding CRIT data 'PostgreSQL is not answering' 'Apps using it will show database errors.' 'systemctl status postgresql'
+        fid=postgres-down finding CRIT data 'PostgreSQL is not answering' 'Apps using it will show database errors.' "systemctl status 'postgresql*'"
         return 0
     fi
     db_row PostgreSQL running 'answers; details need the postgres user'
@@ -2864,6 +2874,10 @@ check_jobs() {
         J_BACKUP='a scheduled job mentions backups; confirm it works'
     fi
     if [[ -z $J_BACKUP ]]; then
+        panel_find
+        if [[ $(panel_backup_state) == on ]]; then J_BACKUP="$PANEL_NAME backups are switched on; confirm they restore"; fi
+    fi
+    if [[ -z $J_BACKUP ]]; then
         fid=backup-missing finding WARN jobs 'No backup tool or backup job was found' \
             'This check only sees this server. Confirm that a backup exists somewhere and that it restores.' 'crontab -l'
     fi
@@ -2953,6 +2967,7 @@ run_checks() {
     check_mail
     progress 'ports and firewall'
     check_network
+    check_panel
     progress 'containers'
     check_containers
     progress 'Kubernetes'
@@ -3125,6 +3140,310 @@ view_report() {
 }
 
 # ---------------------------------------------------------------------------
+# Hosting panels: cPanel & WHM, Plesk and DirectAdmin. Every path and command here comes from
+# the vendor's own documentation, listed in SOURCES.md. Nothing in this part changes anything.
+# ---------------------------------------------------------------------------
+PANEL='' PANEL_NAME='' PANEL_VER='' PANEL_EOL='' PANEL_NOTE=''
+SQL=(mysql)
+
+panel_find() {
+    local R=$LHA_ROOT file line
+    [[ -z $PANEL ]] || return 0
+    if [[ -r $R/usr/local/cpanel/version ]]; then
+        PANEL=cpanel PANEL_NAME='cPanel & WHM'
+        read -r line < "$R/usr/local/cpanel/version"
+        PANEL_VER=${line#11.}
+    elif [[ -r $R/usr/local/psa/version || -r $R/opt/psa/version ]]; then
+        PANEL=plesk PANEL_NAME=Plesk
+        for file in "$R/usr/local/psa/version" "$R/opt/psa/version"; do
+            [[ -r $file ]] || continue
+            read -r PANEL_VER _ < "$file"
+            break
+        done
+    elif [[ -x $R/usr/local/directadmin/directadmin ]]; then
+        PANEL=directadmin PANEL_NAME=DirectAdmin
+        # "v" is the short form that every version of the binary understands.
+        PANEL_VER=$(run_t 3 "$R/usr/local/directadmin/directadmin" v 2>/dev/null | clean | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1)
+    fi
+    PANEL_VER=$(clean <<< "$PANEL_VER")
+    return 0
+}
+
+# How root reaches the database. The panels keep the login themselves, and these are their
+# documented ways in, so this tool never sees a password.
+sql_find() {
+    local R=$LHA_ROOT client=mysql
+    has mysql || client=mariadb
+    SQL=("$client")
+    panel_find
+    if [[ $PANEL == directadmin && -r $R/usr/local/directadmin/conf/my.cnf ]]; then
+        SQL=("$client" "--defaults-extra-file=$R/usr/local/directadmin/conf/my.cnf")
+    elif [[ $PANEL == plesk ]] && has plesk; then
+        SQL=(plesk db)
+    fi
+}
+
+# Last month of support, from the vendor's release page. "past" means an older release than the
+# table has dates for. Empty means the vendor has no end date for it, or it is newer than the table.
+panel_support() {
+    local major=${PANEL_VER%%.*}
+    PANEL_EOL='' PANEL_NOTE=''
+    [[ $major =~ ^[0-9]+$ ]] || return 0
+    case $PANEL in
+        cpanel)
+            if ((major % 2)); then PANEL_NOTE='Odd versions are development builds, not for production.'; return 0; fi
+            case $major in
+                110) PANEL_EOL=2026-12 ;; 134) PANEL_EOL=2027-06 ;; 136) PANEL_EOL=2026-08 ;; 138) PANEL_EOL=2026-11 ;;
+                *) ((major > 138)) || PANEL_EOL=past ;;
+            esac ;;
+        plesk)
+            if ((major < 18)); then PANEL_EOL=past
+            else PANEL_NOTE='Obsidian has no end date, but only an up-to-date server gets security fixes and support.'
+            fi ;;
+        directadmin) PANEL_NOTE='DirectAdmin is a rolling release: stay on the current or stable channel.' ;;
+    esac
+}
+
+panel_is_past() { [[ $PANEL_EOL == past || ( -n $PANEL_EOL && $PANEL_EOL < $(date +%Y-%m) ) ]]; }
+
+# Service names as the vendors list them. Only what really exists here is shown.
+panel_units_regex() {
+    case $PANEL in
+        cpanel) printf 'cpanel|cpsrvd|tailwatchd|queueprocd|cpanellogd|cpdavd|cphulkd|cpanel_php_fpm|httpd|nginx|mysqld|mariadb|exim|dovecot|named|pdns|pure-ftpd|proftpd|ea-php[0-9]+-php-fpm' ;;
+        plesk) printf 'psa|sw-cp-server|sw-engine|psa-firewall|apache2|httpd|nginx|mysql|mysqld|mariadb|postfix|dovecot|qmail|bind9|named|named-chroot|fail2ban|plesk-php[0-9]+-fpm' ;;
+        directadmin) printf 'directadmin|httpd|nginx|lsws|mysqld|mariadb|mysql|exim|dovecot|named|bind9|pure-ftpd|proftpd|php-fpm[0-9]+|clamd|rspamd|redis-rspamd' ;;
+    esac
+}
+
+panel_port() { case $PANEL in cpanel) printf 2087 ;; plesk) printf 8443 ;; directadmin) printf 2222 ;; esac; }
+
+# Files that hold this panel's state: each answers in one word, so the view and checks agree.
+panel_backup_state() {
+    local R=$LHA_ROOT
+    case $PANEL in
+        cpanel)
+            if grep -qE "^BACKUPENABLE:[[:space:]]*['\"]?yes" "$R/var/cpanel/backups/config" 2>/dev/null; then printf on
+            elif [[ -r $R/var/cpanel/backups/config ]]; then printf off
+            else printf none
+            fi ;;
+        directadmin) if [[ -s $R/usr/local/directadmin/data/admin/backup_crons.list ]]; then printf on; else printf none; fi ;;
+        *) printf unknown ;;
+    esac
+}
+
+panel_old_minutes() {
+    local file=$1 now was
+    [[ -e $file ]] || { printf 0; return 0; }
+    now=$(date +%s)
+    was=$(date -r "$file" +%s 2>/dev/null) || was=$now
+    printf '%s' "$(((now - was) / 60))"
+}
+
+check_panel() {
+    local R=$LHA_ROOT port value major age
+    panel_find
+    sql_find
+    [[ -n $PANEL ]] || return 0
+    panel_support
+    major=${PANEL_VER%%.*}
+    if panel_is_past; then
+        fid=panel-eol ftarget="$PANEL_NAME $PANEL_VER" finding WARN security "$PANEL_NAME $PANEL_VER no longer gets updates" \
+            'Its vendor stopped fixing security holes in this version.' "$(panel_update_hint)"
+    fi
+    port=$(panel_port)
+    if ((LHA_UID == 0)) && [[ -n $NET_ROWS ]] && ! listening "$port"; then
+        fid=panel-down ftarget="$PANEL" finding CRIT services "$PANEL_NAME is not listening on port $port" \
+            'You and your customers cannot reach the panel.' "$(panel_status_hint)"
+    fi
+    case $PANEL in
+        cpanel)
+            value=$(sed -n 's/^UPDATES=//p' "$R/etc/cpupdate.conf" 2>/dev/null | head -n 1 | clean)
+            if [[ $value == never || $value == manual ]]; then
+                fid=panel-updates-off ftarget="$value" finding WARN security "cPanel updates are set to $value" \
+                    'New security fixes will not arrive by themselves.' 'grep UPDATES /etc/cpupdate.conf'
+            fi
+            # An update that ended normally says so on its last lines. A running one is left alone.
+            age=$(panel_old_minutes "$R/var/cpanel/updatelogs/last")
+            if ((age > 120)) && ! tail -n 5 "$R/var/cpanel/updatelogs/last" 2>/dev/null | grep -q 'Completed all updates' &&
+                [[ -e $R/var/cpanel/updatelogs/last ]]; then
+                fid=panel-update-failed ftarget="$PANEL" finding WARN services 'The last cPanel update did not finish' \
+                    'Security fixes and service repairs may be missing.' 'tail -n 40 /var/cpanel/updatelogs/last'
+            fi ;;
+        directadmin)
+            # The file is removed after each run, so an old one means the processor is stuck.
+            age=$(panel_old_minutes "$R/usr/local/directadmin/data/task.queue")
+            if ((age > 15)); then
+                fid=panel-queue-stuck ftarget="$age" finding WARN services "DirectAdmin tasks are waiting for $age minutes" \
+                    'Panel changes are not reaching the services, such as new domains or web server reloads.' \
+                    'tail -n 20 /var/log/directadmin/errortaskq.log'
+            fi ;;
+    esac
+    return 0
+}
+
+panel_update_hint() {
+    case $PANEL in
+        cpanel) printf 'WHM > Home > Server Configuration > Update Preferences' ;;
+        plesk) printf 'plesk listupgrade' ;;
+        directadmin) printf 'da update' ;;
+    esac
+}
+panel_status_hint() {
+    case $PANEL in
+        cpanel) printf 'systemctl status cpanel' ;;
+        plesk) printf 'systemctl status psa sw-cp-server sw-engine' ;;
+        directadmin) printf 'systemctl status directadmin' ;;
+    esac
+}
+
+panel_services() {
+    local regex rows
+    regex=$(panel_units_regex)
+    rows=$(awk -v r="^($regex)\\\\.service\$" '$1 ~ r { sub(/\.service$/, "", $1); printf "%s %s\n", $1, $3 }' <<< "$active_units" | sort -u)
+    if [[ -z $rows ]]; then printf '  No panel services were listed here.\n'; return 0; fi
+    awk '{ printf "  %-22s %s\n", $1, $2 }' <<< "$rows" | clean
+}
+
+panel_cpanel_facts() {
+    local R=$LHA_ROOT line
+    kv 'Update tier' "$(sed -n 's/^CPANEL=//p' "$R/etc/cpupdate.conf" 2>/dev/null | head -n 1 | clean), updates $(sed -n 's/^UPDATES=//p' "$R/etc/cpupdate.conf" 2>/dev/null | head -n 1 | clean)"
+    kv 'Last update' "$(tail -n 5 "$R/var/cpanel/updatelogs/last" 2>/dev/null | grep -E 'Completed all updates' | tail -n 1 | clean | cut -c1-60)"
+    kv Accounts "$(find "$R/var/cpanel/users" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' '), $(find "$R/var/cpanel/suspended" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ') suspended"
+    kv 'WHM backups' "$(panel_backup_state)"
+    kv 'Default PHP' "$(sed -n 's/^default: *//p' "$R/etc/cpanel/ea4/php.conf" 2>/dev/null | head -n 1 | clean)"
+    printf '\n  %sSites on each PHP version%s\n' "$c_bold" "$c_off"
+    line=$(run_t 15 grep -rhs '^phpversion:' "$R/var/cpanel/userdata" 2>/dev/null | clean | sort | uniq -c | sort -rn | awk '{ printf "  %5s  %s\n", $1, $3 }')
+    printf '%s\n' "${line:-  No domain data could be read.}"
+    line=$(cat "$R"/var/run/chkservd/* 2>/dev/null | clean | grep -F ':-]' | cut -c1-90 | head -n 6)
+    if [[ -n $line ]]; then printf '\n  %sThe cPanel service monitor reports trouble%s\n' "$c_bold" "$c_off"; indent <<< "$line"; fi
+    line=$(tail -n 3 "$R/usr/local/cpanel/logs/license_log" 2>/dev/null | clean | cut -c1-100)
+    if [[ -n $line ]]; then printf '\n  %sLicense log%s\n' "$c_bold" "$c_off"; indent <<< "$line"; fi
+}
+
+panel_plesk_facts() {
+    local R=$LHA_ROOT line
+    kv 'Plesk PHP' "$(find "$R/opt/plesk/php" -mindepth 1 -maxdepth 1 2>/dev/null | sed 's|.*/||' | sort -V | tr '\n' ' ' | clean)"
+    kv 'License key' "$(find "$R/etc/sw/keys/keys" -type f 2>/dev/null | wc -l | tr -d ' ') file(s) in /etc/sw/keys/keys"
+    line=$(tail -n 200 "$R/var/log/plesk/install/autoinstaller3.log" 2>/dev/null | clean | grep -E 'ERROR|FATAL' | tail -n 4 | cut -c1-100)
+    if [[ -n $line ]]; then printf '\n  %sLast installer errors%s\n' "$c_bold" "$c_off"; indent <<< "$line"; fi
+}
+
+panel_da_facts() {
+    local R=$LHA_ROOT opts key
+    opts=$R/usr/local/directadmin/custombuild/options.conf
+    if [[ -r $opts ]]; then
+        for key in webserver php1_release php1_mode php2_release mysql_inst mysql mariadb; do
+            kv "$key" "$(sed -n "s/^$key=//p" "$opts" | head -n 1 | clean)"
+        done
+    fi
+    kv 'Admin backups' "$(panel_backup_state)"
+    kv 'Waiting tasks' "$(wc -l < "$R/usr/local/directadmin/data/task.queue" 2>/dev/null || printf 0)"
+    kv 'Blocked IPs' "$(wc -l < "$R/usr/local/directadmin/data/admin/ip_blacklist" 2>/dev/null || printf 0)"
+}
+
+panel_tips() {
+    case $PANEL in
+        cpanel)
+            tip '/usr/local/cpanel/cpanel -V' 'exact version'
+            tip '/usr/local/cpanel/bin/servers_queue list' 'tasks waiting in the queue'
+            tip 'less /var/log/chkservd.log' 'what the service monitor saw'
+            tip 'tail -f /usr/local/cpanel/logs/error_log' 'follow panel errors'
+            tip 'less /var/cpanel/updatelogs/last' 'the last update, line by line' ;;
+        plesk)
+            tip 'plesk version' 'exact version'
+            tip 'plesk repair all -n' 'checks everything, fixes nothing. Slow: run it off-peak'
+            tip 'plesk listupgrade' 'versions you can update to'
+            tip 'plesk checkupgrade' 'finds problems before an update'
+            tip 'plesk bin php_handler --list' 'PHP handlers'
+            tip 'plesk log panel.log' 'follow panel errors, also: error_log, maillog, --all' ;;
+        directadmin)
+            tip 'da version' 'exact version, on old versions: /usr/local/directadmin/directadmin v'
+            tip 'da license' 'license details'
+            tip 'da config | grep usersdir' 'check one setting. A blank usersdir blocks logins'
+            tip 'da build versions' 'software with updates waiting'
+            tip 'journalctl -u directadmin.service' 'why the panel stopped'
+            tip 'tail /var/log/directadmin/error.log' 'panel errors' ;;
+    esac
+}
+
+# Kept apart from the list above, whose heading promises that nothing changes.
+panel_changes() {
+    printf '\n%sThese change the server: back up first, and pick a quiet moment%s\n' "$c_bold" "$c_off"
+    case $PANEL in
+        cpanel)
+            tip '/usr/local/cpanel/bin/autossl_check --user=USER' 'checks one account, and renews what it can'
+            tip '/usr/local/cpanel/scripts/restartsrv_httpd' 'restarts a service the cPanel way, also _mysql, _exim, _dovecot, _cpsrvd, _queueprocd'
+            tip '/usr/local/cpanel/scripts/upcp' 'runs the cPanel update now' ;;
+        plesk)
+            tip 'plesk repair all -y' 'repairs what the check found'
+            tip 'plesk installer install-panel-updates' 'installs Plesk updates only' ;;
+        directadmin)
+            tip 'da build update' 'refreshes the CustomBuild data'
+            tip 'da build rewrite_confs' 'rebuilds web server configs from templates'
+            tip 'da update' 'updates DirectAdmin'
+            tip 'killall -USR1 dataskq; tail /var/log/directadmin/errortaskq.log' 'makes the task processor report what it is doing' ;;
+    esac
+}
+
+view_panel() {
+    local value
+    ERR_APPS=0 ERR_LINES_SEEN=0 ERR_KINDS=0
+    run_checks
+    panel_find
+    if [[ -z $PANEL ]]; then
+        title 'Hosting panel' 'cPanel & WHM, Plesk and DirectAdmin are checked here.'
+        printf '  None of them is installed on this server.\n'
+        return 0
+    fi
+    title "$PANEL_NAME troubleshooting" 'Version, services, the panel logs, and the vendor commands for this panel.'
+    kv Version "${PANEL_VER:-unknown}"
+    if panel_is_past; then kv Support "$c_red$( [[ $PANEL_EOL == past ]] && printf ended || printf "ended $PANEL_EOL")$c_off"
+    elif [[ -n $PANEL_EOL ]]; then
+        kv Support "until $PANEL_EOL"
+        [[ $PANEL_EOL != "$(date +%Y-%m)"* ]] || kv Note 'Support ends this month. Move to a newer version now.'
+    fi
+    [[ -z $PANEL_NOTE ]] || kv Note "$PANEL_NOTE"
+    value=$(panel_port)
+    if listening "$value"; then kv Port "$value is listening"; else kv Port "$value is not listening"; fi
+    case $PANEL in
+        cpanel) panel_cpanel_facts ;;
+        plesk) panel_plesk_facts ;;
+        directadmin) panel_da_facts ;;
+    esac
+    printf '\n  %sServices%s\n' "$c_bold" "$c_off"
+    panel_services
+    if ((LHA_UID == 0)); then
+        section 'Errors in the panel logs'
+        err_panel
+    fi
+    tips_begin
+    panel_tips
+    panel_changes
+}
+
+err_panel() {
+    local R=$LHA_ROOT
+    case $PANEL in
+        cpanel)
+            err_app 'cPanel' cpanel '\] (error|die|fatal) |\[(error|die|fatal)\]| error ' '' "$R"/usr/local/cpanel/logs/error_log
+            err_app 'cPanel panics' '' '.' '' "$R"/usr/local/cpanel/logs/panic_log
+            err_app 'cPanel updates' '' '\[(error|fatal)\]|\((error|fatal)\)' '' "$R"/var/cpanel/updatelogs/last
+            err_app 'cPanel task queue' '' 'error|fail' '' "$R"/usr/local/cpanel/logs/queueprocd.log
+            err_app 'cPHulk' cphulkd 'error|fail' '' "$R"/usr/local/cpanel/logs/cphulkd_errors.log ;;
+        plesk)
+            err_app 'Plesk panel' 'psa' ' (err|crit|alert|emerg) |error' '' "$R"/var/log/plesk/panel.log
+            err_app 'Plesk web server' 'sw-cp-server sw-engine' '(error|crit|alert|emerg)]|php (fatal|warning)' '' \
+                "$R"/var/log/sw-cp-server/error_log "$R"/var/log/sw-cp-server/sw-engine.log
+            err_app 'Plesk installer' '' 'error|fatal' '' "$R"/var/log/plesk/install/autoinstaller3.log
+            err_app 'Plesk system updates' '' 'error|fatal' '' "$R"/var/log/plesk/systemupdatestool.log ;;
+        directadmin)
+            err_app 'DirectAdmin' directadmin '.' '' "$R"/var/log/directadmin/error.log
+            err_app 'DirectAdmin tasks' '' '.' '' "$R"/var/log/directadmin/errortaskq.log
+            err_app 'CustomBuild' '' 'error|failed' '' "$R"/usr/local/directadmin/custombuild/custombuild.log ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # End of official support for the applications in use
 # ---------------------------------------------------------------------------
 app_row() {
@@ -3167,12 +3486,18 @@ check_app_versions() {
         if [[ $text == *MariaDB* ]]; then
             case $version in
                 5.*|10.[0-2]) eol=2022-05 ;; 10.3) eol=2023-05 ;; 10.4) eol=2024-06 ;; 10.5) eol=2025-06 ;;
-                10.6) eol=2026-07 ;; 10.11) eol=2028-02 ;; 11.4) eol=2029-05 ;; 11.8) eol=2030-06 ;; *) eol= ;;
+                10.6) eol=2026-07 ;; 10.7) eol=2023-02 ;; 10.8) eol=2023-05 ;; 10.9) eol=2023-08 ;; 10.10) eol=2023-11 ;;
+                10.11) eol=2028-02 ;; 11.0) eol=2024-06 ;; 11.1) eol=2024-08 ;; 11.2) eol=2024-11 ;; 11.3) eol=2024-05 ;;
+                11.4) eol=2029-05 ;; 11.5) eol=2024-11 ;; 11.6) eol=2025-02 ;; 11.7) eol=2025-05 ;; 11.8) eol=2028-06 ;;
+                12.0) eol=2025-11 ;; 12.1) eol=2026-02 ;; 12.2) eol=2026-05 ;; 12.3) eol=2029-06 ;; *) eol= ;;
             esac
             app_row mariadb "$version" "$eol"
         else
             case $version in
-                5.5) eol=2018-12 ;; 5.6) eol=2021-02 ;; 5.7) eol=2023-10 ;; 8.0) eol=2026-04 ;; 8.4) eol=2032-04 ;; *) eol= ;;
+                5.5) eol=2018-12 ;; 5.6) eol=2021-02 ;; 5.7) eol=2023-10 ;; 8.0) eol=2026-04 ;; 8.1) eol=2023-10 ;;
+                8.2) eol=2024-01 ;; 8.3) eol=2024-04 ;; 8.4) eol=2032-04 ;; 9.0) eol=2024-10 ;; 9.1) eol=2025-01 ;;
+                9.2) eol=2025-04 ;; 9.3) eol=2025-07 ;; 9.4) eol=2025-10 ;; 9.5) eol=2026-01 ;; 9.6) eol=2026-04 ;;
+                9.7) eol=2034-04 ;; *) eol= ;;
             esac
             app_row mysql "$version" "$eol"
         fi
@@ -3189,11 +3514,28 @@ check_app_versions() {
         version=$(run_t 3 node --version 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/')
         if [[ $version =~ ^[0-9]+$ ]]; then
             case $version in
-                ?|1[0-6]) eol=2023-09 ;; 17|18) eol=2025-04 ;; 19|20) eol=2026-04 ;; 21|22) eol=2027-04 ;;
-                23|24) eol=2028-04 ;; 25|26) eol=2029-04 ;; *) eol= ;;
+                ?|1[0-6]) eol=2023-09 ;; 17) eol=2022-06 ;; 18) eol=2025-04 ;; 19) eol=2023-06 ;; 20) eol=2026-04 ;;
+                21) eol=2024-06 ;; 22) eol=2027-04 ;; 23) eol=2025-06 ;; 24) eol=2028-04 ;; 25) eol=2026-06 ;;
+                26) eol=2029-04 ;; *) eol= ;;
             esac
             app_row nodejs "$version" "$eol"
         fi
+    fi
+    if [[ -n $(sig_list RUNNING '^MongoDB') ]] && has mongod; then
+        version=$(run_t 3 mongod --version 2>/dev/null | sed -n 's/^db version v\([0-9]*\.[0-9]*\).*/\1/p' | head -n 1)
+        case $version in
+            '') eol= ;; [1-3].*|4.[0-2]) eol=2023-04 ;; 4.4) eol=2024-02 ;; 5.0) eol=2024-10 ;; 6.0) eol=2025-07 ;;
+            7.0) eol=2027-08 ;; 8.0) eol=2029-10 ;; 8.2) eol=2026-07 ;; 9.0) eol=2031-10 ;; *) eol= ;;
+        esac
+        app_row mongodb "$version" "$eol"
+    fi
+    if [[ -n $(sig_list RUNNING '^Redis') ]] && has redis-server; then
+        version=$(run_t 3 redis-server --version 2>/dev/null | sed -n 's/.* v=\([0-9]*\.[0-9]*\).*/\1/p')
+        case $version in
+            '') eol= ;; [1-4].*|5.*) eol=2022-04 ;; 6.0) eol=2022-05 ;; 6.2) eol=2027-04 ;; 7.0) eol=2024-07 ;;
+            7.2) eol=2029-12 ;; 7.4) eol=2029-12 ;; 8.0) eol=2026-12 ;; 8.2) eol=2030-09 ;; *) eol= ;;
+        esac
+        app_row redis "$version" "$eol"
     fi
     return 0
 }
@@ -3297,6 +3639,18 @@ tune_age() {
 }
 tune_age_pid() { ps -o etimes= -p "$1" 2>/dev/null | awk 'NR == 1 { printf "%d", $1 }'; }
 
+# True if version $1 is $2 or newer. Works without sort -V, which small systems lack.
+ver_ge() {
+    awk -v a="$1" -v b="$2" 'BEGIN {
+        n = split(a, x, "."); m = split(b, y, ".")
+        for (i = 1; i <= (n > m ? n : m); i++) {
+            if (x[i] + 0 > y[i] + 0) exit 0
+            if (x[i] + 0 < y[i] + 0) exit 1
+        }
+        exit 0
+    }'
+}
+
 # True, and says so, while a service is too young to judge.
 tune_too_young() {
     ((${2:-0} < TUNE_MATURE)) || return 1
@@ -3304,13 +3658,13 @@ tune_too_young() {
 }
 
 tune_mysql() {
-    local client=mysql vars status label version group mature=no
+    local vars status label version group mature=no number how limit
     local max used pool total free fill reads reqs hit up rate data rec why eff tmp disk size files opened now conn created
     [[ -n $(sig_list RUNNING '^(MariaDB server|MySQL-compatible)') ]] || return 0
-    has mysql || client=mariadb
-    has "$client" || return 0
-    vars=$(run_t 8 "$client" --connect-timeout=3 -NBe 'SHOW GLOBAL VARIABLES' 2>/dev/null)
-    status=$(run_t 8 "$client" --connect-timeout=3 -NBe 'SHOW GLOBAL STATUS' 2>/dev/null)
+    sql_find
+    has "${SQL[0]}" || return 0
+    vars=$(run_t 8 "${SQL[@]}" --connect-timeout=3 -NBe 'SHOW GLOBAL VARIABLES' 2>/dev/null)
+    status=$(run_t 8 "${SQL[@]}" --connect-timeout=3 -NBe 'SHOW GLOBAL STATUS' 2>/dev/null)
     if [[ -z $vars || -z $status ]]; then
         tune_note MySQL 'It needs a password here, so its limits could not be read.'
         return 0
@@ -3318,7 +3672,8 @@ tune_mysql() {
     version=$(tune_get "$vars" version)
     label=MySQL
     [[ $version != *MariaDB* ]] || label=MariaDB
-    group="$label ${version%%-*}"
+    number=${version%%-*}
+    group="$label $number"
     up=$(tune_get "$status" Uptime)
     ((up < TUNE_MATURE)) || mature=yes
     tune_too_young "$group" "$up"
@@ -3349,6 +3704,9 @@ tune_mysql() {
             rec=$((pool * 3 / 2))
             ((rec <= R_MEM_TOTAL * 512)) || rec=$((R_MEM_TOTAL * 512))
             rec=$(tune_round "$rec")
+            # MariaDB 10.11.12 and newer can only grow the pool up to this fixed ceiling.
+            limit=$(tune_get "$vars" innodb_buffer_pool_size_max)
+            if ((limit > 0 && rec > limit)); then rec=$limit; fi
             if ((rec > pool)); then why="Pool is full and only $hit% of reads come from memory."; else rec=''; fi
         elif ((fill <= 50 && pool > 1073741824)); then
             # Page size first: pages times pool size overflows on a very large pool.
@@ -3356,7 +3714,12 @@ tune_mysql() {
             why="Only $fill% is used after $(human_age "$up"). The rest could serve other programs."
         fi
     fi
-    tune_row "$group" innodb_buffer_pool_size "$(tune_size "$pool")" "$fill% full, $hit% read hits" "$fill" "${rec:+$(tune_size "$rec")}" "$why" 'live' "$rec"
+    # Resizing without a restart came with MySQL 5.7.5 and MariaDB 10.2.2.
+    how=live
+    if [[ $label == MariaDB ]]; then ver_ge "$number" 10.2.2 || how=restart
+    else ver_ge "$number" 5.7.5 || how=restart
+    fi
+    tune_row "$group" innodb_buffer_pool_size "$(tune_size "$pool")" "$fill% full, $hit% read hits" "$fill" "${rec:+$(tune_size "$rec")}" "$why" "$how" "$rec"
 
     tmp=$(tune_get "$status" Created_tmp_tables)
     disk=$(tune_get "$status" Created_tmp_disk_tables)
@@ -3408,7 +3771,12 @@ tune_mysql() {
         why="$(tune_size "$rate") of redo log is written each hour. Too small a log causes write stalls."
     fi
     if ((size > 0)); then
-        tune_row "$group" "$log_name" "$(tune_size "$size")" "$(tune_size "$rate") per hour" "$(tune_pct "$rate" "$((size * files))")" "${rec:+$(tune_size "$rec")}" "$why" 'restart' "$rec"
+        # innodb_redo_log_capacity is live on MySQL, and innodb_log_file_size on MariaDB 10.9 and newer.
+        how=restart
+        if ((capacity > 0)); then how=live
+        elif [[ $label == MariaDB ]] && ver_ge "$number" 10.9; then how=live
+        fi
+        tune_row "$group" "$log_name" "$(tune_size "$size")" "$(tune_size "$rate") per hour" "$(tune_pct "$rate" "$((size * files))")" "${rec:+$(tune_size "$rec")}" "$why" "$how" "$rec"
     fi
 
     now=$(tune_get "$status" Slow_queries)
@@ -3549,18 +3917,35 @@ tune_nginx() {
     fi
 }
 
+# One Apache setting for the MPM in use. A shared file can hold a block for each MPM, so a
+# block for another MPM does not count. Later files win, as they do in Apache.
+apache_value() {
+    local R=$LHA_ROOT
+    cat "$R"/etc/apache2/conf/httpd.conf "$R"/etc/apache2/conf.d/*.conf "$R"/etc/httpd/conf/httpd.conf \
+        "$R"/etc/httpd/conf.modules.d/*.conf "$R"/etc/httpd/conf/extra/httpd-mpm.conf "$R"/etc/apache2/mods-enabled/mpm_*.conf 2>/dev/null |
+        awk -v want="^($1)\$" -v mpm="${2:-none}" '
+        { line = tolower($0) }
+        line ~ /^[ \t]*<ifmodule/ && line ~ /(prefork|worker|event)/ {
+            skip = (index(line, mpm) == 0)
+            next
+        }
+        line ~ /^[ \t]*<\/ifmodule/ { skip = 0; next }
+        !skip && line !~ /^[ \t]*#/ && tolower($1) ~ want { v = $2 }
+        END { print v }'
+}
+
 tune_apache() {
-    local bin mpm max threads procs conns reached file rec why group logs=0 real age
+    local bin mpm max threads procs conns reached file rec why group logs=0 real age limit
     [[ -n $(sig_list RUNNING '^Apache HTTP') ]] || return 0
-    if has httpd; then bin=httpd; else bin=apache2; fi
+    # On Debian the apache2 binary lacks its environment, and only apache2ctl reads the config.
+    if has httpd; then bin=httpd; elif has apache2ctl; then bin=apache2ctl; else bin=apache2; fi
     has "$bin" || return 0
     group="Apache $(run_t 3 "$bin" -v 2>/dev/null | sed -n 's/.*Apache\/\([0-9.]*\).*/\1/p')"
     mpm=$(run_t 3 "$bin" -V 2>/dev/null | awk -F ': *' '/Server MPM/ { print tolower($2) }')
     local R=$LHA_ROOT
-    max=$(cat "$R"/etc/apache2/conf/httpd.conf "$R"/etc/apache2/conf.d/*.conf "$R"/etc/httpd/conf/httpd.conf "$R"/etc/httpd/conf.modules.d/*.conf \
-        "$R"/etc/apache2/mods-enabled/mpm_*.conf 2>/dev/null | awk 'tolower($1) ~ /^(maxrequestworkers|maxclients)$/ { v = $2 } END { print v }')
-    threads=$(cat "$R"/etc/apache2/conf/httpd.conf "$R"/etc/httpd/conf/httpd.conf "$R"/etc/apache2/mods-enabled/mpm_*.conf 2>/dev/null |
-        awk 'tolower($1) == "threadsperchild" { v = $2 } END { print v }')
+    max=$(apache_value 'maxrequestworkers|maxclients' "$mpm")
+    threads=$(apache_value threadsperchild "$mpm")
+    limit=$(apache_value serverlimit "$mpm")
     # A value can be a ${VARIABLE} from the environment file, and only numbers can be computed.
     [[ $threads =~ ^[1-9][0-9]*$ ]] || threads=25
     [[ $max =~ ^[1-9][0-9]*$ ]] || max=
@@ -3580,6 +3965,12 @@ tune_apache() {
     tune_too_young "$group" "$age"
     if ((age >= TUNE_MATURE && ${reached:-0} > 0)); then
         rec=$((max * 3 / 2)) why="The error log shows the limit was hit $reached times, so visitors waited."
+        # ServerLimit caps it, and that one takes a full stop and start, not a reload.
+        if [[ $mpm == prefork ]]; then
+            ((rec <= ${limit:-256})) || why+=" Raise ServerLimit to $rec as well."
+        elif ((rec > ${limit:-16} * threads)); then
+            why+=" Raise ServerLimit to $(((rec + threads - 1) / threads)) as well."
+        fi
     fi
     if [[ $mpm == prefork ]]; then
         tune_row "$group ($mpm)" MaxRequestWorkers "$max" "$((procs > 0 ? procs - 1 : 0)) workers now" "$(tune_pct "$((procs > 0 ? procs - 1 : 0))" "$max")" "$rec" "$why" 'reload'
@@ -3603,13 +3994,14 @@ tune_phpfpm() {
     age=$(tune_age php-fpm php-fpm5.6 php-fpm7.0 php-fpm7.1 php-fpm7.2 php-fpm7.3 php-fpm7.4 php-fpm8.0 php-fpm8.1 php-fpm8.2 php-fpm8.3 php-fpm8.4 php-fpm8.5)
     tune_too_young 'PHP-FPM pools' "$age"
     pools=$(cat /etc/php-fpm.d/*.conf /etc/php/*/fpm/pool.d/*.conf /usr/local/etc/php-fpm.d/*.conf /opt/cpanel/ea-php*/root/etc/php-fpm.d/*.conf \
-        /opt/plesk/php/*/etc/php-fpm.d/*.conf /www/server/php/*/etc/php-fpm.conf 2>/dev/null | clean | awk '
+        /opt/plesk/php/*/etc/php-fpm.d/*.conf /www/server/php/*/etc/php-fpm.conf /usr/local/directadmin/data/users/*/php/php-fpm*.conf 2>/dev/null | clean | awk '
         /^[ \t]*\[.*\]/ { name = $0; gsub(/[][ \t]/, "", name); if (name != "global") seen[name] = 1; next }
         /^[ \t]*pm[ \t]*=/ { pm[name] = $NF }
         /^[ \t]*pm\.max_children[ \t]*=/ { max[name] = $NF }
         # A pool can continue in a later file, so its settings are gathered by name.
         END { for (p in seen) print p, (p in pm ? pm[p] : "?"), (p in max ? max[p] : 0) }')
-    for file in /var/log/php-fpm/*.log /var/log/php*-fpm.log /opt/cpanel/ea-php*/root/usr/var/log/php-fpm.log; do
+    for file in /var/log/php-fpm/*.log /var/log/php*-fpm.log /opt/cpanel/ea-php*/root/usr/var/log/php-fpm/error.log \
+        /var/log/plesk-php*-fpm/*.log /usr/local/php*/var/log/php-fpm.log; do
         [[ -r $file ]] && logs+=$(tail -n 20000 "$file" | grep 'reached pm.max_children\|max_children setting')$'\n'
     done
     while read -r count rss pool; do
@@ -3653,7 +4045,10 @@ tune_elastic() {
     local name=$1 row heap_pct heap_max ram_max disk rec why ver group up
     [[ -n $(sig_list RUNNING "^$name") ]] && has curl || return 0
     ver=$(run_t 5 curl -s -m 3 http://127.0.0.1:9200/ 2>/dev/null | clean | sed -n 's/.*"number" *: *"\([0-9.]*\)".*/\1/p' | head -n 1)
-    if [[ -z $ver ]]; then tune_note "$name" 'It needs a password, so its limits could not be read.'; return 0; fi
+    if [[ -z $ver ]]; then
+        tune_note "$name" 'It needs https and a password, so its limits could not be read. By hand: curl --cacert /etc/elasticsearch/certs/http_ca.crt -u elastic https://localhost:9200/_cat/nodes?v'
+        return 0
+    fi
     group="$name $ver"
     up=$(run_t 5 curl -s -m 3 'http://127.0.0.1:9200/_nodes/stats/jvm?filter_path=nodes.*.jvm.uptime_in_millis' 2>/dev/null | clean |
         sed -n 's/.*"uptime_in_millis" *: *\([0-9]*\).*/\1/p' | head -n 1)
@@ -4735,10 +5130,10 @@ err_conf_path() {
 }
 
 err_mysql_log() {
-    local client=mysql value
-    has mysql || client=mariadb
-    has "$client" || return 0
-    value=$(run_t 5 "$client" --connect-timeout=3 -NBe 'SELECT @@log_error' 2>/dev/null | clean)
+    local value
+    sql_find
+    has "${SQL[0]}" || return 0
+    value=$(run_t 5 "${SQL[@]}" --connect-timeout=3 -NBe 'SELECT @@log_error' 2>/dev/null | clean)
     [[ $value == /* ]] && printf '%s\n' "$value"
 }
 
@@ -4762,7 +5157,7 @@ err_apps() {
             '(warning|error|alert|emergency|fatal)[]: ]' '' "$R"/var/log/php*-fpm.log "$R"/var/log/php-fpm/error.log "$R"/var/log/php-fpm/www-error.log \
             "$R"/opt/cpanel/ea-php*/root/usr/var/log/php-fpm/error.log "$R"/opt/cpanel/ea-php*/root/usr/var/log/php-fpm.log \
             "$R"/var/opt/remi/php*/log/php-fpm/error.log "$R"/www/server/php/*/var/log/php-fpm.log \
-            "$R"/opt/plesk/php/*/var/log/php-fpm.log "$R"/var/log/plesk-php*-fpm/error.log
+            "$R"/opt/plesk/php/*/var/log/php-fpm.log "$R"/var/log/plesk-php*-fpm/*.log "$R"/usr/local/php*/var/log/php-fpm.log
     fi
     if err_on '^(MariaDB server|MySQL-compatible)' 'mariadb|mysql|mysqld'; then
         conf=()
@@ -4851,9 +5246,8 @@ err_apps() {
     if err_on '^BIND' 'named|bind9'; then
         err_app BIND 'named bind9' 'error|failed|not loaded|fatal|refused notify' 'query (cache )?denied' "$R"/var/log/named/*.log "$R"/var/log/bind/*.log "$R"/var/named/data/named.run
     fi
-    if err_on '^cPanel' 'cpanel'; then
-        err_app cPanel cpanel '\] (error|die|fatal) |\[(error|die|fatal)\]| error ' '' "$R"/usr/local/cpanel/logs/error_log
-    fi
+    panel_find
+    [[ -z $PANEL ]] || err_panel
 }
 
 # Containers that are up or broken. docker logs reads what the engine already stored.
@@ -5037,6 +5431,8 @@ menu_page_debug() {
     menu_add "$REPLY" 'Problems and what to do' "$F_CRIT critical, $F_WARN warnings" 'START HERE' view_problems
     menu_add tool 'Logs: why did something stop?' 'may show private data' '' view_logs
     menu_add tool 'Errors in application logs' 'grouped and explained, may show private data' '' view_errors
+    panel_find
+    if [[ -n $PANEL ]]; then menu_add tool "$PANEL_NAME troubleshooting" "${PANEL_VER:-version unknown}" '' view_panel; fi
     menu_state services
     menu_add "$REPLY" 'Failed services' "$failed failed" 'LOOK CLOSER' view_apps
     menu_state 'resources|disk'
@@ -5497,6 +5893,7 @@ Views (each prints and exits):
   --logs         Crashes, reboots, why services stopped (may show private data)
   --errors       Error logs of every running application, grouped, counted and explained
                  (shows real log lines, so it may show private data)
+  --panel        cPanel, Plesk or DirectAdmin: version, support, services, panel logs, vendor commands
   --jobs         Cron, timers, backups, monitoring
   --resources    CPU, RAM, disk, top processes
   --tune         How full each database and web server limit is, with advice from real load
@@ -5561,7 +5958,7 @@ main() {
     case ${1:-} in
         --trends) ;;
         --menu|--monitor|--metrics|--overview|--problems|--apps|--network|--containers|--docker|--k8s|\
-        --web|--db|--security|--logs|--errors|--jobs|--resources|--tune|--learn|--report|--check|--json)
+        --web|--db|--security|--logs|--errors|--panel|--jobs|--resources|--tune|--learn|--report|--check|--json)
             if (($# != 1)); then printf 'Unexpected arguments for %s\n' "$1" >&2; return 2; fi ;;
     esac
     case ${1:-} in
@@ -5579,6 +5976,7 @@ main() {
         --security) one_view view_security ;;
         --logs) one_view view_logs ;;
         --errors) one_view view_errors ;;
+        --panel) one_view view_panel ;;
         --jobs) one_view view_jobs ;;
         --resources) one_view view_resources ;;
         --tune) one_view view_tune ;;

@@ -498,5 +498,120 @@ has_text "$(inside --fixer 'F_N=1; F_ID[0]=os-eol; F_TARGET[0]="Debian GNU/Linux
 has_text "$(inside --fixer 'sig_rows="x|Postfix|RUNNING|"; dx_mail_queue; printf "%s\n" "${FX_STEPS[@]}"')" 'postqueue -p'
 has_text "$(inside --fixer 'fx_delegate() { echo "unit $1"; }; units=$'"'"'\nredis-server.service enabled\nvalkey.service enabled\n'"'"'; active_units=; dx_redis_down Valkey')" 'unit valkey.service'
 
+
+# Hosting panels, from files laid out as each vendor documents them.
+scenario=clean
+kcfg=
+root=$fake/cp
+mkdir -p "$root/usr/local/cpanel/logs" "$root/var/cpanel/users" "$root/var/cpanel/userdata/bob" "$root/var/cpanel/updatelogs" "$root/etc/cpanel/ea4"
+printf '11.120.0.1\n' > "$root/usr/local/cpanel/version"
+printf 'CPANEL=release\nUPDATES=never\n' > "$root/etc/cpupdate.conf"
+printf 'phpversion: ea-php74\n' > "$root/var/cpanel/userdata/bob/a.example"
+printf 'phpversion: ea-php82\n' > "$root/var/cpanel/userdata/bob/b.example"
+printf 'default: ea-php82\n' > "$root/etc/cpanel/ea4/php.conf"
+: > "$root/var/cpanel/users/bob"
+printf '[2026-11-04 10:00:00 +0000] die something broke badly\n' > "$root/usr/local/cpanel/logs/error_log"
+printf 'stopped halfway\n' > "$root/var/cpanel/updatelogs/last"
+touch -d @1792990000 "$root/var/cpanel/updatelogs/last"
+out=$(audit --panel)
+has_text "$out" 'cPanel & WHM troubleshooting'
+has_text "$out" '120.0.1'
+has_text "$out" 'ended'
+has_text "$out" 'release, updates never'
+has_text "$out" 'ea-php74'
+has_text "$out" 'something broke badly'
+has_text "$out" '/usr/local/cpanel/scripts/restartsrv_httpd'
+out=$(audit --json)
+has_text "$out" 'panel-eol'
+has_text "$out" 'panel-updates-off'
+has_text "$out" 'panel-update-failed'
+has_text "$out" 'panel-down'
+printf '11.134.0.2\n' > "$root/usr/local/cpanel/version"
+has_text "$(audit --panel)" 'until 2027-06'
+no_text "$(audit --json)" 'panel-eol'
+printf '11.135.0.2\n' > "$root/usr/local/cpanel/version"
+has_text "$(audit --panel)" 'development builds'
+mkdir -p "$root/var/cpanel/backups"
+printf 'BACKUPENABLE: yes\n' > "$root/var/cpanel/backups/config"
+no_text "$(audit --json)" '"backup-missing"'
+equals "$(inside 'panel_find; sql_find; echo "${SQL[*]}"')" mysql 'cPanel root reaches the database by itself'
+has_text "$(inside --fixer 'FX_STEPS=(); tune_panel_steps apache 300; printf "%s\n" "${FX_STEPS[@]}"')" 'Global Configuration: Max Request Workers 300'
+has_text "$(inside --fixer 'FX_STEPS=(); tune_panel_steps fpm; printf "%s\n" "${FX_STEPS[@]}"')" 'php_fpm_config --rebuild'
+has_text "$(inside --fixer 'FX_STEPS=(); tune_panel_steps nginx; printf "%s\n" "${FX_STEPS[@]}"')" '/etc/nginx/ea-nginx/settings.json'
+has_text "$(inside --fixer 'FX_STEPS=(); panel_restart_step mariadb.service; printf "%s\n" "${FX_STEPS[@]}"')" 'restartsrv_mysql'
+has_text "$(inside --fixer 'fx_public_ports() { :; }; fx_ssh_port() { echo 22; }; dx_no_firewall; echo "$FX_MODE"; printf "%s\n" "${FX_STEPS[@]}"')" 'yum install cpanel-csf'
+
+root=$fake/pl
+mkdir -p "$root/usr/local/psa" "$root/var/log/plesk/install" "$root/var/log/sw-cp-server" "$root/opt/plesk/php/8.3"
+printf '18.0.73 Ubuntu 24.04 1800250101.00\n' > "$root/usr/local/psa/version"
+printf '2026-11-04 ERR [panel] database link lost\n' > "$root/var/log/plesk/panel.log"
+printf 'ERROR: repository not reachable\n' > "$root/var/log/plesk/install/autoinstaller3.log"
+printf '#!/bin/bash\necho "plesk $*" >> "%s/calls"\n' "$fake" > "$fake/plesk"
+chmod +x "$fake/plesk"
+out=$(audit --panel)
+has_text "$out" 'Plesk troubleshooting'
+has_text "$out" '18.0.73'
+has_text "$out" 'Obsidian has no end date'
+has_text "$out" 'database link lost'
+has_text "$out" 'repository not reachable'
+has_text "$out" 'plesk repair all -n'
+equals "$(inside 'panel_find; sql_find; echo "${SQL[*]}"')" 'plesk db' 'Plesk reaches its database through plesk db'
+printf '17.8.11 CentOS 7\n' > "$root/usr/local/psa/version"
+has_text "$(audit --json)" 'panel-eol'
+has_text "$(inside --fixer 'fx_public_ports() { :; }; dx_no_firewall; printf "%s\n" "${FX_STEPS[@]}"')" 'Tools & Settings > Firewall'
+has_text "$(inside --fixer 'FX_STEPS=(); tune_panel_steps fpm; printf "%s\n" "${FX_STEPS[@]}"')" 'PHP Settings: pm.max_children'
+rm -f "$fake/plesk"
+
+root=$fake/da
+mkdir -p "$root/usr/local/directadmin/conf" "$root/usr/local/directadmin/data/admin" "$root/usr/local/directadmin/custombuild" "$root/var/log/directadmin"
+printf '#!/bin/bash\n[[ $1 == v ]] && echo "DirectAdmin v.1.695 abc123"\n' > "$root/usr/local/directadmin/directadmin"
+chmod +x "$root/usr/local/directadmin/directadmin"
+printf 'webserver=nginx_apache\nphp1_release=8.3\nmysql_inst=mariadb\n' > "$root/usr/local/directadmin/custombuild/options.conf"
+printf '[client]\nuser=da_admin\n' > "$root/usr/local/directadmin/conf/my.cnf"
+printf 'action=rewrite&value=httpd\n' > "$root/usr/local/directadmin/data/task.queue"
+touch -d @1792990000 "$root/usr/local/directadmin/data/task.queue"
+printf 'Error opening task queue\n' > "$root/var/log/directadmin/errortaskq.log"
+out=$(audit --panel)
+has_text "$out" 'DirectAdmin troubleshooting'
+has_text "$out" '1.695'
+has_text "$out" 'nginx_apache'
+has_text "$out" 'Error opening task queue'
+has_text "$out" 'da build rewrite_confs'
+out=$(audit --json)
+has_text "$out" 'panel-queue-stuck'
+no_text "$out" 'panel-eol'
+has_text "$(inside 'panel_find; sql_find; echo "${SQL[*]}"')" "--defaults-extra-file=$root/usr/local/directadmin/conf/my.cnf"
+has_text "$(inside --fixer 'FX_STEPS=(); tune_panel_steps apache 300; printf "%s\n" "${FX_STEPS[@]}"')" 'custom/ap2/conf/extra/httpd-mpm.conf'
+has_text "$(inside --fixer 'FX_STEPS=(); tune_panel_steps fpm; printf "%s\n" "${FX_STEPS[@]}"')" 'da config-set php_fpm_max_children_default'
+has_text "$(inside --fixer 'fx_public_ports() { :; }; dx_no_firewall; printf "%s\n" "${FX_STEPS[@]}"')" 'port 2222'
+
+root=$fake/none
+mkdir -p "$root"
+has_text "$(audit --panel)" 'None of them is installed'
+
+# Values that depend on the version or the MPM.
+equals "$(inside 'ver_ge 10.11.5 10.9 && echo yes')" yes 'version 10.11 is newer than 10.9'
+equals "$(inside 'ver_ge 8.0.30 8.0.4 && echo yes')" yes 'numbers compare as numbers'
+equals "$(inside 'ver_ge 5.7.4 5.7.5 || echo no')" no 'older version'
+root=$fake/ap
+mkdir -p "$root/etc/httpd/conf/extra"
+cat > "$root/etc/httpd/conf/extra/httpd-mpm.conf" <<'EOF'
+<IfModule mpm_prefork_module>
+    MaxRequestWorkers 150
+</IfModule>
+<IfModule mpm_event_module>
+    ServerLimit 32
+    # MaxRequestWorkers 1
+    MaxRequestWorkers 800
+</IfModule>
+<IfModule mpm_worker_module>
+    MaxRequestWorkers 300
+</IfModule>
+EOF
+equals "$(inside "apache_value 'maxrequestworkers|maxclients' event")" 800 'the block of the MPM in use'
+equals "$(inside "apache_value 'maxrequestworkers|maxclients' prefork")" 150 'the block of the other MPM'
+equals "$(inside 'apache_value serverlimit event')" 32 'ServerLimit of the MPM in use'
+root=$fake/root
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 ((fail == 0))

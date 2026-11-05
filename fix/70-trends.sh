@@ -17,10 +17,9 @@ trend_record() {
     conns=$(tcp_count 01 0 65535)
     php=$(ps -eo args= 2>/dev/null | grep -c '^php-fpm[0-9.]*: pool')
     if ps -eo comm= 2>/dev/null | grep -qE '^(mariadbd|mysqld)$'; then
-        file=mysql
-        has mysql || file=mariadb
-        if has "$file"; then
-            db=$(run_t 4 "$file" --connect-timeout=2 -NBe "SHOW GLOBAL STATUS LIKE 'Threads_connected'" 2>/dev/null | awk '{ print $2 + 0 }')
+        sql_find
+        if has "${SQL[0]}"; then
+            db=$(run_t 4 "${SQL[@]}" --connect-timeout=2 -NBe "SHOW GLOBAL STATUS LIKE 'Threads_connected'" 2>/dev/null | awk '{ print $2 + 0 }')
         fi
     fi
     oom=$(awk '$1 == "oom_kill" { print $2 }' /proc/vmstat 2>/dev/null)

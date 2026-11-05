@@ -37,8 +37,8 @@ tune_fpm_edit() {
         { print }' "$1"
 }
 
-fx_mysql_client() { FX_SQL=mysql; has mysql || FX_SQL=mariadb; }
-fx_mysql_get() { run_t 6 "$FX_SQL" --connect-timeout=3 -NBe "SELECT @@GLOBAL.$1" 2>/dev/null; }
+fx_mysql_client() { sql_find; }
+fx_mysql_get() { run_t 6 "${SQL[@]}" --connect-timeout=3 -NBe "SELECT @@GLOBAL.$1" 2>/dev/null; }
 
 dx_tune_apply() {
     local n=${1:-0} line
@@ -53,14 +53,20 @@ dx_tune_apply() {
         MariaDB*|MySQL*)
             fx_mysql_client
             case $TA_SETTING in
-                max_connections|innodb_buffer_pool_size|tmp_table_size|table_open_cache|thread_cache_size|query_cache_type)
+                max_connections|innodb_buffer_pool_size|tmp_table_size|table_open_cache|thread_cache_size|query_cache_type|innodb_redo_log_capacity|innodb_log_file_size)
+                    if [[ $TA_HOW != live ]]; then
+                        FX_STEPS+=("Under [mysqld] in your config, then a planned restart: $TA_SETTING = $TA_RAW")
+                        tune_panel_steps mysql
+                        return 0
+                    fi
                     TA_KIND=mysql TA_DIR=$(tune_mysql_dir)
                     FX_MODE=auto FX_RISK=medium
                     FX_PLAN=("SET GLOBAL $TA_SETTING = $TA_RAW, with no restart.")
                     if [[ -n $TA_DIR ]]; then FX_PLAN+=("Save it in $TA_DIR/zz-linux-host-audit.cnf, so it survives a restart.")
                     else FX_PLAN+=('No included config folder was found, so this lasts until the next restart.')
                     fi ;;
-                *) FX_STEPS+=("Under [mysqld] in your config, then a planned restart: $TA_SETTING = $TA_RAW") ;;
+                *) FX_STEPS+=("Under [mysqld] in your config, then a planned restart: $TA_SETTING = $TA_RAW")
+                   tune_panel_steps mysql ;;
             esac ;;
         'Linux kernel')
             case $TA_SETTING in
@@ -82,9 +88,11 @@ dx_tune_apply() {
                 FX_PLAN=("CONFIG SET maxmemory $TA_RAW. This is above what it uses now, so nothing is evicted.")
                 FX_STEPS=('Also add it to the config file, or it resets at restart. Consider a maxmemory-policy.')
             fi ;;
+        Apache*) tune_panel_steps apache "$TA_REC" ;;
         Nginx*)
-            if [[ -d /usr/local/cpanel ]]; then
-                FX_STEPS+=('cPanel manages this nginx config. Use the WHM NGINX Manager or its settings file.')
+            panel_find
+            if [[ -n $PANEL ]]; then
+                tune_panel_steps nginx
             elif [[ $TA_SETTING == worker_connections || $TA_SETTING == worker_processes ]]; then
                 TA_KIND=nginx FX_MODE=auto FX_RISK=medium TA_FILE=/etc/nginx/nginx.conf
                 [[ -r $TA_FILE ]] || TA_FILE=/usr/local/nginx/conf/nginx.conf
@@ -93,8 +101,9 @@ dx_tune_apply() {
         'PHP-FPM pools')
             TA_POOL=${TA_SETTING%% *}
             TA_FILE=$(grep -lsE "^\[$TA_POOL\]" /etc/php-fpm.d/*.conf /etc/php/*/fpm/pool.d/*.conf /usr/local/etc/php-fpm.d/*.conf | head -n 1)
-            if [[ -d /usr/local/cpanel ]]; then
-                FX_STEPS+=('cPanel rebuilds these files. Change it in MultiPHP Manager > PHP-FPM Settings.')
+            panel_find
+            if [[ -n $PANEL ]]; then
+                tune_panel_steps fpm
             elif [[ -n $TA_FILE ]]; then
                 TA_KIND=phpfpm FX_MODE=auto FX_RISK=medium
                 # With several PHP versions, the file says which one owns this pool.
@@ -116,17 +125,17 @@ ap_tune_apply() {
         mysql)
             old=$(fx_mysql_get "$TA_SETTING")
             [[ -n $old ]] || return 1
-            fx_quote "$FX_SQL" -e "SET GLOBAL $TA_SETTING = $old"
+            fx_quote "${SQL[@]}" -e "SET GLOBAL $TA_SETTING = $old"
             fx_undo "$REPLY"
-            fx_run "$FX_SQL" -e "SET GLOBAL $TA_SETTING = $TA_RAW" || return 1
+            fx_run "${SQL[@]}" -e "SET GLOBAL $TA_SETTING = $TA_RAW" || return 1
             line=''
             # The smaller of these two is what counts, so they only ever move together.
             if [[ $TA_SETTING == tmp_table_size ]]; then
                 old=$(fx_mysql_get max_heap_table_size)
                 [[ -n $old ]] || return 1
-                fx_quote "$FX_SQL" -e "SET GLOBAL max_heap_table_size = $old"
+                fx_quote "${SQL[@]}" -e "SET GLOBAL max_heap_table_size = $old"
                 fx_undo "$REPLY"
-                fx_run "$FX_SQL" -e "SET GLOBAL max_heap_table_size = $TA_RAW" || return 1
+                fx_run "${SQL[@]}" -e "SET GLOBAL max_heap_table_size = $TA_RAW" || return 1
                 line=max_heap_table_size
             fi
             if [[ -n $TA_DIR ]]; then
@@ -171,7 +180,7 @@ ck_tune_apply() {
             value=$(fx_mysql_get "$TA_SETTING")
             case $TA_SETTING in
                 # The server rounds the pool to its chunk size, and resizes in the background.
-                innodb_buffer_pool_size) ((value * 10 >= TA_RAW * 9 && value * 10 <= TA_RAW * 11)) ;;
+                innodb_buffer_pool_size|innodb_redo_log_capacity|innodb_log_file_size) ((value * 10 >= TA_RAW * 9 && value * 10 <= TA_RAW * 11)) ;;
                 query_cache_type) [[ $value == OFF || $value == 0 ]] ;;
                 *) [[ $value == "$TA_RAW" ]] ;;
             esac ;;

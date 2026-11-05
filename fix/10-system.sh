@@ -34,7 +34,7 @@ dx_clock_unsynced() {
         FX_PLAN=('Turn on time sync: timedatectl set-ntp true')
     else
         FX_CAUSE='Time sync is on, but no time server has answered yet.'
-        FX_STEPS=('Check that UDP port 123 can leave this server.' 'timedatectl timesync-status' 'chronyc sources')
+        FX_STEPS=('Check that UDP port 123 can leave this server.' 'With chrony: chronyc sources' 'With systemd-timesyncd, systemd 239 or newer: timedatectl timesync-status')
     fi
 }
 ap_clock_unsynced() {
@@ -141,10 +141,10 @@ fx_swap_apply() {
 fx_swap_check() { awk '$1 == "/swapfile" { found = 1 } END { exit !found }' /proc/swaps; }
 
 fx_mysql_advice() {
-    local pool ram=$((R_MEM_TOTAL * 1024)) client=mysql
-    has mysql || client=mariadb
-    has "$client" || return 0
-    pool=$(run_t 5 "$client" --connect-timeout=3 -NBe 'SELECT @@innodb_buffer_pool_size' 2>/dev/null)
+    local pool ram=$((R_MEM_TOTAL * 1024))
+    sql_find
+    has "${SQL[0]}" || return 0
+    pool=$(run_t 5 "${SQL[@]}" --connect-timeout=3 -NBe 'SELECT @@innodb_buffer_pool_size' 2>/dev/null)
     [[ $pool =~ ^[0-9]+$ ]] || return 0
     FX_CAUSE+=" MariaDB/MySQL buffer pool is $(fx_bytes "$pool") of $(fx_bytes "$ram") RAM."
     if ((pool * 100 / ram > 50)); then
@@ -156,7 +156,9 @@ fx_mysql_advice() {
 dx_memory_low() {
     FX_CAUSE="Biggest users: $(fx_top_memory 5)."
     fx_mysql_advice
-    FX_STEPS+=('Lower PHP-FPM pm.max_children if PHP is the top user.' 'free -h' 'ps aux --sort=-rss | head')
+    FX_STEPS+=('Lower PHP-FPM pm.max_children if PHP is the top user.')
+    tune_panel_steps fpm
+    FX_STEPS+=('free -h' 'ps aux --sort=-rss | head')
     if fx_swap_possible; then fx_swap_plan; FX_CAUSE+=' This server has no swap.'; fi
 }
 ap_memory_low() { fx_swap_apply; }
@@ -164,8 +166,9 @@ ck_memory_low() { fx_swap_check; }
 dx_oom_kills() {
     FX_CAUSE="Killed: ${1:-unknown}. Biggest users now: $(fx_top_memory 4)."
     fx_mysql_advice
-    FX_STEPS+=('If php-fpm is a big user, lower pm.max_children, per pool or in your panel.'
-        'journalctl -k | grep -i "out of memory"' 'Add RAM if the numbers above already look reasonable.')
+    FX_STEPS+=('If php-fpm is a big user, lower pm.max_children.')
+    tune_panel_steps fpm
+    FX_STEPS+=('journalctl -k | grep -i "out of memory"' 'Add RAM if the numbers above already look reasonable.')
     if fx_swap_possible; then fx_swap_plan; FX_CAUSE+=' This server has no swap.'; fi
 }
 ap_oom_kills() { fx_swap_apply; }

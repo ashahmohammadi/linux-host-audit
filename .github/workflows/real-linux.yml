@@ -120,6 +120,36 @@ jobs:
       - name: Read a real ${{ matrix.image }}, and compare with what it reports itself
         run: bash tests/tune-real.sh '${{ matrix.image }}' '${{ matrix.env }}' '${{ matrix.expect }}' '${{ matrix.value }}' '${{ matrix.command }}' '${{ matrix.wait }}'
 
+  simulated:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Simulated servers, panels and version rules
+        run: bash tests/run.sh
+
+  version-rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Settings called live really change live on those versions
+        run: bash tests/sql-real.sh
+      - name: Debian Apache gives its MPM only through apache2ctl
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq apache2
+          sudo systemctl start apache2
+          out=$(sudo NO_COLOR=1 bash linux-host-audit.sh --tune)
+          printf '%s\n' "$out" | grep -A6 'Apache 2'
+          printf '%s\n' "$out" | grep -E 'Apache 2[.0-9]* \((event|prefork|worker)\)'
+
+  plesk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read a real Plesk from the vendor's image
+        run: bash tests/plesk-real.sh plesk/plesk:18.0
+
   fixer:
     runs-on: ubuntu-latest
     steps:

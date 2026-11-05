@@ -52,6 +52,7 @@ dx_service_failed() {
     status=$(run_t 3 systemctl show -p ExecMainStatus --value -- "$unit" 2>/dev/null)
     log=$(fx_unit_log "$unit")
     FX_STEPS=("systemctl status $unit" "journalctl -u $unit -n 100 --no-pager")
+    panel_restart_step "$unit"
 
     fx_config_test "$unit"
     if [[ -n $FX_CONFIG_ERROR ]]; then
@@ -196,7 +197,13 @@ fx_tls_dx() {
         FX_STEPS=('If this fails, port 80 or the DNS record usually does not reach this server.' "certbot renew --dry-run --cert-name $name")
     elif [[ -x /usr/local/cpanel/bin/autossl_check ]]; then
         FX_CAUSE="cPanel AutoSSL has not renewed $name."
-        FX_STEPS=('/usr/local/cpanel/bin/autossl_check --all' 'WHM > SSL/TLS > Manage AutoSSL > Logs shows why a domain failed.')
+        FX_STEPS=('/usr/local/cpanel/bin/autossl_check --user=USER checks one account, --all checks every account.' 'WHM > Home > SSL/TLS > Manage AutoSSL > Logs shows why a domain failed.')
+    elif [[ -d /usr/local/psa/admin || -d /opt/psa/admin ]]; then
+        FX_CAUSE="Plesk has not renewed $name."
+        FX_STEPS=('Domains > DOMAIN > SSL/TLS Certificates shows the certificate in use.' 'plesk log panel.log shows renewal errors.')
+    elif [[ -x /usr/local/directadmin/directadmin ]]; then
+        FX_CAUSE="DirectAdmin has not renewed $name."
+        FX_STEPS=("Read /usr/local/directadmin/data/users/USER/domains/acme_provider_cert_logs/$name.log" 'No recent log means DirectAdmin never asked for it.' 'tail /var/log/directadmin/system.log')
     elif [[ -x /root/.acme.sh/acme.sh ]]; then
         FX_CAUSE="$name looks issued by acme.sh, which has not renewed it."
         FX_STEPS=('/root/.acme.sh/acme.sh --cron' '/root/.acme.sh/acme.sh --list')

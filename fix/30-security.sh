@@ -18,11 +18,24 @@ dx_no_firewall() {
     ssh=$(fx_ssh_port)
     count=$(fx_public_ports | wc -l | tr -d ' ')
     FX_CAUSE="No firewall is filtering traffic, so all $count public ports are reachable."
-    if [[ -d /usr/local/cpanel ]]; then
-        FX_MODE=never
-        FX_STEPS=('cPanel needs many ports. Use WHM > Security Center, or install CSF, which knows them.')
-        return 0
-    fi
+    panel_find
+    case $PANEL in
+        cpanel)
+            FX_MODE=never
+            FX_STEPS=('cPanel needs many ports, so a generic firewall can lock customers out.'
+                'CSF, kept up by the cPanel vendor. It needs firewalld removed first. AlmaLinux, CloudLinux, Rocky: yum install cpanel-csf. Ubuntu: apt install cpanel-csf.'
+                'Then in WHM > Home > Plugins > ConfigServer Security & Firewall, turn Testing off.'
+                'Or run /usr/local/cpanel/scripts/configure_firewall_for_cpanel. It clears existing rules, so save them first: iptables-save > backupfile')
+            return 0 ;;
+        plesk)
+            FX_MODE=never
+            FX_STEPS=('Use the Plesk firewall, which knows the ports of Plesk: Tools & Settings > Firewall.' 'Its service is psa-firewall.')
+            return 0 ;;
+        directadmin)
+            FX_MODE=never
+            FX_STEPS=('DirectAdmin advises CSF for this. Keep port 2222 open, or you lose the panel.' 'firewall-cmd --zone=public --add-port=2222/tcp --permanent')
+            return 0 ;;
+    esac
     if [[ -z $ssh ]]; then
         FX_MODE=never FX_CAUSE+=' The SSH port could not be found, so a firewall could lock you out.'
         return 0
@@ -179,7 +192,10 @@ dx_updates_security() {
     FX_STEPS=('apt list --upgradable')
     if ! has apt-get; then
         FX_CAUSE='Security updates are waiting.'
-        FX_STEPS=('dnf updateinfo list security' 'dnf upgrade --security')
+        if has zypper; then FX_STEPS=('zypper list-patches --category security' 'zypper patch --category security')
+        elif has dnf; then FX_STEPS=('dnf updateinfo list --security' 'dnf upgrade --security')
+        else FX_STEPS=('yum updateinfo list security' 'yum update --security')
+        fi
         return 0
     fi
     list=$(run_t 15 apt-get -s -o Debug::NoLocking=true -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= upgrade 2>/dev/null |
