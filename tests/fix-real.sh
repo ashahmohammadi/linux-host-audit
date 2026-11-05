@@ -267,5 +267,57 @@ if has docker; then
     docker rm -f lha-web lha-sick >/dev/null
 fi
 
+echo '=== tuning: applied live, kept after a restart, undone cleanly'
+advice() { tune_done=yes TUNE_NOTES='' TUNE_BUDGET=''; TUNE_ROWS="$1"$'\n'; }
+if has mariadb || has mysql; then
+    systemctl start mariadb
+    sql=mariadb; has mariadb || sql=mysql
+    before=$($sql -NBe 'select @@max_connections')
+    want=$((before + 40))
+    fresh
+    advice "MariaDB 10|max_connections|$before|x|0|$want|test|live|$want"
+    fx_transaction tune-apply 1 | tail -n 3
+    run=$(ls -t "$FX_HOME/runs" | head -n 1)
+    check 'applied live' "[[ \$($sql -NBe 'select @@max_connections') == $want ]]"
+    systemctl restart mariadb
+    check 'survives a restart' "[[ \$($sql -NBe 'select @@max_connections') == $want ]]"
+    fx_undo_run "$run"
+    check 'undo restored the value' "[[ \$($sql -NBe 'select @@max_connections') == $before ]]"
+    check 'undo removed the file' "! ls /etc/mysql/*/zz-linux-host-audit.cnf 2>/dev/null | grep -q ."
+    systemctl restart mariadb
+    check 'still right after a restart' "[[ \$($sql -NBe 'select @@max_connections') == $before ]]"
+fi
+if has redis-cli; then
+    systemctl start redis-server
+    advice "Redis 7|maxmemory|unlimited|x|0|256 MiB|test|live|268435456"
+    fx_transaction tune-apply 1 | tail -n 2
+    check 'redis limit applied' "[[ \$(redis-cli config get maxmemory | tail -n 1) == 268435456 ]]"
+    fx_undo_run "$(ls -t "$FX_HOME/runs" | head -n 1)"
+    check 'redis limit undone' "[[ \$(redis-cli config get maxmemory | tail -n 1) == 0 ]]"
+fi
+if has nginx; then
+    systemctl start nginx
+    sum=$(sha256sum /etc/nginx/nginx.conf)
+    advice "Nginx 1|worker_connections|768|x|0|4096|test|reload|4096"
+    fx_transaction tune-apply 1 | tail -n 2
+    check 'nginx limit applied' "grep -q 'worker_connections 4096;' /etc/nginx/nginx.conf"
+    check 'nginx still running' "[[ \$(systemctl is-active nginx) == active ]]"
+    fx_undo_run "$(ls -t "$FX_HOME/runs" | head -n 1)"
+    check 'nginx file restored exactly' "[[ \$(sha256sum /etc/nginx/nginx.conf) == \"\$sum\" ]]"
+fi
+sysctl -w vm.swappiness=60 >/dev/null
+advice "Linux kernel|vm.swappiness|60|x|0|10|test|live|10"
+fx_transaction tune-apply 1 | tail -n 1
+check 'kernel setting applied' "[[ \$(sysctl -n vm.swappiness) == 10 ]]"
+fx_undo_run "$(ls -t "$FX_HOME/runs" | head -n 1)"
+check 'kernel setting undone' "[[ \$(sysctl -n vm.swappiness) == 60 ]]"
+FX_DRY=yes fx_transaction tune-apply 1 >/dev/null
+check 'dry run does not apply' "[[ \$(sysctl -n vm.swappiness) == 60 ]]"
+FX_DRY=no
+advice "MariaDB 10|innodb_log_file_size|512 MiB|x|0|896.0 MiB|test|restart|939524096"
+out=$(fx_transaction tune-apply 1 2>&1); status=$?
+check 'restart setting is only explained' "((status == 3))"
+check 'config value is a raw number' "grep -q 'innodb_log_file_size = 939524096' <<< \"\$out\""
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 ((fail == 0))

@@ -110,7 +110,7 @@ jobs:
       - name: Break things for real, and fix them
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq nginx ufw
+          sudo apt-get install -y -qq nginx ufw mariadb-server redis-server
           sudo LHA_I_AM_DISPOSABLE=yes bash tests/fix-real.sh
 
   docker:

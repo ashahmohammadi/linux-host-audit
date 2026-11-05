@@ -39,7 +39,7 @@ dx_tune_apply() {
     IFS='|' read -r TA_GROUP TA_SETTING TA_NOW _ _ TA_REC TA_WHY TA_HOW TA_RAW <<< "$line"
     if [[ -z $TA_SETTING ]]; then FX_CAUSE="There is no advice number $n."; return 0; fi
     FX_CAUSE="$TA_GROUP $TA_SETTING: $TA_WHY"
-    FX_STEPS=("Set $TA_SETTING to $TA_REC, now $TA_NOW.")
+    FX_STEPS=("Now $TA_NOW, advised $TA_REC.")
     case $TA_GROUP in
         MariaDB*|MySQL*)
             fx_mysql_client
@@ -51,7 +51,7 @@ dx_tune_apply() {
                     if [[ -n $TA_DIR ]]; then FX_PLAN+=("Save it in $TA_DIR/zz-linux-host-audit.cnf, so it survives a restart.")
                     else FX_PLAN+=('No included config folder was found, so this lasts until the next restart.')
                     fi ;;
-                *) FX_STEPS+=("Under [mysqld] in your config, then a planned restart: $TA_SETTING = $TA_REC") ;;
+                *) FX_STEPS+=("Under [mysqld] in your config, then a planned restart: $TA_SETTING = $TA_RAW") ;;
             esac ;;
         'Linux kernel')
             case $TA_SETTING in
@@ -126,7 +126,7 @@ ap_tune_apply() {
         nginx)
             fx_quote systemctl reload nginx
             fx_undo "$REPLY"
-            sed -E "s/^([[:space:]]*$TA_SETTING[[:space:]]+)[^;]+;/\1$TA_RAW;/" "$TA_FILE" | fx_write "$TA_FILE" || return 1
+            sed -E "s/^([[:space:]]*${TA_SETTING}[[:space:]]+)[^;]+;/\1$TA_RAW;/" "$TA_FILE" | fx_write "$TA_FILE" || return 1
             nginx -t >/dev/null 2>&1 || return 1
             fx_run systemctl reload nginx ;;
         phpfpm)
@@ -152,7 +152,7 @@ ck_tune_apply() {
         sysctl) [[ $(sysctl -n "$TA_SETTING" | tr -s '\t ' ' ') == "$TA_RAW" ]] ;;
         thp) grep -q '\[madvise\]' /sys/kernel/mm/transparent_hugepage/enabled ;;
         redis) [[ $(run_t 5 "$TA_CLI" -h 127.0.0.1 config get maxmemory | tail -n 1 | tr -d '\r') == "$TA_RAW" ]] ;;
-        nginx) grep -qE "^[[:space:]]*$TA_SETTING[[:space:]]+$TA_RAW;" "$TA_FILE" && [[ $(run_t 3 systemctl is-active nginx) == active ]] ;;
+        nginx) grep -qE "^[[:space:]]*${TA_SETTING}[[:space:]]+$TA_RAW;" "$TA_FILE" && [[ $(run_t 3 systemctl is-active nginx) == active ]] ;;
         phpfpm) [[ $(run_t 3 systemctl is-active "$TA_UNIT") == active ]] ;;
         *) return 1 ;;
     esac
