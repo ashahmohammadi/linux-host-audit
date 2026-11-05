@@ -3679,8 +3679,9 @@ tune_mongo() {
     has mongosh || client=mongo
     has "$client" || return 0
     # mongosh keeps a log and a config in its home folder, and reports usage unless told not to.
-    # A home inside /proc cannot be created, even by root.
-    out=$(run_t 8 env HOME=/proc/nonexistent DO_NOT_TRACK=1 "$client" --quiet --norc --eval 'var s = db.serverStatus(), c = s.wiredTiger.cache;
+    # Nothing can be created under /dev/null, not even by root. It warns, and goes on. A home
+    # under /proc does not work: mongosh hangs there.
+    out=$(run_t 8 env HOME=/dev/null DO_NOT_TRACK=1 "$client" --quiet --norc --eval 'var s = db.serverStatus(), c = s.wiredTiger.cache;
         print("version\t" + s.version); print("uptime\t" + s.uptime); print("cache\t" + c["maximum bytes configured"]);
         print("used\t" + c["bytes currently in the cache"]); print("conn\t" + s.connections.current);
         print("avail\t" + s.connections.available);' 2>/dev/null | clean)

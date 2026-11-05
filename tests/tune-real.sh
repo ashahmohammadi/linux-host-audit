@@ -26,9 +26,6 @@ docker exec -u 0 svc sh -c '
         fi
     fi'
 if ! docker exec svc sh -c 'command -v ps >/dev/null && command -v awk >/dev/null'; then echo 'NOTE: this image has no ps or no awk, and they could not be installed.'; fi
-for h in /proc/nonexistent /proc /dev/null /sys /root; do
-    docker exec -u 0 svc sh -c "command -v mongosh >/dev/null || exit 0; echo DEBUG home $h; HOME=$h DO_NOT_TRACK=1 timeout 15 mongosh --quiet --norc --eval 'print(1)' 2>&1 | tail -n 4; echo DEBUG done; ls -a $h/.mongodb 2>&1 | head -n 3" 2>&1
-done
 files() { docker exec -u 0 svc sh -c 'find /root /home -xdev -type f 2>/dev/null | sort'; }
 before=$(files)
 # Privileged, because root on a real host may read /proc/PID/fd, and a plain exec may not.
