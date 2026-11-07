@@ -10,7 +10,7 @@ kcfg=$fake/kubeconfig
 
 # Every call lands in $fake/calls. The audit must never touch the tools that write something.
 for tool in hostname uname getconf systemd-detect-virt timedatectl date df ip ss ufw systemctl journalctl \
-    docker podman kubectl mysql mariadb redis-cli valkey-cli apt-get crontab last ps iptables ip6tables zpool \
+    docker podman kubectl mysql mariadb redis-cli valkey-cli apt-get crontab last ps iptables ip6tables nft zpool \
     postqueue postconf postfix rpm sshd httpd php-fpm8.2 curl su dnf yum gluster ceph rabbitmqctl nodetool pm2; do
     printf '#!/bin/bash\necho "%s $*" >> "%s/calls"\nexec bash "%s" %s "$@"\n' "$tool" "$fake" "$here/fake-tools.sh" "$tool" > "$fake/$tool"
     chmod +x "$fake/$tool"
@@ -121,7 +121,9 @@ equals "$?" 2 'exit code of --check'
 
 # The contract for scripts and a future fixer: valid JSON, and every finding has a stable id.
 out=$(audit --json)
-report=$(python -c '
+py=python3
+"$py" -c 1 2>/dev/null || py=python
+report=$("$py" -c '
 import json, sys
 d = json.load(sys.stdin)
 ids = [f["id"] for f in d["findings"]]
@@ -425,10 +427,38 @@ has_text "$out" 'rabbitmqctl is left out on purpose'
 has_text "$out" 'Port 8123 did not answer'
 no_text "$out" 'RabbitMQ|vm_memory'
 
+# Red Hat 9 and newer: the drop-in holds an Include of its own. This once looped forever.
+mkdir -p "$fake/sshloop/sshd_config.d"
+printf 'Include %s/sshloop/sshd_config.d/*.conf
+Port 22
+' "$fake" > "$fake/sshloop/sshd_config"
+printf 'Include %s/sshloop/policy.config
+Include %s/sshloop/sshd_config.d/*.conf
+PermitRootLogin no
+' "$fake" "$fake" > "$fake/sshloop/sshd_config.d/50-redhat.conf"
+printf 'Ciphers aes256-gcm
+' > "$fake/sshloop/policy.config"
+out=$(timeout 20 bash -c 'source <(sed "\$d" "$1") >/dev/null; sshd_file_settings "$2"' _ "$script" "$fake/sshloop/sshd_config" 2>&1)
+has_text "$out" 'permitrootlogin no'
+has_text "$out" 'ciphers aes256-gcm'
+has_text "$out" 'port 22'
+
+# nginx 1.18 on Ubuntu 22.04 does not spell out the error.
+out=$(inside --fixer 'journalctl() { echo "bind() to 0.0.0.0:80 failed (98: Unknown error)"; }; run_t() { shift; "$@"; }; fx_unit_log nginx.service')
+has_text "$out" '0.0.0.0:80 failed (98: address already in use)'
+
+# Panel licenses are off limits: the tool never reads, checks or mentions them.
+if cat "$script" "$fixer" | grep -qiE 'licen[cs]e|cpkeyclt|/etc/sw/keys'; then ((fail += 1)); echo 'FAIL a license reference is in the tool'; else ((pass += 1)); fi
+
 # Fixer. Each of these is a defect that would have hurt a real server.
 bash "$here/../make-fix.sh" >/dev/null
 scenario=clean
-out=$(inside --fixer 'fx_begin t; fx_write() { cat >/dev/null; fx_undo RESTORE; }; ap_ssh_root_password; cat "$FX_DIR/undo.list"')
+out=$(inside --fixer 'FX_RISK=low FX_UNDOABLE=no FX_ASSUME=medium; fx_confirm </dev/null; echo "rc=$?"; FX_ASSUME=high; fx_confirm; echo "rc=$?"')
+has_text "$out" 'Use --yes=high'
+has_text "$out" 'rc=1'
+has_text "$out" 'rc=0'
+scenario=clean
+out=$(inside --fixer 'fx_begin t; fx_write() { cat >/dev/null; fx_undo RESTORE; }; ap_ssh_root_password 2>/dev/null; cat "$FX_DIR/undo.list"')
 equals "$(grep -c reload <<< "$(sed -n 1p <<< "$out")")" 1 'the reload runs after the file is back'
 equals "$(tail -n 1 <<< "$out")" RESTORE 'the file is restored first'
 
@@ -513,7 +543,15 @@ printf 'default: ea-php82\n' > "$root/etc/cpanel/ea4/php.conf"
 printf '[2026-11-04 10:00:00 +0000] die something broke badly\n' > "$root/usr/local/cpanel/logs/error_log"
 printf 'stopped halfway\n' > "$root/var/cpanel/updatelogs/last"
 touch -d @1792990000 "$root/var/cpanel/updatelogs/last"
+printf '2026-11-04 tailwatchd error reading a log
+' > "$root/usr/local/cpanel/logs/tailwatchd_log"
+mkdir -p "$root/usr/local/cpanel/logs/cpbackup"
+printf 'backup failed for bob
+' > "$root/usr/local/cpanel/logs/cpbackup/1.log"
 out=$(audit --panel)
+has_text "$out" 'cPanel log watcher'
+has_text "$out" 'backup failed for bob'
+no_text "$out" 'cPanel DNS'
 has_text "$out" 'cPanel & WHM troubleshooting'
 has_text "$out" '120.0.1'
 has_text "$out" 'ended'

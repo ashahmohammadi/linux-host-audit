@@ -56,6 +56,8 @@ curl -fsSLO https://raw.githubusercontent.com/ashahmohammadi/linux-host-audit/ma
 Every fix shows the exact cause, the plan and the risk, and asks first. It backs up what it changes,
 tests the result, and rolls back if the problem stays or anything else stopped running. Changes that
 could lock you out undo themselves unless you confirm from a new session. `--undo RUN` reverses any fix.
+A fix that cannot be undone always needs the word yes typed by a person, or `--yes=high`. Panel
+licenses are never read or checked.
 
 It never reboots, never deletes sites, uploads or databases, never reruns one-shot jobs, never starts a
 service that is switched off, and never edits an app config by guessing. Failing disks, signs of a
@@ -127,5 +129,7 @@ contract: other tools can act on them without reading the English text, so never
 `bash tests/run.sh` runs simulated servers with fake `docker`, `kubectl`, `ss` and other tools.
 `tests/fix-real.sh` breaks a throwaway machine on purpose and fixes it. Never run it on a real server.
 CI runs the second one, old and new distros, and real databases, web servers and queues across versions.
+`tests/all-distros.sh` runs every view on about 70 releases. `tests/fix-distros.sh` runs the real
+break-and-fix tests inside booted AlmaLinux and Ubuntu containers, so the host stays untouched.
 `tests/parse-real.sh` checks the parsers on each distro's own awk, because mawk fails quietly.
 Run `tests/run.sh` yourself before a release, because it is not in CI.

@@ -157,9 +157,9 @@ dx_panel_down() {
     panel_find
     FX_CAUSE="$PANEL_NAME does not answer on its port."
     case $PANEL in
-        cpanel) FX_STEPS=('/usr/local/cpanel/scripts/restartsrv_cpsrvd' 'tail -n 50 /usr/local/cpanel/logs/error_log' 'less /usr/local/cpanel/logs/license_log') ;;
+        cpanel) FX_STEPS=('/usr/local/cpanel/scripts/restartsrv_cpsrvd' 'tail -n 50 /usr/local/cpanel/logs/error_log') ;;
         plesk) FX_STEPS=('systemctl status psa sw-cp-server sw-engine' 'plesk log panel.log' 'plesk repair all -n checks everything and fixes nothing.' 'plesk repair all -y then repairs it. Run it off-peak, after a backup.') ;;
-        *) FX_STEPS=('systemctl status directadmin' 'tail /var/log/directadmin/error.log' 'journalctl -u directadmin.service' 'da license shows if the license is the cause.' 'Is the disk with /usr/local/directadmin/data/sessions full? df -h' 'For more detail: systemctl stop directadmin, then da server --debug=2000, and stop it with Ctrl+C. Then systemctl start directadmin') ;;
+        *) FX_STEPS=('systemctl status directadmin' 'tail /var/log/directadmin/error.log' 'journalctl -u directadmin.service' 'Is the disk with /usr/local/directadmin/data/sessions full? df -h' 'For more detail: systemctl stop directadmin, then da server --debug=2000, and stop it with Ctrl+C. Then systemctl start directadmin') ;;
     esac
 }
 dx_panel_updates_off() {

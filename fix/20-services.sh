@@ -43,7 +43,11 @@ fx_owner_package() {
     fi
 }
 
-fx_unit_log() { run_t 8 journalctl -u "$1" -n 60 --no-pager -q -o cat 2>/dev/null | clean; }
+# Old nginx on new glibc prints "(98: Unknown error)", so the numbers are spelled out here.
+fx_unit_log() {
+    run_t 8 journalctl -u "$1" -n 60 --no-pager -q -o cat 2>/dev/null | clean |
+        sed -e 's/(98: [^)]*)/(98: address already in use)/' -e 's/(13: [^)]*)/(13: permission denied)/'             -e 's/(28: [^)]*)/(28: no space left on device)/' -e 's/(30: [^)]*)/(30: read-only file system)/'
+}
 
 dx_service_failed() {
     local unit=${1:-} result status log port owner path pkg last enabled

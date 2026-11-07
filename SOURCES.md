@@ -13,6 +13,7 @@ rely on an old entry.
 |---|---|---|---|
 | cPanel | Version numbers, tiers, end of life | docs, read on a live server | [Product versions](https://docs.cpanel.net/knowledge-base/cpanel-product/product-versions-and-the-release-process/) |
 | cPanel | Log paths | docs, read on a live server | [The cPanel log files](https://docs.cpanel.net/knowledge-base/cpanel-product/the-cpanel-log-files/) |
+| cPanel | Service monitor, log watcher, WebDAV, DNS, statistics, backup and MySQL upgrade logs | docs | [The cPanel log files](https://docs.cpanel.net/knowledge-base/cpanel-product/the-cpanel-log-files/) |
 | cPanel | `restartsrv_*` first, `systemctl` second | docs | [How to restart services](https://docs.cpanel.net/knowledge-base/general-systems-administration/how-to-restart-services/) |
 | cPanel | `autossl_check --user`, `--all` | docs | [autossl_check](https://docs.cpanel.net/whm/scripts/the-autossl_check-script/) |
 | cPanel | `servers_queue`, `queueprocd` | docs | [servers_queue](https://docs.cpanel.net/whm/scripts/the-servers-queue-script/) |
@@ -39,6 +40,8 @@ rely on an old entry.
 | DirectAdmin | Certificate logs | docs | [Let's Encrypt errors](https://docs.directadmin.com/webservices/ssl/troubleshooting-letsencrypt.html) |
 | DirectAdmin | Exim commands | docs | [Exim queue](https://docs.directadmin.com/other-hosting-services/exim/maintaining-email-queue.html) |
 
+Panel licenses are left out on purpose. This tool never reads, checks or reports a license on any panel.
+
 ## Applications
 
 | App | Rule in the tool | Tested | Source |
@@ -59,7 +62,7 @@ own page. cPanel dates come from its product versions page above.
 
 ## Known gaps
 
-- cPanel and DirectAdmin need a paid license, so CI cannot run them. Their commands are read from the
+- CI cannot run cPanel or DirectAdmin. Their commands are read from the
   documentation, and the cPanel paths were also read on one live AlmaLinux 8 server, version 138.
 - The `kubeadm alpha certs` form for Kubernetes before 1.20 comes from memory of the old manual.
 - Elastic's documentation shows `$ES_HOME/config/certs/http_ca.crt`. The `/etc/elasticsearch/certs/`

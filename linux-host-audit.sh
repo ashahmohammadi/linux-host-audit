@@ -4,7 +4,7 @@
 # Never prints passwords, process arguments, container environments or Kubernetes secrets.
 # Bash 3.2+ on any Linux. Missing tools only hide the part of the report that needs them.
 
-LHA_VERSION=3.7.0
+LHA_VERSION=3.7.1
 # Lets tests point file checks at a made-up server. Empty on a real one.
 LHA_ROOT=${LHA_TEST_ROOT:-}
 
@@ -315,7 +315,7 @@ service_report() {
                 "_SYSTEMD_INVOCATION_ID=$invocation" 2>/dev/null | awk '
                 {
                     msg=tolower($0)
-                    if (msg ~ /address already in use|eaddrinuse/) bind=1
+                    if (msg ~ /address already in use|eaddrinuse|(98: unknown error)/) bind=1
                     if (msg ~ /permission denied|operation not permitted/) perm=1
                     if (msg ~ /no space left on device|disk quota exceeded/) space=1
                     if (msg ~ /read-only file system/) ro=1
@@ -707,7 +707,8 @@ scan_evidence() {
     packages=$(package_snapshot)
     processes=$'\n'
     # /proc comm is limited to 15 bytes. Supplement truncated names via /proc/exe when readable.
-    for proc in /proc/[0-9]*/comm; do
+    # A simulated server has only the fake ps: the real processes here say nothing about it.
+    [[ -n ${LHA_TEST_PATH:-} ]] || for proc in /proc/[0-9]*/comm; do
         if { IFS= read -r comm < "$proc"; } 2>/dev/null; then
             processes+="$comm"$'\n'
             if (( ${#comm} == 15 )) && has readlink; then
@@ -790,7 +791,6 @@ sig_group 'Web and app runtimes'
 detect 'Nginx' 'nginx' '/etc/nginx/nginx.conf /www/server/nginx/sbin/nginx /usr/local/nginx/sbin/nginx' 'nginx nginx-core nginx-full nginx-light nginx-extras ea-nginx' 'nginx'
 detect 'Apache HTTP Server' 'httpd apache2 apache2ctl apachectl' '/etc/httpd/conf/httpd.conf /etc/apache2/apache2.conf /www/server/apache/bin/httpd /usr/local/apache/bin/httpd' 'httpd apache2 ea-apache24' 'httpd apache2'
 detect 'LiteSpeed server family' 'lshttpd lswsctrl' '/usr/local/lsws/bin/lshttpd /usr/local/lsws/bin/lswsctrl' '' 'lsws lshttpd litespeed'
-detect 'LiteSpeed commercial edition license artifacts' '' '/usr/local/lsws/conf/license.key /usr/local/lsws/conf/serial.no /usr/local/lsws/conf/trial.key' '' ''
 detect 'OpenLiteSpeed' 'openlitespeed' '/usr/local/lsws/bin/openlitespeed' 'openlitespeed' 'openlitespeed'
 detect 'Caddy' 'caddy' '/etc/caddy/Caddyfile' 'caddy' 'caddy'
 detect 'HAProxy' 'haproxy' '/etc/haproxy/haproxy.cfg' 'haproxy' 'haproxy'
@@ -2621,6 +2621,9 @@ sshd_file_settings() {
     files=$(printf '%s ' "${main%/*}"/sshd_config.d/*.conf)
     awk -v included="$files" '
         function take(file,   line, w, n, i, f) {
+            # A file can include itself through a wildcard. Red Hat 9 and newer ship one that does.
+            if (file in opened) return
+            opened[file] = 1
             while ((getline line < file) > 0) {
                 sub(/^[ \t]+/, "", line)
                 if (line == "" || line ~ /^#/) continue
@@ -2629,6 +2632,7 @@ sshd_file_settings() {
                 w[1] = tolower(w[1])
                 if (w[1] == "match") break
                 if (w[1] == "include") {
+                    if (w[2] ~ /^\// && w[2] !~ /[*?]/) { take(w[2]); continue }
                     n = split(included, f, " ")
                     for (i = 1; i <= n; i++) take(f[i])
                     continue
@@ -3209,9 +3213,9 @@ panel_is_past() { [[ $PANEL_EOL == past || ( -n $PANEL_EOL && $PANEL_EOL < $(dat
 # Service names as the vendors list them. Only what really exists here is shown.
 panel_units_regex() {
     case $PANEL in
-        cpanel) printf 'cpanel|cpsrvd|tailwatchd|queueprocd|cpanellogd|cpdavd|cphulkd|cpanel_php_fpm|httpd|nginx|mysqld|mariadb|exim|dovecot|named|pdns|pure-ftpd|proftpd|ea-php[0-9]+-php-fpm' ;;
-        plesk) printf 'psa|sw-cp-server|sw-engine|psa-firewall|apache2|httpd|nginx|mysql|mysqld|mariadb|postfix|dovecot|qmail|bind9|named|named-chroot|fail2ban|plesk-php[0-9]+-fpm' ;;
-        directadmin) printf 'directadmin|httpd|nginx|lsws|mysqld|mariadb|mysql|exim|dovecot|named|bind9|pure-ftpd|proftpd|php-fpm[0-9]+|clamd|rspamd|redis-rspamd' ;;
+        cpanel) printf 'cpanel|cpsrvd|tailwatchd|queueprocd|cpanellogd|cpdavd|cphulkd|cpgreylistd|dnsadmin|cpanel_php_fpm|httpd|nginx|lsws|mysqld|mariadb|exim|dovecot|spamd|mailman|named|pdns|pure-ftpd|proftpd|lfd|ea-php[0-9]+-php-fpm' ;;
+        plesk) printf 'psa|sw-cp-server|sw-engine|sw-collectd|psa-firewall|apache2|httpd|nginx|mysql|mysqld|mariadb|postfix|dovecot|qmail|courier-imapd|courier-imaps|courier-pop3d|courier-pop3s|courier-authdaemon|spamassassin|drwebd|xinetd|proftpd|bind9|named|named-chroot|fail2ban|plesk-php[0-9]+-fpm' ;;
+        directadmin) printf 'directadmin|httpd|nginx|lsws|mysqld|mariadb|mysql|exim|dovecot|spamd|named|bind9|pure-ftpd|proftpd|lfd|php-fpm[0-9]+|clamd|rspamd|redis-rspamd' ;;
     esac
 }
 
@@ -3316,14 +3320,11 @@ panel_cpanel_facts() {
     printf '%s\n' "${line:-  No domain data could be read.}"
     line=$(cat "$R"/var/run/chkservd/* 2>/dev/null | clean | grep -F ':-]' | cut -c1-90 | head -n 6)
     if [[ -n $line ]]; then printf '\n  %sThe cPanel service monitor reports trouble%s\n' "$c_bold" "$c_off"; indent <<< "$line"; fi
-    line=$(tail -n 3 "$R/usr/local/cpanel/logs/license_log" 2>/dev/null | clean | cut -c1-100)
-    if [[ -n $line ]]; then printf '\n  %sLicense log%s\n' "$c_bold" "$c_off"; indent <<< "$line"; fi
 }
 
 panel_plesk_facts() {
     local R=$LHA_ROOT line
     kv 'Plesk PHP' "$(find "$R/opt/plesk/php" -mindepth 1 -maxdepth 1 2>/dev/null | sed 's|.*/||' | sort -V | tr '\n' ' ' | clean)"
-    kv 'License key' "$(find "$R/etc/sw/keys/keys" -type f 2>/dev/null | wc -l | tr -d ' ') file(s) in /etc/sw/keys/keys"
     line=$(tail -n 200 "$R/var/log/plesk/install/autoinstaller3.log" 2>/dev/null | clean | grep -E 'ERROR|FATAL' | tail -n 4 | cut -c1-100)
     if [[ -n $line ]]; then printf '\n  %sLast installer errors%s\n' "$c_bold" "$c_off"; indent <<< "$line"; fi
 }
@@ -3358,7 +3359,6 @@ panel_tips() {
             tip 'plesk log panel.log' 'follow panel errors, also: error_log, maillog, --all' ;;
         directadmin)
             tip 'da version' 'exact version, on old versions: /usr/local/directadmin/directadmin v'
-            tip 'da license' 'license details'
             tip 'da config | grep usersdir' 'check one setting. A blank usersdir blocks logins'
             tip 'da build versions' 'software with updates waiting'
             tip 'journalctl -u directadmin.service' 'why the panel stopped'
@@ -3421,6 +3421,15 @@ view_panel() {
     panel_changes
 }
 
+# For logs that only some servers have: an empty heading on all the others tells nobody anything.
+err_some() {
+    local file
+    for file in "${@:5}"; do
+        if [[ -f $file ]]; then err_app "$@"; return 0; fi
+    done
+    return 0
+}
+
 err_panel() {
     local R=$LHA_ROOT
     case $PANEL in
@@ -3429,16 +3438,34 @@ err_panel() {
             err_app 'cPanel panics' '' '.' '' "$R"/usr/local/cpanel/logs/panic_log
             err_app 'cPanel updates' '' '\[(error|fatal)\]|\((error|fatal)\)' '' "$R"/var/cpanel/updatelogs/last
             err_app 'cPanel task queue' '' 'error|fail' '' "$R"/usr/local/cpanel/logs/queueprocd.log
-            err_app 'cPHulk' cphulkd 'error|fail' '' "$R"/usr/local/cpanel/logs/cphulkd_errors.log ;;
+            err_app 'cPHulk' cphulkd 'error|fail' '' "$R"/usr/local/cpanel/logs/cphulkd_errors.log
+            err_some 'cPanel service monitor' '' ':-\]|failed' '' "$R"/var/log/chkservd.log
+            err_some 'cPanel log watcher' tailwatchd 'error|fail|die' '' "$R"/usr/local/cpanel/logs/tailwatchd_log
+            err_some 'cPanel WebDAV' cpdavd 'error|fail' '' "$R"/usr/local/cpanel/logs/cpdavd_error_log
+            err_some 'cPanel own PHP' cpanel_php_fpm 'error|warning' '' "$R"/usr/local/cpanel/logs/php-fpm/error.log
+            err_some 'cPanel DNS' dnsadmin 'error|fail' '' "$R"/usr/local/cpanel/logs/dnsadmin_log
+            err_some 'cPanel statistics' cpanellogd 'error|fail' '' "$R"/usr/local/cpanel/logs/stats_log
+            err_some 'cPanel Apache restarts' '' 'error|fail' '' "$R"/usr/local/cpanel/logs/safeapacherestart_log
+            err_some 'cPanel backups' '' 'error|fail' '' "$R"/usr/local/cpanel/logs/cpbackup/*.log
+            err_some 'cPanel backup transport' '' 'error|fail' '' "$R"/usr/local/cpanel/logs/cpbackup_transporter/*.log
+            err_some 'cPanel MySQL upgrade' '' 'error|fail' '' "$R"/var/cpanel/logs/mysql_upgrade.log ;;
         plesk)
-            err_app 'Plesk panel' 'psa' ' (err|crit|alert|emerg) |error' '' "$R"/var/log/plesk/panel.log
+            err_app 'Plesk panel' 'psa' ' (err|crit|alert|emerg) |error' '' "$R"/var/log/plesk/panel.log "$R"/usr/local/psa/admin/logs/panel.log
             err_app 'Plesk web server' 'sw-cp-server sw-engine' '(error|crit|alert|emerg)]|php (fatal|warning)' '' \
                 "$R"/var/log/sw-cp-server/error_log "$R"/var/log/sw-cp-server/sw-engine.log
             err_app 'Plesk installer' '' 'error|fatal' '' "$R"/var/log/plesk/install/autoinstaller3.log
-            err_app 'Plesk system updates' '' 'error|fatal' '' "$R"/var/log/plesk/systemupdatestool.log ;;
+            err_app 'Plesk system updates' '' 'error|fatal' '' "$R"/var/log/plesk/systemupdatestool.log
+            err_some 'Plesk tasks' '' 'error|fail' '' "$R"/var/log/plesk/task-manager.log
+            err_some 'Plesk health monitor' '' 'error|fail' '' "$R"/usr/local/psa/admin/logs/health-alarm.log "$R"/var/log/plesk/modules/wdcollect.log "$R"/var/log/plesk/modules/monit.log
+            err_some 'Plesk FTP' '' 'error|fail' '' "$R"/var/log/plesk/ftp_tls.log
+            err_some 'Plesk webmail' '' 'error|fatal' '' "$R"/var/log/plesk-roundcube/errors "$R"/var/log/psa-horde/psa-horde.log
+            err_some 'Plesk site PHP' '' 'error|fatal|max_children' '' "$R"/var/log/plesk-php*-fpm/error.log ;;
         directadmin)
             err_app 'DirectAdmin' directadmin '.' '' "$R"/var/log/directadmin/error.log
             err_app 'DirectAdmin tasks' '' '.' '' "$R"/var/log/directadmin/errortaskq.log
+            err_some 'DirectAdmin system' '' 'error|fail' '' "$R"/var/log/directadmin/system.log
+            err_some 'DirectAdmin web server' 'httpd' '(error|crit|alert|emerg)\]' '' "$R"/var/log/httpd/error_log
+            err_some 'DirectAdmin FTP' 'pure-ftpd proftpd' 'error|fail' '' "$R"/var/log/pureftpd.log
             err_app 'CustomBuild' '' 'error|failed' '' "$R"/usr/local/directadmin/custombuild/custombuild.log ;;
     esac
 }
@@ -4962,6 +4989,7 @@ cannot allocate memory|out of memory~The program could not get memory~Check RAM 
 permission denied~A program may not read or write a file or socket~Compare the owner of that path with the user of the service
 read-only file system~The disk went read-only, usually after errors~dmesg | tail -30
 address already in use~The port this program wants is already taken~ss -lntup shows the owner
+(98: unknown error)~The port this program wants is already taken. Old nginx words it this way~ss -lntup shows the owner
 connection refused~Nothing is listening where this program connects~Check that the service it depends on runs
 connection timed out|operation timed out~The other side did not answer in time~Check the network path and firewall
 certificate.*(expired|verify failed)~A TLS certificate is not valid~Open Websites, domains and SSL

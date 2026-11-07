@@ -17,7 +17,13 @@ jobs:
           - ubuntu:24.04
           - ubuntu:20.04
           - debian:12
+          - almalinux:8
           - almalinux:9
+          - almalinux:10
+          - ubuntu:22.04
+          - ubuntu:26.04
+          - debian:13
+          - oraclelinux:9
           - rockylinux:8
           - fedora:latest
           - opensuse/leap:15
@@ -120,14 +126,12 @@ jobs:
       - name: Read a real ${{ matrix.image }}, and compare with what it reports itself
         run: bash tests/tune-real.sh '${{ matrix.image }}' '${{ matrix.env }}' '${{ matrix.expect }}' '${{ matrix.value }}' '${{ matrix.command }}' '${{ matrix.wait }}'
 
-  # Eight of these tests still depend on the machine they run on, so this job reports and does not block.
   simulated:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Simulated servers, panels and version rules
-        run: docker run --rm -v "$PWD:/w" -w /w debian:12 sh -c 'rm -f /.dockerenv; exec bash tests/run.sh'
+        run: docker run --rm -v "$PWD:/w" -w /w debian:12 sh -c 'apt-get update -qq && apt-get install -y -qq python3 >/dev/null && rm -f /.dockerenv && exec bash tests/run.sh'
 
   version-rules:
     runs-on: ubuntu-latest

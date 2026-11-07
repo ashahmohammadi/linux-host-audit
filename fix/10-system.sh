@@ -15,6 +15,7 @@ fx_sysctl() {
     local key=$1 value=$2 file=/etc/sysctl.d/90-linux-host-audit.conf old
     old=$(sysctl -n "$key" 2>/dev/null) || return 1
     fx_backup "$file" || return 1
+    mkdir -p "${file%/*}" || return 1
     { grep -v "^$key " "$file" 2>/dev/null; printf '%s = %s\n' "$key" "$value"; } > "$file.lha-new" || return 1
     mv -f "$file.lha-new" "$file" || return 1
     fx_quote sysctl -w "$key=$old"

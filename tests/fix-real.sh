@@ -74,6 +74,8 @@ check 'locked, no change' "[[ ! -e /etc/lha-new-file ]]"
 rmdir /dev/shm/linux-host-audit.lock
 
 echo '=== failed service: clean retry works'
+systemctl stop lha-flaky lha-off 2>/dev/null
+rm -f /run/lha-*
 cat > /etc/systemd/system/lha-flaky.service <<'EOF'
 [Service]
 ExecStart=/bin/sh -c 'test -f /run/lha-ok && exec sleep 600'
@@ -238,7 +240,14 @@ kill "$pid"
 
 echo '=== lockout protection: SSH'
 if [[ ! -f /etc/ssh/sshd_config ]] || ! has sshd; then apt-get -y -qq install openssh-server >/dev/null; fi
+# These tests empty root's key file. Without this restore, the machine locks out whoever runs them.
 mkdir -p /root/.ssh
+saved_keys=$(mktemp)
+if [[ -f /root/.ssh/authorized_keys ]]; then cp -p /root/.ssh/authorized_keys "$saved_keys"; else rm -f "$saved_keys"; fi
+restore_keys() {
+    if [[ -f $saved_keys ]]; then cp -p "$saved_keys" /root/.ssh/authorized_keys; rm -f "$saved_keys"; else rm -f /root/.ssh/authorized_keys; fi
+}
+trap restore_keys EXIT
 : > /root/.ssh/authorized_keys
 fresh
 dx_ssh_root_password
@@ -253,7 +262,9 @@ check 'change applied' "sshd -T | grep -qE '^permitrootlogin (prohibit-password|
 sleep 28
 check 'timer reverted it' "[[ \$(sshd -T | awk '\$1 == \"permitrootlogin\" { print \$2 }') == yes ]]"
 check 'sshd still healthy' "sshd -t"
-rm -f /etc/ssh/sshd_config.d/01-test.conf /root/.ssh/authorized_keys
+rm -f /etc/ssh/sshd_config.d/01-test.conf
+restore_keys
+trap - EXIT
 rm -rf /dev/shm/linux-host-audit.lock
 
 echo '=== lockout protection: firewall'
@@ -286,7 +297,7 @@ fi
 
 echo '=== trends: recording goes on and off, and keeps its data'
 fix=$here/../linux-host-fix.sh
-bash "$fix" --trends-on --yes=low </dev/null | tail -n 1
+bash "$fix" --trends-on --yes=low </dev/null | tail -n 12
 check 'cron job installed' "[[ -f /etc/cron.d/linux-host-audit ]]"
 check 'tool copied for cron' "[[ -x /usr/local/sbin/linux-host-fix ]]"
 check 'first sample written' "ls /var/lib/linux-host-audit/history/*.csv"
@@ -319,7 +330,7 @@ if has mariadb || has mysql; then
     check 'still right after a restart' "[[ \$($sql -NBe 'select @@max_connections') == $before ]]"
 fi
 if has redis-cli; then
-    systemctl start redis-server
+    if systemctl cat redis-server >/dev/null 2>&1; then systemctl start redis-server; else systemctl start redis; fi
     advice "Redis 7|maxmemory|unlimited|x|0|256 MiB|test|live|268435456"
     fx_transaction tune-apply 1 | tail -n 2
     check 'redis limit applied' "[[ \$(redis-cli config get maxmemory | tail -n 1) == 268435456 ]]"

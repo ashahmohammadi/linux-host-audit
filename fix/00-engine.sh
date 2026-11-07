@@ -59,6 +59,8 @@ fx_write() {
     if [[ -L $path ]]; then path=$(readlink -f "$path") || return 1; fi
     temp=$path.lha-new
     fx_backup "$path" || return 1
+    # Minimal systems can lack folders such as /etc/sysctl.d.
+    mkdir -p "${path%/*}" || return 1
     cat > "$temp" || { rm -f "$temp"; return 1; }
     # A failed command at the start of the pipe leaves nothing here, and that must not win.
     if [[ -s $path && ! -s $temp ]]; then
@@ -150,21 +152,23 @@ fx_gates_end() {
 }
 
 # Low risk: y. Medium and high: the word yes, typed. --yes only ever covers what it names.
+# A fix that cannot be undone counts as high, so an unattended run never does it by accident.
 fx_confirm() {
-    local answer=''
-    case $FX_ASSUME:$FX_RISK in
+    local answer='' risk=$FX_RISK
+    [[ $FX_UNDOABLE == yes ]] || risk=high
+    case $FX_ASSUME:$risk in
         low:low|medium:low|medium:medium|high:*) return 0 ;;
     esac
     if ! { : </dev/tty; } 2>/dev/null; then
-        fx_say "Needs a person to confirm. Skipped. Use --yes=$FX_RISK if you accept this risk."
+        fx_say "Needs a person to confirm. Skipped. Use --yes=$risk if you accept this risk."
         return 1
     fi
-    if [[ $FX_RISK == low ]]; then
+    if [[ $risk == low ]]; then
         printf 'Apply this fix? [y/N] ' >/dev/tty
         IFS= read -r answer </dev/tty
         [[ $answer == [yY]* ]]
     else
-        printf 'This is %s risk. Type yes to apply: ' "$FX_RISK" >/dev/tty
+        printf 'This is %s risk. Type yes to apply: ' "$risk" >/dev/tty
         IFS= read -r answer </dev/tty
         [[ $answer == yes ]]
     fi
